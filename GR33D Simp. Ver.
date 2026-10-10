@@ -1,5 +1,5 @@
 --[[
-    PLAYER FLING v23.6 — OUTCOME TELEMETRY + COMPACT MOBILE UI
+    PLAYER FLING v23.8 — SELECTABLE R6/R15 AIM PART + TALL SLIM UI
     Based on v22.5 baseline. Additions:
       • Full rig scanner (every BasePart, joint, accessory, with state)
       • Environment scanner (nearby BaseParts, ownership, anchoring)
@@ -55,7 +55,8 @@ local CONFIG = {
     PredictionMaxSpeed = 60,
     PredictionDirectionReset = 0.35,
     -- Spatial overlap + velocity-change evidence, not velocity alone.
-    OverlapCheckInterval = 0.025,
+    OverlapCheckInterval = 0.080, -- avoid expensive workspace overlap on every physics step
+    HitUIRefreshSeconds = 0.20, -- no multi-line UI rebuild each frame
     MinimumResponseDelta = 75,
     -- Leave moving players free to walk or jump while testing prediction.
     -- The original freeze/stun functions and manual UI buttons remain intact.
@@ -74,7 +75,7 @@ local HRP_BURST = {
 -- Only use left-arm body parts for the target position.  Keep existing
 -- motion/landing logic and root velocity prediction unchanged.
 local KICK_PART_ORDER = {
-    "LeftLowerArm", "LeftUpperArm", "LeftHand", "Left Arm", -- R15, R6
+    "LeftUpperArm", "LeftLowerArm", "LeftHand", "Left Arm", -- R15, R6
 }
 
 local BURST_PART_ROTATION = KICK_PART_ORDER
@@ -175,6 +176,30 @@ end
 local HitDebug = {}
 local Adaptive = {} -- per-player, session-only local-contact rankings
 local Telemetry = {} -- diagnostics and user-labelled results; no physics changes
+-- Picker state is shared by the adaptive selector and fixed footer UI.
+-- Selecting a specific part locks aiming to that part for every attempt.
+-- Auto retains the v23.7 per-player adaptive rotation.
+local TargetPicker = {
+    selected = "LeftUpperArm",
+    choices = {
+        "LeftUpperArm", "LeftLowerArm", "LeftHand",
+        "RightUpperArm", "RightLowerArm", "RightHand",
+        "LeftUpperLeg", "LeftLowerLeg", "LeftFoot",
+        "RightUpperLeg", "RightLowerLeg", "RightFoot",
+        "Left Arm", "Right Arm", "Left Leg", "Right Leg",
+        "UpperTorso", "LowerTorso", "Torso", "HumanoidRootPart",
+        "Auto",
+    },
+    -- R15 selection works on classic R6 avatars without silently targeting a hat.
+    r6Aliases = {
+        LeftUpperArm = "Left Arm", LeftLowerArm = "Left Arm", LeftHand = "Left Arm",
+        RightUpperArm = "Right Arm", RightLowerArm = "Right Arm", RightHand = "Right Arm",
+        LeftUpperLeg = "Left Leg", LeftLowerLeg = "Left Leg", LeftFoot = "Left Leg",
+        RightUpperLeg = "Right Leg", RightLowerLeg = "Right Leg", RightFoot = "Right Leg",
+        UpperTorso = "Torso", LowerTorso = "Torso",
+    },
+}
+
 do
 local PhysicsService = game:GetService("PhysicsService")
 local hitObservations = {}
@@ -231,6 +256,8 @@ end
 
 local function renderHitInfo()
     if not HitDebug.summary or not HitDebug.summary.Parent then return end
+    -- Hidden page: defer costly multi-line text layout until user opens Hits.
+    if not HitDebug.summary.Parent.Visible then return end
     -- Prefer the newest limb observation, not a historic response from an
     -- earlier target or attempt. Older responses stay in the history below.
     local newest = nil
@@ -239,7 +266,7 @@ local function renderHitInfo()
     end
     if not newest then
         HitDebug.summary.Text = "No " .. (HitDebug.focus == "Both" and "arm/leg" or (HitDebug.focus == "LeftArm" and "left-arm" or HitDebug.focus:lower())) .. " contact observed."
-        HitDebug.details.Text = "Head and accessories are ignored.\nTracking starts on the left arm; local observations can reprioritize later attempts."
+        HitDebug.details.Text = "Head and accessories are ignored.\nTracking starts on LeftUpperArm; local observations can reprioritize later attempts."
         HitDebug.log.Text = "The most recent 32 observations appear here."
         return
     end
@@ -249,6 +276,7 @@ local function renderHitInfo()
         "Aimed at: %s\nApprox. point: %s\nEvidence: %s\nCollision eligible: %s  |  Try %s",
         newest.aimedPart or "unknown", hitVec(newest.point), hitStatus(newest),
         newest.collidable and "Yes" or "No/unknown", tostring(newest.attempt))
+    if not HitDebug.showHistory then return end
     local lines = {}
     local shown = 0
     for _, event in ipairs(hitObservations) do
@@ -270,9 +298,11 @@ local hitRenderQueued = false
 local function queueHitRender()
     if hitRenderQueued then return end
     hitRenderQueued = true
-    task.defer(function()
+    task.delay(CONFIG.HitUIRefreshSeconds, function()
         hitRenderQueued = false
-        renderHitInfo()
+        if HitDebug.summary and HitDebug.summary.Parent then
+            renderHitInfo()
+        end
     end)
 end
 
@@ -408,7 +438,7 @@ end
 do
     local preferenceByUserId = {}
     local baseOrder = {
-        "LeftLowerArm", "LeftUpperArm", "LeftUpperLeg", "RightUpperLeg",
+        "LeftUpperArm", "LeftLowerArm", "LeftUpperLeg", "RightUpperLeg",
         "LeftHand", "RightLowerArm", "RightUpperArm", "LeftLowerLeg",
         "RightLowerLeg", "RightHand", "LeftFoot", "RightFoot",
         "Left Arm", "Left Leg", "Right Leg", "Right Arm", -- R6 fallbacks
@@ -429,6 +459,22 @@ do
 
     function Adaptive.choose(player, character, attempt)
         if not character then return nil, nil end
+        -- Fixed selection takes precedence over adaptive scores/rotation.
+        -- A classic R6 alias is used only if the selected R15 part does not exist.
+        -- If neither exists, the adaptive fallback prevents a nil target.
+        local requested = TargetPicker.selected
+        if requested ~= "Auto" then
+            local part = character:FindFirstChild(requested)
+            if not (part and part:IsA("BasePart") and part.Parent == character
+                and not part.Anchored) then
+                local alias = TargetPicker.r6Aliases[requested]
+                part = alias and character:FindFirstChild(alias) or nil
+            end
+            if part and part:IsA("BasePart") and part.Parent == character
+                and not part.Anchored then
+                return part, part.Name
+            end
+        end
         local stats = playerStats(player, false)
         local available = {}
         for _, name in ipairs(baseOrder) do
@@ -447,8 +493,8 @@ do
         if stats and (attemptIndex == 1 or stats.cycleCharacter ~= character
             or not stats.cycleOrder) then
             table.sort(available, function(a, b)
-                local aa = stats.scores[a.Name] or 0
-                local bb = stats.scores[b.Name] or 0
+                local aa = (stats.scores[a.Name] or 0) + (a.Name == "LeftUpperArm" and 3 or 0)
+                local bb = (stats.scores[b.Name] or 0) + (b.Name == "LeftUpperArm" and 3 or 0)
                 if aa ~= bb then return aa > bb end
                 return baseRank[a.Name] < baseRank[b.Name]
             end)
@@ -499,9 +545,14 @@ do
 
     function Adaptive.refreshUI(player)
         if not HitDebug.priority or not HitDebug.priority.Parent then return end
+        if TargetPicker.selected ~= "Auto" then
+            HitDebug.priority.Text = "Fixed target: " .. TargetPicker.selected
+                .. "  |  AUTO available from target picker"
+            return
+        end
         local stats = playerStats(player, false)
         if not stats or stats.signals == 0 then
-            HitDebug.priority.Text = "Adaptive: LeftLowerArm first  |  no local response history"
+            HitDebug.priority.Text = "Adaptive: LeftUpperArm first  |  no local response history"
             return
         end
         local bestPart, bestScore = nil, -math.huge
@@ -511,7 +562,7 @@ do
         end
         HitDebug.priority.Text = string.format(
             "Adaptive @%s: %s  |  %d local motion signals",
-            player.Name, bestPart or "LeftLowerArm", stats.signals)
+            player.Name, bestPart or "LeftUpperArm", stats.signals)
     end
 end
 
@@ -654,8 +705,8 @@ local Gui = make("ScreenGui", {
     IgnoreGuiInset = true, ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
 }, PlayerGui)
 
-local PANEL_W = 510
-local PANEL_H = 760
+local PANEL_W = 410
+local PANEL_H = 850
 
 local Main = make("Frame", {
     AnchorPoint = Vector2.new(0.5, 0),
@@ -677,7 +728,7 @@ make("Frame", {
     BackgroundColor3 = ACCENT, BorderSizePixel = 0,
 }, Header)
 
-local Title = label("FLING  ·  v23.6", 15,
+local Title = label("FLING  ·  v23.8", 15,
     UDim2.fromOffset(20, 10), UDim2.new(1, -180, 0, 20), Header)
 Title.Font = Enum.Font.GothamBold
 local SubTitle = label("Adaptive limb observations  ·  Safer mobile layout", 10,
@@ -1008,9 +1059,122 @@ local HitPage = makePage("Hits")
 HitPage.ScrollingEnabled = false
 
 local Footer = make("Frame", {
-    Name = "FixedFooter", Position = UDim2.new(0, 12, 1, -128),
-    Size = UDim2.new(1, -24, 0, 122), BackgroundTransparency = 1,
+    Name = "FixedFooter", Position = UDim2.new(0, 12, 1, -155),
+    Size = UDim2.new(1, -24, 0, 148), BackgroundTransparency = 1,
 }, Content)
+
+-- Always accessible above FLING/STOP, regardless of the selected tab.
+local TargetBar = make("Frame", {
+    Name = "AimPartBar", BackgroundColor3 = ROW, BorderSizePixel = 0,
+    Position = UDim2.fromOffset(0, 0), Size = UDim2.new(1, 0, 0, 34),
+}, Footer)
+round(TargetBar, 8)
+local TargetBarLabel = label("AIM PART", 10,
+    UDim2.fromOffset(10, 0), UDim2.fromOffset(68, 34), TargetBar)
+TargetBarLabel.Font = Enum.Font.GothamBold
+TargetBarLabel.TextColor3 = MUTED
+TargetBarLabel.TextYAlignment = Enum.TextYAlignment.Center
+local TargetPartButton = make("TextButton", {
+    Name = "ChooseAimPart", Text = "LeftUpperArm  ▾",
+    BackgroundColor3 = ACCENTD, TextColor3 = WHITE,
+    Font = Enum.Font.GothamBold, TextSize = 12,
+    TextTruncate = Enum.TextTruncate.AtEnd,
+    BorderSizePixel = 0, AutoButtonColor = true,
+    Position = UDim2.fromOffset(80, 3), Size = UDim2.new(1, -84, 0, 28),
+}, TargetBar)
+round(TargetPartButton, 7)
+
+-- Picker popup uses Main rather than PageHost so it never gets clipped by
+-- the scrolling pages or the footer. Every choice has a large touch hitbox.
+local PickerBackdrop = make("TextButton", {
+    Name = "AimPartBackdrop", Text = "", AutoButtonColor = false,
+    BackgroundColor3 = Color3.fromRGB(0, 0, 0), BackgroundTransparency = 0.35,
+    BorderSizePixel = 0, Size = UDim2.fromScale(1, 1),
+    Visible = false, ZIndex = 40,
+}, Main)
+local PickerPopup = make("Frame", {
+    Name = "AimPartPopup", AnchorPoint = Vector2.new(0.5, 0.5),
+    Position = UDim2.fromScale(0.5, 0.5),
+    Size = UDim2.fromOffset(320, 370),
+    BackgroundColor3 = BG, BorderSizePixel = 0,
+    Visible = false, Active = true, ZIndex = 41,
+}, Main)
+round(PickerPopup, 12)
+make("UIStroke", {Color = ACCENT, Thickness = 1.5}, PickerPopup)
+local PickerTitle = label("SELECT AIM PART", 13,
+    UDim2.fromOffset(12, 8), UDim2.new(1, -65, 0, 30), PickerPopup)
+PickerTitle.Font = Enum.Font.GothamBold
+PickerTitle.ZIndex = 42
+local PickerClose = make("TextButton", {
+    Text = "✕", Font = Enum.Font.GothamBold, TextSize = 14,
+    TextColor3 = WHITE, BackgroundColor3 = RED,
+    Position = UDim2.new(1, -43, 0, 8), Size = UDim2.fromOffset(32, 30),
+    ZIndex = 43,
+}, PickerPopup)
+round(PickerClose, 8)
+local PickerList = make("ScrollingFrame", {
+    Name = "PartChoices", BackgroundTransparency = 1,
+    Position = UDim2.fromOffset(10, 44),
+    Size = UDim2.new(1, -20, 1, -56),
+    CanvasSize = UDim2.fromOffset(0, #TargetPicker.choices * 40 + 8),
+    ScrollBarThickness = 5, ScrollBarImageColor3 = ACCENT,
+    ScrollingDirection = Enum.ScrollingDirection.Y,
+    ZIndex = 42,
+}, PickerPopup)
+local PickerRows = {}
+local function closePartPicker()
+    PickerPopup.Visible = false
+    PickerBackdrop.Visible = false
+end
+local function setAimPart(partName)
+    if FlingActive or selfFlinging then
+        setStatus("Finish current attempt first", AMBER)
+        return false
+    end
+    local valid = false
+    for _, name in ipairs(TargetPicker.choices) do
+        if name == partName then valid = true break end
+    end
+    if not valid then return false end
+    TargetPicker.selected = partName
+    TargetPartButton.Text = partName == "Auto" and "Auto (adaptive)  ▾"
+        or (partName .. "  ▾")
+    for name, button in pairs(PickerRows) do
+        button.BackgroundColor3 = name == partName and ACCENTD or ROW
+    end
+    Adaptive.refreshUI(currentTarget)
+    closePartPicker()
+    setStatus("Aim part: " .. partName, CYAN,
+        partName == "Auto" and "Uses adaptive limb ranking"
+        or "Locks target part; R6 fallback if necessary")
+    return true
+end
+TargetPicker.set = setAimPart
+for i, name in ipairs(TargetPicker.choices) do
+    local option = make("TextButton", {
+        Name = "Select_" .. name:gsub("%s+", ""),
+        Text = (name == "Auto" and "AUTO (ADAPTIVE)" or name),
+        Font = Enum.Font.GothamMedium, TextSize = 13,
+        TextColor3 = WHITE, BackgroundColor3 = name == TargetPicker.selected
+            and ACCENTD or ROW, BorderSizePixel = 0,
+        AutoButtonColor = true, ZIndex = 43,
+        Position = UDim2.fromOffset(0, (i-1) * 40),
+        Size = UDim2.new(1, -8, 0, 36),
+    }, PickerList)
+    round(option, 7)
+    PickerRows[name] = option
+    option.MouseButton1Click:Connect(function() setAimPart(name) end)
+end
+TargetPartButton.MouseButton1Click:Connect(function()
+    if FlingActive or selfFlinging then
+        setStatus("Finish current attempt first", AMBER)
+        return
+    end
+    PickerBackdrop.Visible = true
+    PickerPopup.Visible = true
+end)
+PickerClose.MouseButton1Click:Connect(closePartPicker)
+PickerBackdrop.MouseButton1Click:Connect(closePartPicker)
 
 -- Group by function, without deleting or recreating the original controls.
 for _, obj in ipairs({sectionFrames[1], CmdBar, sectionFrames[2], Search,
@@ -1047,9 +1211,10 @@ local HitHeading = label("CONTACT OBSERVATIONS", 12,
     UDim2.fromOffset(10, 14), UDim2.fromOffset(300, 22), HitPage)
 HitHeading.Font = Enum.Font.GothamBold
 HitHeading.TextColor3 = CYAN
-HitDebug.priority = label("Adaptive: LeftLowerArm first  |  no local response history", 11,
+HitDebug.priority = label("Adaptive: LeftUpperArm first  |  no local response history", 11,
     UDim2.fromOffset(10, 37), UDim2.new(1, -20, 0, 22), HitPage)
 HitDebug.priority.TextColor3 = CYAN
+Adaptive.refreshUI(nil) -- initial Hits label reflects fixed LeftUpperArm default
 HitDebug.summary = label("No contact observations yet", 13,
     UDim2.fromOffset(10, 46), UDim2.new(1, -20, 0, 54), HitPage)
 HitDebug.summary.Font = Enum.Font.GothamBold
@@ -1095,7 +1260,7 @@ local ResetLearning = make("TextButton", {
 round(ResetLearning, 8)
 ResetLearning.MouseButton1Click:Connect(function()
     Adaptive.clear()
-    setStatus("Adaptive history reset", MUTED, "Next target starts at LeftLowerArm")
+    setStatus("Adaptive history reset", MUTED, "Target picker choice stays selected")
 end)
 local HitHistory = make("ScrollingFrame", {
     Position = UDim2.fromOffset(10, 252),
@@ -1203,7 +1368,10 @@ local function showTab(name)
     ActionPage.Visible = name == "Actions"
     UtilityPage.Visible = name == "Tools"
     HitPage.Visible = name == "Hits"
-    if name == "Hits" then Adaptive.refreshUI(currentTarget) end
+    if name == "Hits" then
+        Adaptive.refreshUI(currentTarget)
+        HitDebug.render()
+    end
     for tabName, btn in pairs(tabButtons) do
         btn.BackgroundColor3 = (name == tabName) and ACCENTD or ROW
         btn.TextColor3 = (name == tabName) and WHITE or MUTED
@@ -1354,10 +1522,15 @@ local function reflowContents(panelWidth, panelHeight)
     HitPage.CanvasSize = UDim2.fromOffset(0, HitDebug.showHistory and 550 or 379)
     if HitDebug.relayoutHistory then HitDebug.relayoutHistory() end
     local short = panelHeight < 660
+    local targetH = short and 30 or 34
     local statusH = short and 24 or 38
-    local btnY = short and 28 or 44
+    local btnY = short and 66 or 82
     local btnH = short and 42 or 48
-    StatusPanel.Position = UDim2.fromOffset(0, 0)
+    TargetBar.Size = UDim2.new(1, 0, 0, targetH)
+    TargetBarLabel.Size = UDim2.fromOffset(68, targetH)
+    TargetPartButton.Position = UDim2.fromOffset(80, 2)
+    TargetPartButton.Size = UDim2.new(1, -84, 0, targetH - 4)
+    StatusPanel.Position = UDim2.fromOffset(0, targetH + 4)
     StatusPanel.Size = UDim2.new(1, 0, 0, statusH)
     Status.Position = UDim2.fromOffset(10, short and 2 or 8)
     Status.Size = UDim2.new(1, -20, 0, 18)
@@ -1396,24 +1569,24 @@ updateWindow = function()
     -- Roblox CoreGui plus game-specific bars may cover the screen top.
     -- Reserve additional space above AND below the panel on mobile.
     local hudTop = touch
-        and math.max(insetY + 22, math.floor(vp.Y * 0.245))
+        and math.max(insetY + 20, math.floor(vp.Y * 0.20))
         or math.max(insetY + 12, 20)
     local hudBottom = touch
-        and math.max(80, math.floor(vp.Y * 0.225)) or 14
+        and math.max(68, math.floor(vp.Y * 0.14)) or 14
     if vp.Y - hudTop - hudBottom < 185 then
         -- Last-resort safe margins on extra-short displays.
         hudTop = math.max(insetY + 4, math.floor(vp.Y * 0.11))
         hudBottom = math.max(22, math.floor(vp.Y * 0.10))
     end
-    local maxWidth = maximized and 660 or PANEL_W
-    local maxHeight = maximized and 920 or PANEL_H
+    local maxWidth = maximized and 520 or PANEL_W
+    local maxHeight = maximized and 960 or PANEL_H
     local w = math.min(maxWidth, math.max(250, vp.X - 28))
     local usableH = math.max(130, vp.Y - hudTop - hudBottom)
     local h = minimized and 44 or math.min(maxHeight, usableH)
     local compact = h < 660
     local headerH = compact and 40 or 56
     local tabsH = compact and 36 or 42
-    local footerH = compact and 76 or 96
+    local footerH = compact and 116 or 140
     local navY = compact and 2 or 6
     local hostY = navY + tabsH + 8
     local contentH = h - headerH
@@ -1448,6 +1621,9 @@ updateWindow = function()
     Footer.Size = UDim2.new(1, -24, 0, footerH)
     InspectOverlay.Position = UDim2.fromOffset(10, headerH + 6)
     InspectOverlay.Size = UDim2.new(1, -20, 1, -(headerH + 16))
+    PickerPopup.Size = UDim2.fromOffset(math.max(180, math.min(350, w - 26)),
+        math.max(110, math.min(430, h - 58)))
+    if minimized then closePartPicker() end
     reflowContents(w, h)
     -- Compress tabs only when the phone is short.
     if compact then
@@ -1506,6 +1682,17 @@ local function startDamageGuard()
             local h2 = c2 and c2:FindFirstChildOfClass("Humanoid")
             if not root or not h2 or h2.Health <= 0 then
                 if guardAnchoredSelf and root and root.Parent then
+                    pcall(function() root.Anchored = false end)
+                    guardAnchoredSelf = false
+                end
+                return
+            end
+
+            -- Let the active movement/return routine own the character.
+            -- This avoids scanning all players and rewriting Humanoid state
+            -- during an intensive local physics sequence.
+            if selfFlinging or returning then
+                if guardAnchoredSelf then
                     pcall(function() root.Anchored = false end)
                     guardAnchoredSelf = false
                 end
@@ -2421,7 +2608,7 @@ local function setNoclip(state)
 end
 
 table.insert(connections, RunService.Stepped:Connect(function()
-    if not noclipActive then return end
+    if not noclipActive or selfFlinging then return end
     local ch = Me.Character
     if not ch then return end
     for _, part in ipairs(ch:GetChildren()) do
@@ -2459,7 +2646,16 @@ local function runCommand(text)
 
     if cmd == "/help" or cmd == "/?" then
         setStatus("Commands", MUTED,
-            "/hits /marklaunch /markmiss /clearhits /resetmemory /testreturn /scan /scanenv /scanall /fling /freeze /unfreeze /anchor /unanchor /bring /grab /goto /aim /noclip /speed")
+            "/target LeftUpperArm|Auto|... /hits /marklaunch /markmiss /clearhits /resetmemory /testreturn /scan /scanenv /scanall /fling /freeze /unfreeze /anchor /unanchor /bring /grab /goto /aim /noclip /speed")
+    elseif cmd == "/target" then
+        local partName = arg:gsub("^%s+", ""):gsub("%s+$", "")
+        -- Case-insensitive command values, including R6 names with spaces.
+        for _, name in ipairs(TargetPicker.choices) do
+            if name:lower() == partName:lower() then partName = name break end
+        end
+        if not TargetPicker.set(partName) then
+            setStatus("Invalid aim part", AMBER, "Use the footer picker or /target Auto")
+        end
     elseif cmd == "/hits" then
         if HitDebug.showHits then HitDebug.showHits() end
         setStatus("Hit observations", CYAN, "Local contact evidence is in the Hits tab")
@@ -2694,7 +2890,7 @@ local function makeTargetOverlapParams(character)
     local params = OverlapParams.new()
     params.FilterType = Enum.RaycastFilterType.Include
     params.FilterDescendantsInstances = {character}
-    params.MaxParts = 40
+    params.MaxParts = 16
     params.RespectCanCollide = false
     return params
 end
@@ -2817,14 +3013,16 @@ local function SkidFling(TargetPlayer, forcedPart, monitor)
     end
     local tracker = {}
     local movementUpdates = 0
+    -- Prepare collision flags ONCE per run, not at every offset.
+    pcall(function()
+        RootPart.CanCollide = true
+        RootPart.Massless = false
+    end)
     local function FPos(worldAim, localOffset, ang)
         if not RootPart.Parent or not aimPart.Parent then return end
-        pcall(function()
-            RootPart.CanCollide = true
-            RootPart.Massless = false
-        end)
         local kickCF = CFrame.new(worldAim) * CFrame.new(localOffset) * ang
-        pcall(function() Character:SetPrimaryPartCFrame(kickCF) end)
+        -- Moving the root's connected assembly is cheaper than moving
+        -- the whole Model and then moving the same root again.
         RootPart.CFrame = kickCF
         movementUpdates = movementUpdates + 1
         RootPart.Velocity = Vector3.new(
@@ -2863,6 +3061,13 @@ local function SkidFling(TargetPlayer, forcedPart, monitor)
                     local limbDelta = aimPart.Position - predictionRoot.Position
                     if limbDelta.Magnitude > 6 then
                         limbDelta = limbDelta.Unit * 6
+                    end
+                    if aimPart.Name == "LeftUpperArm" then
+                        local oldDelta = tracker.lastArmOffset
+                        if oldDelta and (limbDelta - oldDelta).Magnitude < 3 then
+                            limbDelta = oldDelta:Lerp(limbDelta, 0.60)
+                        end
+                        tracker.lastArmOffset = limbDelta
                     end
                     aim = aim + limbDelta
                 end
@@ -3377,4 +3582,4 @@ updateWindow()
 refreshPlayers()
 setStatus("Ready · contact and outcome diagnostics", MUTED,
     "Begins at left arm; per-player local responses influence later attempts.")
-print("Fling v23.6 — local telemetry + user-marked results; compact mobile UI; landing preserved")
+print("Fling v23.7 — slimmer/taller UI; throttled diagnostics; single-root movement updates")
