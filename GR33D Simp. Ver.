@@ -1,5 +1,5 @@
 --[[
-    PLAYER FLING v23.9 — SELECTABLE R6/R15 AIM PART + TALL SLIM UI
+    PLAYER FLING v23.8 — SELECTABLE R6/R15 AIM PART + TALL SLIM UI
     Based on v22.5 baseline. Additions:
       • Full rig scanner (every BasePart, joint, accessory, with state)
       • Environment scanner (nearby BaseParts, ownership, anchoring)
@@ -705,8 +705,8 @@ local Gui = make("ScreenGui", {
     IgnoreGuiInset = true, ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
 }, PlayerGui)
 
-local PANEL_W = 350
-local PANEL_H = 900
+local PANEL_W = 410
+local PANEL_H = 850
 
 local Main = make("Frame", {
     AnchorPoint = Vector2.new(0.5, 0),
@@ -728,7 +728,7 @@ make("Frame", {
     BackgroundColor3 = ACCENT, BorderSizePixel = 0,
 }, Header)
 
-local Title = label("FLING  ·  v23.9", 15,
+local Title = label("FLING  ·  v23.8", 15,
     UDim2.fromOffset(20, 10), UDim2.new(1, -180, 0, 20), Header)
 Title.Font = Enum.Font.GothamBold
 local SubTitle = label("Adaptive limb observations  ·  Safer mobile layout", 10,
@@ -829,7 +829,7 @@ make("UIPadding", {
     PaddingLeft = UDim.new(0, 6), PaddingRight = UDim.new(0, 6),
 }, List)
 local PlayerRowLayout = make("UIListLayout", {
-    SortOrder = Enum.SortOrder.LayoutOrder, Padding = UDim.new(0, 4),
+    SortOrder = Enum.SortOrder.LayoutOrder, Padding = UDim.new(0, 6),
 }, List)
 -- Explicit height prevents the last row from being clipped by automatic
 -- canvas calculation and gives it room to scroll completely into view.
@@ -1177,14 +1177,9 @@ PickerClose.MouseButton1Click:Connect(closePartPicker)
 PickerBackdrop.MouseButton1Click:Connect(closePartPicker)
 
 -- Group by function, without deleting or recreating the original controls.
-for _, obj in ipairs({sectionFrames[2], Search, Count, List,
-    sectionFrames[4], SelectAll, DeselectAll}) do
+for _, obj in ipairs({sectionFrames[1], CmdBar, sectionFrames[2], Search,
+    Count, List, sectionFrames[4], SelectAll, DeselectAll, InspectButton}) do
     obj.Parent = PlayerPage
-end
--- Commands and scans belong on Tools: they used to consume the player list's
--- entire viewport on landscape phones.
-for _, obj in ipairs({sectionFrames[1], CmdBar, InspectButton}) do
-    obj.Parent = UtilityPage
 end
 for _, obj in ipairs({sectionFrames[3], TPButton, BringButton,
     FreezeButton, UnfreezeButton, AnchorButton, UnanchorButton}) do
@@ -1203,13 +1198,6 @@ local UtilityTitle = label("MOVEMENT & UTILITIES", 12,
     UDim2.fromOffset(10, 16), UDim2.fromOffset(300, 20), UtilityPage)
 UtilityTitle.Font = Enum.Font.GothamBold
 UtilityTitle.TextColor3 = MUTED
-local GoActionsButton = make("TextButton", {
-    Name = "GoToFlingActions", Text = "FLING ›", Font = Enum.Font.GothamBold,
-    TextSize = 12, TextColor3 = WHITE, BackgroundColor3 = ACCENTD,
-    BorderSizePixel = 0, AutoButtonColor = true,
-}, PlayerPage)
-round(GoActionsButton, 8)
-
 local ActionsHint = label("Actions use the selected player on the Players tab.", 11,
     UDim2.fromOffset(10, 245), UDim2.new(1, -20, 0, 34), ActionPage)
 ActionsHint.TextWrapped = true
@@ -1384,10 +1372,6 @@ local function showTab(name)
         Adaptive.refreshUI(currentTarget)
         HitDebug.render()
     end
-    -- The Players page is a dedicated large list. The persistent footer is
-    -- hidden only on this tab and automatically returns for the action pages.
-    Footer.Visible = name ~= "Players"
-    Navigation.Visible = name ~= "Players"
     for tabName, btn in pairs(tabButtons) do
         btn.BackgroundColor3 = (name == tabName) and ACCENTD or ROW
         btn.TextColor3 = (name == tabName) and WHITE or MUTED
@@ -1401,21 +1385,11 @@ for _, tab in ipairs({"Players", "Actions", "Tools", "Hits"}) do
         AutoButtonColor = true,
     }, Navigation)
     round(btn, 8)
-    btn.MouseButton1Click:Connect(function()
-        showTab(tab)
-        if updateWindow then updateWindow() end
-    end)
+    btn.MouseButton1Click:Connect(function() showTab(tab) end)
     tabButtons[tab] = btn
 end
 
-HitDebug.showHits = function()
-    showTab("Hits")
-    if updateWindow then updateWindow() end
-end
-GoActionsButton.MouseButton1Click:Connect(function()
-    showTab("Actions")
-    if updateWindow then updateWindow() end
-end)
+HitDebug.showHits = function() showTab("Hits") end
 
 local function place(obj, x, y, w, h)
     obj.Position = UDim2.fromOffset(x, y)
@@ -1448,42 +1422,44 @@ local function reflowContents(panelWidth, panelHeight)
         tabButtons[name].TextSize = 12
     end
 
-    -- Players tab: single, dedicated scrolling list; no nested scroll areas.
-    -- Search and selection actions stay visible even with many players online.
+    -- Players: command and search remain at the top, selections at bottom,
+    -- and the player list gets all the remaining vertical space.
+    place(sectionFrames[1], 10, 10, innerWidth, 18)
+    place(CmdBar, 10, 32, innerWidth, 40)
+    place(sectionFrames[2], 10, 84, innerWidth, 18)
+    place(Search, 10, 106, innerWidth, 40)
+    place(Count, 10, 149, innerWidth, 20)
     local narrow = innerWidth < 335
-    place(sectionFrames[2], 10, 0, innerWidth, 0)
-    sectionFrames[2].Visible = false
-    place(Search, 8, 7, innerWidth + 4, 32)
-    place(Count, 10, 42, innerWidth, 16)
-    place(sectionFrames[4], 10, 0, innerWidth, 0)
-    sectionFrames[4].Visible = false
-    local quickY = 62
-    local quickGap = 6
-    local quickW = math.floor((innerWidth - 2 * quickGap) / 3)
-    place(SelectAll, 8, quickY, quickW, 30)
-    place(DeselectAll, 8 + quickW + quickGap, quickY, quickW, 30)
-    place(GoActionsButton, 8 + 2 * (quickW + quickGap), quickY,
-        innerWidth - 2 * (quickW + quickGap) + 4, 30)
-    SelectAll.TextSize = 12
-    DeselectAll.TextSize = 12
-    local listY = 100
-    local listHeight = math.max(42, innerHeight - listY - 6)
-    place(List, 8, listY, innerWidth + 4, listHeight)
+    local listY = 175
+    local listHeight
+    if compact then
+        -- Short screen: grow the rows to their actual content height and
+        -- let the Players page scroll through every item + bottom controls.
+        listHeight = math.max(64, getPlayerListContentHeight())
+    else
+        -- Normal screen: pinned search and selection bar, dedicated list scroll.
+        listHeight = math.max(60, innerHeight - listY - (narrow and 123 or 82))
+    end
+    local selectionY = listY + listHeight + 10
+    place(List, 10, listY, innerWidth, listHeight)
     List.CanvasSize = UDim2.fromOffset(0, getPlayerListContentHeight())
-    List.ScrollingEnabled = true
-    List.ScrollBarThickness = 6
-    List.ScrollBarImageColor3 = ACCENT
-    PlayerPage.ScrollingEnabled = false
-    PlayerPage.ScrollBarThickness = 0
-    PlayerPage.CanvasSize = UDim2.fromOffset(0, innerHeight)
-
-    -- Tools: retain the old command input and full scan functionality.
-    place(UtilityTitle, 10, 10, innerWidth, 20)
-    place(sectionFrames[1], 10, 344, innerWidth, 18)
-    place(CmdBar, 10, 367, innerWidth, 38)
-    place(InspectButton, 10, 414, innerWidth, 36)
-    InspectButton.Text = "SCAN SELECTED PLAYER"
-    UtilityPage.CanvasSize = UDim2.fromOffset(0, 465)
+    List.ScrollingEnabled = not compact
+    List.ScrollBarThickness = compact and 0 or 6
+    PlayerPage.ScrollingEnabled = compact
+    PlayerPage.ScrollBarThickness = compact and 6 or 0
+    PlayerPage.CanvasSize = UDim2.fromOffset(0,
+        math.max(innerHeight, selectionY + (narrow and 108 or 68)))
+    place(sectionFrames[4], 10, selectionY + 2, innerWidth, 16)
+    if narrow then
+        place(SelectAll, 10, selectionY + 24, half, 34)
+        place(DeselectAll, 10 + half + gap, selectionY + 24, half, 34)
+        place(InspectButton, 10, selectionY + 64, innerWidth, 34)
+    else
+        place(SelectAll, 10, selectionY + 22, third, 36)
+        place(DeselectAll, 10 + third + gap, selectionY + 22, third, 36)
+        place(InspectButton, 10 + 2 * (third + gap), selectionY + 22,
+            innerWidth - 2 * (third + gap), 36)
+    end
 
     -- Target actions: 2 columns, large hit areas, every original button.
     place(sectionFrames[3], 10, 14, innerWidth, 18)
@@ -1575,8 +1551,9 @@ PlayerRowLayout:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(function
         playerLayoutUpdatePending = false
         if not Gui.Parent then return end
         List.CanvasSize = UDim2.fromOffset(0, getPlayerListContentHeight())
-        -- The list is the only scroller on Players; never force its parent
-        -- to resize while somebody is scrolling or tapping a player.
+        if PlayerPage.ScrollingEnabled then
+            reflowContents(Main.Size.X.Offset, Main.Size.Y.Offset)
+        end
     end)
 end)
 
@@ -1592,28 +1569,26 @@ updateWindow = function()
     -- Roblox CoreGui plus game-specific bars may cover the screen top.
     -- Reserve additional space above AND below the panel on mobile.
     local hudTop = touch
-        and math.max(insetY + 9, math.floor(vp.Y * 0.125))
+        and math.max(insetY + 20, math.floor(vp.Y * 0.20))
         or math.max(insetY + 12, 20)
     local hudBottom = touch
-        and math.max(28, math.floor(vp.Y * 0.09)) or 14
+        and math.max(68, math.floor(vp.Y * 0.14)) or 14
     if vp.Y - hudTop - hudBottom < 185 then
         -- Last-resort safe margins on extra-short displays.
         hudTop = math.max(insetY + 4, math.floor(vp.Y * 0.11))
         hudBottom = math.max(22, math.floor(vp.Y * 0.10))
     end
-    local maxWidth = maximized and 385 or PANEL_W
-    local maxHeight = maximized and 980 or PANEL_H
-    local w = math.min(maxWidth, math.max(230, vp.X - 24))
+    local maxWidth = maximized and 520 or PANEL_W
+    local maxHeight = maximized and 960 or PANEL_H
+    local w = math.min(maxWidth, math.max(250, vp.X - 28))
     local usableH = math.max(130, vp.Y - hudTop - hudBottom)
     local h = minimized and 44 or math.min(maxHeight, usableH)
     local compact = h < 660
-    local headerH = compact and 36 or 50
-    local tabsH = compact and 34 or 42
-    -- No footer on Players: every saved pixel becomes selectable list space.
-    local footerH = currentTab == "Players" and 0
-        or (compact and 116 or 140)
+    local headerH = compact and 40 or 56
+    local tabsH = compact and 36 or 42
+    local footerH = compact and 116 or 140
     local navY = compact and 2 or 6
-    local hostY = currentTab == "Players" and 4 or (navY + tabsH + 8)
+    local hostY = navY + tabsH + 8
     local contentH = h - headerH
     Main.Position = UDim2.new(0.5, 0, 0, hudTop)
     Main.Size = UDim2.fromOffset(w, h)
@@ -1639,15 +1614,11 @@ updateWindow = function()
     MaxButton.Text = maximized and "❐" or "▢"
     Navigation.Position = UDim2.fromOffset(12, navY)
     Navigation.Size = UDim2.new(1, -24, 0, tabsH)
-    -- Player selection is an expanded view by default, and FLING › restores
-    -- the normal tab/navigation layout. No tiny unreadable player list.
-    Navigation.Visible = currentTab ~= "Players"
     PageHost.Position = UDim2.fromOffset(12, hostY)
     PageHost.Size = UDim2.new(1, -24, 0,
-        math.max(34, contentH - hostY - footerH - (footerH == 0 and 8 or 7)))
+        math.max(34, contentH - hostY - footerH - 7))
     Footer.Position = UDim2.new(0, 12, 1, -(footerH + 4))
     Footer.Size = UDim2.new(1, -24, 0, footerH)
-    Footer.Visible = currentTab ~= "Players"
     InspectOverlay.Position = UDim2.fromOffset(10, headerH + 6)
     InspectOverlay.Size = UDim2.new(1, -20, 1, -(headerH + 16))
     PickerPopup.Size = UDim2.fromOffset(math.max(180, math.min(350, w - 26)),
@@ -3384,7 +3355,7 @@ local function refreshPlayers()
                 or player.DisplayName:lower():find(q, 1, true)) then
             shown = shown + 1
             local Row = make("TextButton", {
-                Size = UDim2.new(1, -18, 0, 46), LayoutOrder = shown,
+                Size = UDim2.new(1, -18, 0, 56), LayoutOrder = shown,
                 BackgroundColor3 = SelectedTargets[player.Name]
                     and Color3.fromRGB(58, 78, 110) or ROW,
                 BorderSizePixel = 0,
@@ -3400,13 +3371,13 @@ local function refreshPlayers()
 
             local pic = make("ImageLabel", {
                 Position = UDim2.fromOffset(36, 6),
-                Size = UDim2.fromOffset(34, 34),
+                Size = UDim2.fromOffset(40, 40),
                 BackgroundColor3 = PANEL, Image = "",
             }, Row)
             round(pic, 20)
 
             local check = make("Frame", {
-                Position = UDim2.fromOffset(8, 12),
+                Position = UDim2.fromOffset(8, 15),
                 Size = UDim2.fromOffset(22, 22),
                 BackgroundColor3 = Color3.fromRGB(60, 70, 95),
                 BorderSizePixel = 0,
@@ -3422,11 +3393,11 @@ local function refreshPlayers()
                 Visible = SelectedTargets[player.Name] ~= nil,
             }, check)
 
-            local dl = label(player.DisplayName, 13,
-                UDim2.fromOffset(78, 3), UDim2.new(1, -88, 0, 22), Row)
+            local dl = label(player.DisplayName, 14,
+                UDim2.fromOffset(84, 6), UDim2.new(1, -92, 0, 22), Row)
             dl.Font = Enum.Font.GothamBold
-            local ul = label("@"..player.Name, 10,
-                UDim2.fromOffset(78, 24), UDim2.new(1, -88, 0, 16), Row)
+            local ul = label("@"..player.Name, 11,
+                UDim2.fromOffset(84, 28), UDim2.new(1, -92, 0, 18), Row)
             ul.TextColor3 = MUTED
 
             loadAvatar(player, pic, Enum.ThumbnailSize.Size100x100)
