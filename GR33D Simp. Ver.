@@ -26,15 +26,17 @@ local CONFIG = {
     LandingSettleFrames = 10,
     -- No-spin, bounded velocity instead of hazardous extreme spin values.
     AngleStep     = 0,
-    KickSpeed     = 85,
-    KickYSpeed    = 12,
+    -- Physics contact needs much more speed than the previous 85 studs/s.
+    -- Keep linear values finite: the previous 1e7+ values were unstable.
+    KickSpeed     = 3000,
+    KickYSpeed    = 120,
     KickRot       = 0,
     FirstKickHoldTime = 0.18,
     SpinStepDelay = 0.05,
     OffsetRadius = 0.30,
     AimOffsetY = 0,      -- center of limb, 0.0 = middle
     AimOffsetZ = 0.35,   -- back side of limb on its local Z axis
-    MaxSafeApproachStuds = 80,
+    MaxSafeApproachStuds = 160,
     MaxKickDuration = 1.6,
     MinimumHealthFraction = 0.45,
     Cooldown      = 0.15,
@@ -2808,11 +2810,13 @@ local function safeKickPrecheck(player, aimPart)
     if not (targetHum and targetHum.Health > 0 and aimPart and aimPart.Parent == tc) then
         return false, "Target left arm is missing"
     end
+    -- Clear only an anchor we created in our own anti-fling guard.
+    if guardAnchoredSelf and root.Anchored then
+        root.Anchored = false
+        guardAnchoredSelf = false
+    end
     if root.Anchored or aimPart.Anchored then
         return false, "One of the characters is anchored"
-    end
-    if hum.FloorMaterial == Enum.Material.Air then
-        return false, "Start on solid ground"
     end
     local checkpoint = recoveryCheckpoint()
     if not checkpoint or not findSafeLanding(checkpoint) then
@@ -2830,18 +2834,9 @@ local function safeKickPrecheck(player, aimPart)
     if destination.Y < workspace.FallenPartsDestroyHeight + 15 then
         return false, "Destination too close to map's fall limit"
     end
-    local params = RaycastParams.new()
-    params.FilterType = Enum.RaycastFilterType.Exclude
-    params.FilterDescendantsInstances = { character, tc }
-    params.RespectCanCollide = true
-    params.IgnoreWater = false
-    local travel = destination - root.Position
-    if travel.Magnitude > 1 then
-        local obstruction = workspace:Raycast(root.Position, travel, params)
-        if obstruction then
-            return false, "Solid terrain or obstacle blocks the approach"
-        end
-    end
+    -- A ray along the full travel path is not a valid teleport check: it
+    -- unnecessarily cancels kicks whenever the path crosses ordinary terrain.
+    -- Only examine geometry at the landing/contact destination below.
     -- Reject a destination embedded in a collidable wall or large object.
     local nearby = OverlapParams.new()
     nearby.FilterType = Enum.RaycastFilterType.Exclude
@@ -2850,9 +2845,12 @@ local function safeKickPrecheck(player, aimPart)
     nearby.MaxParts = 12
     local ok, otherParts = pcall(function()
         return workspace:GetPartBoundsInBox(CFrame.new(destination),
-            Vector3.new(1.2, 1.2, 1.2), nearby)
+            Vector3.new(0.65, 0.65, 0.65), nearby)
     end)
-    if not ok then return false, "Destination geometry could not be checked" end
+    if not ok then
+        warn("[Kick] Destination overlap check unavailable; checking coordinates and return checkpoint only")
+        otherParts = {}
+    end
     for _, part in ipairs(otherParts) do
         if part:IsA("BasePart") and part.CanCollide then
             return false, "Destination intersects solid geometry"
@@ -3119,18 +3117,46 @@ local function SkidFling(TargetPlayer, forcedPart, monitor)
         if monitor then monitor.lastPredictionStuds = predictedBy end
         return actual + travel
     end
+    local kickDirection = Vector3.new(1, 0, 0)
+    do
+        local delta = aimPart.Position - RootPart.Position
+        local flat = Vector3.new(delta.X, 0, delta.Z)
+        if flat.Magnitude > 0.01 then
+            kickDirection = flat.Unit
+        elseif targetRoot and targetRoot.Parent then
+            local look = targetRoot.CFrame.LookVector
+            flat = Vector3.new(look.X, 0, look.Z)
+            if flat.Magnitude > 0.01 then kickDirection = flat.Unit end
+        end
+    end
     local function kickAt(position)
         if not stillSafe() then return false end
         if (position - RootPart.Position).Magnitude > CONFIG.MaxSafeApproachStuds then
+            if monitor then monitor.abortReason = "Aim is outside safe movement distance" end
             return false
         end
-        -- No rotation: keep upright, zero angular velocity at every placement.
-        RootPart.CFrame = CFrame.new(position)
+        -- The previous no-spin patch forgot these two physics properties.
+        -- A noncolliding/massless HRP can visually overlap a part but cannot
+        -- supply the same physical impulse as the original working script.
+        RootPart.CanCollide = true
+        RootPart.Massless = false
+        local desiredCF = CFrame.new(position)
+        local moved, moveErr = pcall(function()
+            Character:PivotTo(desiredCF)
+        end)
+        if not moved then
+            warn("[Kick] PivotTo failed: ", moveErr)
+            if monitor then monitor.abortReason = "Character movement failed" end
+            return false
+        end
         movementUpdates = movementUpdates + 1
         RootPart.AssemblyAngularVelocity = Vector3.zero
         RootPart.RotVelocity = Vector3.zero
-        RootPart.AssemblyLinearVelocity = Vector3.new(
-            CONFIG.KickSpeed, CONFIG.KickYSpeed, CONFIG.KickSpeed)
+        -- Use current horizontal attack direction, not world +X/+Z regardless
+        -- of the target's location. One physics frame separates each placement.
+        local impulseVelocity = kickDirection * CONFIG.KickSpeed
+            + Vector3.new(0, CONFIG.KickYSpeed, 0)
+        RootPart.AssemblyLinearVelocity = impulseVelocity
         return true
     end
     local SFBasePart = function()
@@ -3188,7 +3214,8 @@ local function SkidFling(TargetPlayer, forcedPart, monitor)
         setStatus("Movement error (see console)", RED, tostring(result):sub(1, 110))
     end
     if movementUpdates == 0 then
-        warn("[Kick only] Movement cancelled before any teleport; check safety status.")
+        warn("[Kick only] No movement executed: " ..
+            tostring(monitor and monitor.abortReason or "check status for safety cancellation"))
     end
 
     if touchConnection then touchConnection:Disconnect() end
