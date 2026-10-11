@@ -1,9 +1,16 @@
 --[[
-    PLAYER FLING v23.4M
-    • HRP tracker + prediction (fixes hitting a moving target)
-    • Target Part selector: Original | LeftUpperArm   (only two)
-    • Narrower UI (460 px wide); full-height in landscape
-    • KILASIK rotation logic retained
+    PLAYER FLING v23.4N
+    • Universal PartTracker — tracks EVERY BasePart of every other
+      player, so we can predict the exact world position of any chosen
+      target part (HRP, Head, Handle, LeftUpperArm …) instead of
+      guessing with a stale HRP-relative offset.
+    • KILASIK rotation logic preserved (FPos + SFBasePart pattern).
+    • Target Part selector: Original | LeftUpperArm (only two).
+    • Self-fling guard — kick velocity only applied when we are
+      actually overlapping the target part this frame.
+    • Airborne-chase break — the fling stops chasing once the target
+      is already flying.
+    • Narrower panel (460 px), full-height in landscape.
 ]]
 
 local Players    = game:GetService("Players")
@@ -46,8 +53,7 @@ local function getCurrentTargetLabel()
     return "Original"
 end
 
--- Prediction window (seconds). Tunable from the Actions tab.
-local PREDICTION_TIME = 0.06
+local PREDICTION_TIME = 0.06   -- seconds; tunable from Actions tab
 
 do
     local ok, ping = pcall(function()
@@ -85,43 +91,97 @@ local guardAnchoredSelf = false
 local freezeActive, freezeThreads = {}, {}
 
 -- ============================================================
--- HRP TRACKER + PREDICTION
--- Samples every RenderStepped so we always have the freshest
--- HRP position/velocity for every other player, then extrapolates
--- forward by PREDICTION_TIME when aiming.
+-- UNIVERSAL PART TRACKER + PREDICTION
+-- Tracks EVERY BasePart in every other player's character every
+-- RenderStepped frame. This lets us aim at the exact predicted
+-- world position of ANY chosen part (HRP, Head, Handle,
+-- LeftUpperArm, LeftLowerArm, …) — mirroring KILASIK's "read the
+-- part fresh every cycle" logic, but with network-lag lead.
 -- ============================================================
-local HRPs = {}                     -- [player] = {hrp, pos, vel, time}
-do
-    local function bindPlayer(plr)
-        if plr == Me then return end
-        local function bindChar(char)
-            local hrp = char:WaitForChild("HumanoidRootPart", 5)
-            if not hrp then return end
-            HRPs[plr] = {
-                hrp = hrp,
-                pos = hrp.Position,
-                vel = hrp.AssemblyLinearVelocity,
+local PartTracker = {}   -- [part] = {pos, vel, time}
+local CharParts   = {}   -- [character] = {list of tracked parts}
+
+local function trackCharacter(char)
+    if not char then return end
+    local old = CharParts[char]
+    if old then
+        for _, p in ipairs(old) do PartTracker[p] = nil end
+    end
+    local parts = {}
+    for _, d in ipairs(char:GetDescendants()) do
+        if d:IsA("BasePart") then
+            PartTracker[d] = {
+                pos  = d.Position,
+                vel  = d.AssemblyLinearVelocity,
                 time = os.clock(),
             }
+            parts[#parts + 1] = d
         end
-        plr.CharacterAdded:Connect(bindChar)
-        if plr.Character then bindChar(plr.Character) end
     end
-    for _, p in ipairs(Players:GetPlayers()) do bindPlayer(p) end
-    Players.PlayerAdded:Connect(bindPlayer)
-    Players.PlayerRemoving:Connect(function(p) HRPs[p] = nil end)
+    CharParts[char] = parts
 end
+
+local function untrackCharacter(char)
+    if not char then return end
+    local parts = CharParts[char]
+    if parts then
+        for _, p in ipairs(parts) do PartTracker[p] = nil end
+        CharParts[char] = nil
+    end
+end
+
+local function bindPlayer(plr)
+    if plr == Me then return end
+    local function onChar(char)
+        trackCharacter(char)
+        char.DescendantAdded:Connect(function(d)
+            if d:IsA("BasePart") and not PartTracker[d] then
+                PartTracker[d] = { pos = d.Position, vel = d.AssemblyLinearVelocity, time = os.clock() }
+                local list = CharParts[char]
+                if list then list[#list + 1] = d end
+            end
+        end)
+        char.DescendantRemoving:Connect(function(d)
+            if PartTracker[d] then PartTracker[d] = nil end
+        end)
+    end
+    plr.CharacterAdded:Connect(onChar)
+    if plr.Character then onChar(plr.Character) end
+end
+
+for _, p in ipairs(Players:GetPlayers()) do bindPlayer(p) end
+Players.PlayerAdded:Connect(bindPlayer)
+Players.PlayerRemoving:Connect(function(p)
+    if p.Character then untrackCharacter(p.Character) end
+end)
+
 table.insert(connections, RunService.RenderStepped:Connect(function()
-    for _, d in pairs(HRPs) do
-        if d.hrp and d.hrp.Parent then
-            d.pos = d.hrp.Position
-            d.vel = d.hrp.AssemblyLinearVelocity
-            d.time = os.clock()
+    for char, parts in pairs(CharParts) do
+        if not char.Parent then
+            untrackCharacter(char)
+        else
+            for i = #parts, 1, -1 do
+                local d = parts[i]
+                if d.Parent then
+                    local t = PartTracker[d]
+                    if t then
+                        t.pos  = d.Position
+                        t.vel  = d.AssemblyLinearVelocity
+                        t.time = os.clock()
+                    end
+                else
+                    PartTracker[d] = nil
+                    table.remove(parts, i)
+                end
+            end
         end
     end
 end))
-local function predictedPos(data, extraTime)
-    if not data then return nil end
+
+local function predictPart(part, extraTime)
+    if not part then return nil end
+    local data = PartTracker[part]
+    if not data then return part.Position end
     local dt = (os.clock() - (data.time or os.clock())) + (extraTime or 0)
     if dt > 0.35 then dt = 0.35 end
     if dt < 0 then dt = 0 end
@@ -267,13 +327,11 @@ HitDebug.render = renderHitInfo
 HitDebug.clear = clearHitInfo
 end
 
--- ============================================================
--- GUI  — narrower panel (460 wide); height preserved
--- ============================================================
+-- GUI
 local Gui = make("ScreenGui", {Name="PlayerOrbitV3", ResetOnSpawn=false,
     IgnoreGuiInset=true, ZIndexBehavior=Enum.ZIndexBehavior.Sibling}, PlayerGui)
 
-local PANEL_W = 460      -- was 520, now narrower
+local PANEL_W = 460
 local PANEL_H = 1400
 
 local Main = make("Frame", {AnchorPoint=Vector2.new(0.5,0),
@@ -287,9 +345,9 @@ local Scale = make("UIScale", {Scale=1}, Main)
 local Header = make("Frame", {Size=UDim2.new(1,0,0,56), BackgroundTransparency=1, Active=true}, Main)
 make("Frame", {Position=UDim2.fromOffset(0,0), Size=UDim2.new(0,4,1,0),
     BackgroundColor3=ACCENT, BorderSizePixel=0}, Header)
-local Title = label("FLING  ·  v23.4M", 15, UDim2.fromOffset(20,10), UDim2.new(1,-180,0,20), Header)
+local Title = label("FLING  ·  v23.4N", 15, UDim2.fromOffset(20,10), UDim2.new(1,-180,0,20), Header)
 Title.Font = Enum.Font.GothamBold
-local SubTitle = label("HRP prediction  ·  Original / LeftUpperArm", 10,
+local SubTitle = label("Part-tracker ·  Original / LeftUpperArm", 10,
     UDim2.fromOffset(20,30), UDim2.new(1,-180,0,14), Header)
 SubTitle.TextColor3 = MUTED
 
@@ -432,7 +490,7 @@ local SelectAll     = makeActionBtn("ALL",  14,                    s_y, s_w, s_h
 local DeselectAll   = makeActionBtn("NONE", 14 + (s_w+s_gap)*1,    s_y, s_w, s_h, ROW)
 local InspectButton = makeActionBtn("SCAN", 14 + (s_w+s_gap)*2,    s_y, s_w, s_h, ACCENTD)
 
--- TARGET PART (2 options)
+-- TARGET PART selector
 local TargetPartHeading = label("TARGET PART", 11, UDim2.fromOffset(14,0),
     UDim2.new(1,-28,0,16), Content)
 TargetPartHeading.Font = Enum.Font.GothamBold
@@ -494,7 +552,7 @@ TargetPartButton.MouseButton1Click:Connect(function()
     TargetPartDropdown.Visible = not TargetPartDropdown.Visible
 end)
 
--- PREDICTION (ms)
+-- PREDICTION
 local PredHeading = label("PREDICTION (ms)", 11, UDim2.fromOffset(14,0),
     UDim2.new(1,-28,0,16), Content)
 PredHeading.Font = Enum.Font.GothamBold
@@ -737,7 +795,6 @@ local function reflowContents(panelWidth, panelHeight)
         place(InspectButton, 10 + 2 * (third + gap), selectionY + 22,
             innerWidth - 2 * (third + gap), 36)
     end
-    -- Actions tab
     place(sectionFrames[3], 10, 14, innerWidth, 18)
     local targetButtons = {TPButton, BringButton, FreezeButton,
         UnfreezeButton, AnchorButton, UnanchorButton}
@@ -752,7 +809,6 @@ local function reflowContents(panelWidth, panelHeight)
     place(TargetPartDropdown, 10, 344, innerWidth, 80)
     place(PredHeading, 10, 430, innerWidth, 18)
     place(PredBox,     10, 450, innerWidth, 34)
-    -- Tools
     place(UtilityTitle, 10, 14, innerWidth, 22)
     local utilityButtons = {AimbotButton, FollowButton, NoclipButton,
         SpeedButton, GrabObjectButton, RescueButton}
@@ -774,7 +830,6 @@ local function reflowContents(panelWidth, panelHeight)
         place(SmoothBox, 74 + half + gap, 232, half - 64, 34)
         place(ToolsHint, 10, 283, innerWidth, 44)
     end
-    -- Hits
     place(HitHeading, 10, 14, innerWidth, 24)
     place(HitDebug.summary, 10, 43, innerWidth, 55)
     place(HitDebug.details, 10, 106, innerWidth, 89)
@@ -818,7 +873,6 @@ PlayerRowLayout:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(function
     end)
 end)
 
--- WINDOW SIZING (unchanged height, narrower already set via PANEL_W)
 updateWindow = function()
     local cam = workspace.CurrentCamera
     local vp = cam and cam.ViewportSize or Vector2.new(1024, 768)
@@ -1259,28 +1313,10 @@ local function getTargetHRP(player)
     return tc, tHum, tHum and tHum.RootPart
 end
 
--- AIM POSITION — the crucial change.
--- Returns the world-space point we should aim at:
---   • HRP target  → predicted HRP position (velocity lead + sample age)
---   • arm target  → predicted HRP + the limb's current offset from HRP
+-- Aim point: predict the exact world position of the chosen part.
 local function getAimWorldPosition(tCharacter, aimPart)
-    if not tCharacter or not aimPart then return nil end
-    local tHum = tCharacter:FindFirstChildOfClass("Humanoid")
-    local tHRP = tHum and tHum.RootPart
-    if not tHRP then return aimPart.Position end
-
-    local plr = Players:GetPlayerFromCharacter(tCharacter)
-    local data = plr and HRPs[plr]
-    local predictedHRP = (data and predictedPos(data, PREDICTION_TIME)) or tHRP.Position
-
-    if aimPart == tHRP then
-        return predictedHRP
-    end
-    local limbOffset = aimPart.Position - tHRP.Position
-    if limbOffset.Magnitude > 6 then
-        limbOffset = limbOffset.Unit * 6
-    end
-    return predictedHRP + limbOffset
+    if not aimPart or not aimPart.Parent then return nil end
+    return predictPart(aimPart, PREDICTION_TIME) or aimPart.Position
 end
 
 local function findPlayerByName(name)
@@ -1657,11 +1693,8 @@ local function hardTeleportToTarget(player)
     local myRoot = hum and hum.RootPart
     local _, _, tRoot = getTargetHRP(player)
     if not (ch and myRoot and tRoot) then return false end
-    -- Aim at predicted HRP too so teleport doesn't lag behind a running target.
-    local tChar = player.Character
-    local aimWorld = getAimWorldPosition(tChar, tRoot) or tRoot.Position
-    local look = tRoot.CFrame.LookVector
-    local target = aimWorld + look * 2.5 + Vector3.new(0,2,0)
+    local aimWorld = getAimWorldPosition(player.Character, tRoot) or tRoot.Position
+    local target = aimWorld + tRoot.CFrame.LookVector * 2.5 + Vector3.new(0,2,0)
     pcall(function()
         ch:PivotTo(CFrame.new(target, aimWorld))
         myRoot.AssemblyLinearVelocity = Vector3.zero
@@ -1738,7 +1771,7 @@ local function sampleContact(myRoot, targetCharacter, targetRoot, params, monito
     end
 end
 
--- SKID FLING — KILASIK rotation + HRP prediction aim
+-- SKID FLING — KILASIK rotation + prediction + self-fling guard
 local function SkidFling(TargetPlayer, forcedPart, monitor)
     local Character = Me.Character
     local Humanoid  = Character and Character:FindFirstChildOfClass("Humanoid")
@@ -1789,7 +1822,12 @@ local function SkidFling(TargetPlayer, forcedPart, monitor)
         end)
     end
 
-    -- *** KEY CHANGE: aim at the predicted world position of BP ***
+    local swingOverlapParams = OverlapParams.new()
+    swingOverlapParams.FilterType = Enum.RaycastFilterType.Include
+    swingOverlapParams.FilterDescendantsInstances = {TCharacter}
+    swingOverlapParams.MaxParts = 12
+    swingOverlapParams.RespectCanCollide = false
+
     local function FPos(BP, Pos, Ang)
         if not RootPart.Parent or not BP.Parent then return end
         pcall(function()
@@ -1800,8 +1838,27 @@ local function SkidFling(TargetPlayer, forcedPart, monitor)
         local baseCF = CFrame.new(aimWorld)
         RootPart.CFrame = baseCF * Pos * Ang
         pcall(function() Character:SetPrimaryPartCFrame(baseCF * Pos * Ang) end)
-        RootPart.Velocity    = Vector3.new(9e7, 9e7 * 10, 9e7)
-        RootPart.RotVelocity = Vector3.new(9e8, 9e8, 9e8)
+
+        local overlapping = false
+        local ok, hits = pcall(function()
+            return workspace:GetPartsInPart(RootPart, swingOverlapParams)
+        end)
+        if ok then
+            for _, p in ipairs(hits) do
+                if p == BP or p:IsDescendantOf(TCharacter) then
+                    overlapping = true
+                    break
+                end
+            end
+        end
+
+        if overlapping then
+            RootPart.Velocity    = Vector3.new(9e7, 9e7 * 10, 9e7)
+            RootPart.RotVelocity = Vector3.new(9e8, 9e8, 9e8)
+        else
+            RootPart.Velocity    = Vector3.zero
+            RootPart.RotVelocity = Vector3.zero
+        end
     end
 
     local SFBasePart = function(BP)
@@ -1877,7 +1934,7 @@ local function SkidFling(TargetPlayer, forcedPart, monitor)
 
     if ran then attackOK, confirmed = true, result == true
     else
-        warn("[Fling v23.4M] Movement failed:", result)
+        warn("[Fling v23.4N] Movement failed:", result)
         setStatus("Movement error", RED, tostring(result):sub(1, 110))
     end
     if touchConnection then touchConnection:Disconnect() end
@@ -1911,6 +1968,26 @@ local function burstFlingTarget(player)
     for i = 1, HRP_BURST.MaxAttempts do
         if not FlingActive then break end
         if not isTargetReady(player) then break end
+
+        -- Airborne-chase break
+        do
+            local _, tHumNow, tRootNow = getTargetHRP(player)
+            if tHumNow and tRootNow and tRootNow.Parent and Me.Character then
+                local myRoot = Me.Character:FindFirstChild("HumanoidRootPart")
+                if myRoot then
+                    local v = tRootNow.AssemblyLinearVelocity.Magnitude
+                    local airborne = tHumNow.FloorMaterial == Enum.Material.Air
+                    local dist = (tRootNow.Position - myRoot.Position).Magnitude
+                    if v > 300 or (airborne and v > 100) or dist > 60 then
+                        setStatus(player.Name .. " already airborne — stop chase", CYAN,
+                            string.format("vel %.0f · airborne=%s · dist %.0f",
+                                v, tostring(airborne), dist))
+                        break
+                    end
+                end
+            end
+        end
+
         local candidate, candidateName = findAnyTargetPart(tc, tHum)
         if not candidate then
             setStatus("Target part unavailable", AMBER)
@@ -1997,16 +2074,41 @@ local function startFlingInternal(todo)
                 player.Name, i, #todo, getCurrentTargetLabel()), WHITE,
                 string.format("Predict +%.0f ms", PREDICTION_TIME * 1000))
             stopFollowThread()
-            local ok, peak, tries, pn = burstFlingTarget(player)
-            if ok then
-                setStatus(string.format("@%s contact (%s)", player.Name, tostring(pn or "?")),
-                    GREEN, string.format("Peak %.0f | %d tries", peak, tries))
-            else
-                setStatus(string.format("@%s no contact", player.Name), AMBER,
-                    string.format("Best %.0f | %d tries", peak, tries))
+
+            -- Skip if already airborne
+            local skip = false
+            do
+                local _, tHumPre, tRootPre = getTargetHRP(player)
+                if tHumPre and tRootPre and tRootPre.Parent and Me.Character then
+                    local myRoot = Me.Character:FindFirstChild("HumanoidRootPart")
+                    if myRoot then
+                        local v = tRootPre.AssemblyLinearVelocity.Magnitude
+                        local airborne = tHumPre.FloorMaterial == Enum.Material.Air
+                        local dist = (tRootPre.Position - myRoot.Position).Magnitude
+                        if v > 300 or (airborne and v > 100) or dist > 60 then
+                            setStatus(string.format("@%s already airborne (%.0f)", player.Name, v),
+                                CYAN, "Skipping — already flung")
+                            skip = true
+                        end
+                    end
+                end
             end
-            task.wait(CONFIG.Cooldown)
-            safeReturn()
+
+            if skip then
+                task.wait(CONFIG.Cooldown)
+                safeReturn()
+            else
+                local ok, peak, tries, pn = burstFlingTarget(player)
+                if ok then
+                    setStatus(string.format("@%s contact (%s)", player.Name, tostring(pn or "?")),
+                        GREEN, string.format("Peak %.0f | %d tries", peak, tries))
+                else
+                    setStatus(string.format("@%s no contact", player.Name), AMBER,
+                        string.format("Best %.0f | %d tries", peak, tries))
+                end
+                task.wait(CONFIG.Cooldown)
+                safeReturn()
+            end
         end
         FlingActive = false
         currentTarget = nil
@@ -2224,4 +2326,4 @@ updateWindow()
 refreshPlayers()
 setStatus("Ready · " .. getCurrentTargetLabel(), MUTED,
     string.format("Prediction: %.0f ms", PREDICTION_TIME * 1000))
-print("Fling v23.4M — HRP prediction; narrower panel; 2 target options")
+print("Fling v23.4N — universal part tracker, 2 target options, self-fling guard")
