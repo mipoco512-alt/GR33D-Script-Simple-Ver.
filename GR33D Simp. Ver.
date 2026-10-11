@@ -1,8 +1,656 @@
 --[[
-    GR33D EXPLOIT — Part 2/2
+    GR33D EXPLOIT
+      • Super Ring Old logic
+      • Multi-target + rung tracking + self-immunity
+      • Anti-Fling
+      • Fly GUI (fixed speed)
+      • Mass Fling
+      • Minimize shows round "G" button
 ]]
 
--- Fly GUI
+local Players    = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UIS        = game:GetService("UserInputService")
+local Lighting   = game:GetService("Lighting")
+
+local Me        = Players.LocalPlayer
+local PlayerGui = Me:WaitForChild("PlayerGui")
+
+local OrbitState = 0
+local LockedPosition = nil
+local targetPlayerNames = {}
+local rungPlayers = {}
+local lastTargetPos = nil
+local orbitTargetName = nil
+local orbitTargetStart = 0
+local itemsInRing = {}
+local itemsInRingLookup = {}
+local minimized = false
+local updateWindow
+
+local config = {
+    radiusA = 10, radiusB = 10,
+    heightA = 1, heightB = 1,
+    speed = 15, targetRadius = 50,
+    baseSpeedMultiplier = 2.0,
+    scanRadius = 500, maxItemsPerLoop = 60,
+    simRadius = 2048,
+    ringSuccessTime = 3.0, flingVelThreshold = 200,
+    selfImmunity = true, immunityRadius = 12,
+}
+
+local old = PlayerGui:FindFirstChild("GR33D_EXPLOIT")
+if old then old:Destroy() end
+
+local function selectedCount()
+    local n = 0
+    for _ in pairs(targetPlayerNames) do n = n + 1 end
+    return n
+end
+local function rungCount()
+    local n = 0
+    for _ in pairs(rungPlayers) do n = n + 1 end
+    return n
+end
+
+local BG=Color3.fromRGB(19,23,35) local PANEL=Color3.fromRGB(30,37,53)
+local ROW=Color3.fromRGB(41,49,69) local ROWHI=Color3.fromRGB(52,62,86)
+local ACCENT=Color3.fromRGB(83,138,255) local ACCENTD=Color3.fromRGB(60,100,200)
+local WHITE=Color3.fromRGB(245,247,255) local MUTED=Color3.fromRGB(155,169,193)
+local RED=Color3.fromRGB(184,68,84) local GREEN=Color3.fromRGB(64,160,96)
+local AMBER=Color3.fromRGB(200,160,60)
+
+local function make(c, p, parent)
+    local o = Instance.new(c)
+    for k, v in pairs(p) do o[k] = v end
+    o.Parent = parent
+    return o
+end
+local function round(o, r) make("UICorner", {CornerRadius = UDim.new(0, r)}, o) end
+local function label(t, s, pos, dim, parent)
+    return make("TextLabel", {Text=t, TextSize=s, Font=Enum.Font.Gotham, TextColor3=WHITE,
+        TextXAlignment=Enum.TextXAlignment.Left, TextTruncate=Enum.TextTruncate.AtEnd,
+        BackgroundTransparency=1, Position=pos, Size=dim}, parent)
+end
+
+-- ============================================================
+-- ROOT GUI
+-- ============================================================
+local Gui = make("ScreenGui", {Name="GR33D_EXPLOIT", ResetOnSpawn=false,
+    IgnoreGuiInset=true, ZIndexBehavior=Enum.ZIndexBehavior.Sibling}, PlayerGui)
+
+local PANEL_W = 440
+local PANEL_H = 1400
+
+local Main = make("Frame", {AnchorPoint=Vector2.new(0.5,0),
+    Position=UDim2.new(0.5,0,0,0.02), Size=UDim2.fromOffset(PANEL_W, PANEL_H),
+    BackgroundColor3=BG, BorderSizePixel=0, Active=true}, Gui)
+round(Main, 16)
+make("UIStroke", {Color=Color3.fromRGB(62,75,105), Thickness=1.5}, Main)
+local Scale = make("UIScale", {Scale=1}, Main)
+
+local MiniCircle = make("TextButton", {
+    Name = "MiniCircle",
+    Text = "G",
+    Font = Enum.Font.GothamBold,
+    TextSize = 24,
+    TextColor3 = Color3.fromRGB(20, 20, 22),
+    BackgroundColor3 = Color3.fromRGB(212, 175, 55),
+    Position = UDim2.new(0, 20, 0, 80),
+    Size = UDim2.fromOffset(58, 58),
+    Visible = false,
+    Active = true,
+    AutoButtonColor = false,
+    ZIndex = 100,
+}, Gui)
+round(MiniCircle, 999)
+make("UIStroke", {Color = Color3.fromRGB(255, 235, 150), Thickness = 2, Transparency = 0.35}, MiniCircle)
+
+do
+    local mcDragging, mcStart, mcPos, mcMoved = false, nil, nil, false
+    MiniCircle.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1
+        or input.UserInputType == Enum.UserInputType.Touch then
+            mcDragging = true; mcMoved = false
+            mcStart = input.Position
+            mcPos = MiniCircle.Position
+        end
+    end)
+    UIS.InputChanged:Connect(function(input)
+        if not mcDragging then return end
+        if input.UserInputType ~= Enum.UserInputType.MouseMovement and input ~= mcStart then return end
+        local delta = input.Position - mcStart
+        if delta.Magnitude > 4 then mcMoved = true end
+        MiniCircle.Position = UDim2.new(mcPos.X.Scale,
+            mcPos.X.Offset + delta.X, mcPos.Y.Scale, mcPos.Y.Offset + delta.Y)
+    end)
+    UIS.InputEnded:Connect(function(input)
+        if input == mcStart then mcDragging = false; mcStart = nil end
+    end)
+    MiniCircle.MouseButton1Click:Connect(function()
+        if mcMoved then return end
+        minimized = false
+        Main.Visible = true
+        MiniCircle.Visible = false
+        if updateWindow then updateWindow() end
+    end)
+end
+
+local Header = make("Frame", {Size=UDim2.new(1,0,0,56), BackgroundTransparency=1, Active=true}, Main)
+make("Frame", {Position=UDim2.fromOffset(0,0), Size=UDim2.new(0,4,1,0),
+    BackgroundColor3=ACCENT, BorderSizePixel=0}, Header)
+local Title = label("GR33D EXPLOIT", 15, UDim2.fromOffset(20,10), UDim2.new(1,-180,0,20), Header)
+Title.Font = Enum.Font.GothamBold
+local SubTitle = label("Multi-target · rung · immunity · mass", 10,
+    UDim2.fromOffset(20,30), UDim2.new(1,-180,0,14), Header)
+SubTitle.TextColor3 = MUTED
+
+local MinButton = make("TextButton", {Text="−", Font=Enum.Font.GothamBold, TextSize=22,
+    TextColor3=WHITE, BackgroundColor3=ROW, Position=UDim2.new(1,-160,0,12),
+    Size=UDim2.fromOffset(44,40)}, Header)
+round(MinButton, 9)
+local MaxButton = make("TextButton", {Text="▢", Font=Enum.Font.GothamBold, TextSize=15,
+    TextColor3=WHITE, BackgroundColor3=ROW, Position=UDim2.new(1,-110,0,12),
+    Size=UDim2.fromOffset(44,40)}, Header)
+round(MaxButton, 9)
+local CloseButton = make("TextButton", {Text="✕", Font=Enum.Font.GothamBold, TextSize=14,
+    TextColor3=WHITE, BackgroundColor3=RED, Position=UDim2.new(1,-60,0,12),
+    Size=UDim2.fromOffset(44,40)}, Header)
+round(CloseButton, 9)
+
+local Content = make("Frame", {Position=UDim2.fromOffset(0,56),
+    Size=UDim2.new(1,0,1,-56), BackgroundTransparency=1}, Main)
+
+local Navigation = make("Frame", {Name="Tabs", Position=UDim2.fromOffset(12,8),
+    Size=UDim2.new(1,-24,0,48), BackgroundTransparency=1}, Content)
+local PageHost = make("Frame", {Name="Pages", Position=UDim2.fromOffset(12,64),
+    Size=UDim2.new(1,-24,1,-200), BackgroundColor3=PANEL,
+    BorderSizePixel=0, ClipsDescendants=true}, Content)
+round(PageHost, 12)
+
+local function makePage(name)
+    return make("ScrollingFrame", {Name=name, Size=UDim2.fromScale(1,1),
+        BackgroundTransparency=1, Visible=false, BorderSizePixel=0,
+        ScrollingDirection=Enum.ScrollingDirection.Y, ScrollBarThickness=6,
+        ScrollBarImageColor3=ACCENT, CanvasSize=UDim2.fromOffset(0,460)}, PageHost)
+end
+local PlayerPage = makePage("Players")
+local RingPage   = makePage("Ring")
+local MassPage   = makePage("Mass")
+local ToolsPage  = makePage("Tools")
+
+local Footer = make("Frame", {Name="Footer", Position=UDim2.new(0,12,1,-128),
+    Size=UDim2.new(1,-24,0,122), BackgroundTransparency=1}, Content)
+local StatusPanel = make("Frame", {Position=UDim2.new(0,0,0,0),
+    Size=UDim2.new(1,0,0,52), BackgroundColor3=PANEL, BorderSizePixel=0}, Footer)
+round(StatusPanel, 10)
+make("UIStroke", {Color=Color3.fromRGB(48,56,76), Thickness=1}, StatusPanel)
+local StatusLbl = label("Ready", 12, UDim2.fromOffset(12,8), UDim2.new(1,-24,0,18), StatusPanel)
+StatusLbl.Font = Enum.Font.GothamMedium
+local StatusSub = label("Press Ring · Right Shift = emergency off", 10,
+    UDim2.fromOffset(12,26), UDim2.new(1,-24,0,14), StatusPanel)
+StatusSub.TextColor3 = MUTED
+local function setStatus(main, color, sub)
+    StatusLbl.Text = main
+    StatusLbl.TextColor3 = color or WHITE
+    StatusSub.Text = sub or ""
+end
+
+-- ============================================================
+-- PLAYERS PAGE
+-- ============================================================
+local sectionPlayers = label("PLAYERS", 10, UDim2.fromOffset(10,10), UDim2.new(1,-20,0,16), PlayerPage)
+sectionPlayers.Font = Enum.Font.GothamBold
+sectionPlayers.TextColor3 = MUTED
+
+local Search = make("TextBox", {Text="", PlaceholderText="🔍  Search players...",
+    ClearTextOnFocus=false, TextColor3=WHITE, PlaceholderColor3=MUTED,
+    TextSize=13, Font=Enum.Font.Gotham, BackgroundColor3=PANEL,
+    TextXAlignment=Enum.TextXAlignment.Left}, PlayerPage)
+round(Search, 10)
+make("UIPadding", {PaddingLeft=UDim.new(0,12)}, Search)
+
+local Count = label("Loading players...", 11, UDim2.fromOffset(10,0),
+    UDim2.new(1,-20,0,16), PlayerPage)
+Count.TextColor3 = MUTED
+
+local SelectAllBtn = make("TextButton", {Text="SELECT ALL", Font=Enum.Font.GothamBold,
+    TextSize=11, TextColor3=WHITE, BackgroundColor3=ROW, AutoButtonColor=false}, PlayerPage)
+round(SelectAllBtn, 8)
+local ClearBtn = make("TextButton", {Text="CLEAR", Font=Enum.Font.GothamBold,
+    TextSize=11, TextColor3=WHITE, BackgroundColor3=ROW, AutoButtonColor=false}, PlayerPage)
+round(ClearBtn, 8)
+local ResetRungBtn = make("TextButton", {Text="RESET", Font=Enum.Font.GothamBold,
+    TextSize=11, TextColor3=WHITE, BackgroundColor3=Color3.fromRGB(120,80,180),
+    AutoButtonColor=false}, PlayerPage)
+round(ResetRungBtn, 8)
+
+for _, b in ipairs({SelectAllBtn, ClearBtn, ResetRungBtn}) do
+    b.MouseEnter:Connect(function() b.BackgroundColor3 = b.BackgroundColor3:Lerp(Color3.new(1,1,1), 0.15) end)
+    b.MouseLeave:Connect(function()
+        if b == ResetRungBtn then b.BackgroundColor3 = Color3.fromRGB(120,80,180)
+        else b.BackgroundColor3 = ROW end
+    end)
+end
+
+local List = make("ScrollingFrame", {BackgroundColor3=PANEL, BorderSizePixel=0,
+    ScrollBarThickness=6, ScrollBarImageColor3=ACCENT,
+    CanvasSize=UDim2.fromOffset(0,0),
+    ScrollingDirection=Enum.ScrollingDirection.Y, ScrollingEnabled=true,
+    ClipsDescendants=true}, PlayerPage)
+round(List, 10)
+make("UIPadding", {PaddingTop=UDim.new(0,6), PaddingBottom=UDim.new(0,6),
+    PaddingLeft=UDim.new(0,6), PaddingRight=UDim.new(0,6)}, List)
+local ListLayout = make("UIListLayout", {SortOrder=Enum.SortOrder.LayoutOrder,
+    Padding=UDim.new(0,6)}, List)
+
+local rows = {}
+local function loadAvatar(player, image, size)
+    image:SetAttribute("AvatarUserId", player.UserId)
+    image.Image = ""
+    task.spawn(function()
+        local ok, url = pcall(function()
+            return Players:GetUserThumbnailAsync(player.UserId, Enum.ThumbnailType.HeadShot, size)
+        end)
+        if ok and image.Parent and image:GetAttribute("AvatarUserId") == player.UserId then
+            image.Image = url
+        end
+    end)
+end
+
+local function refreshPlayers()
+    for _, r in pairs(rows) do r:Destroy() end
+    table.clear(rows)
+    local all = Players:GetPlayers()
+    table.sort(all, function(a,b) return a.Name:lower() < b.Name:lower() end)
+    local q = Search.Text:lower()
+    local shown = 0
+    for _, player in ipairs(all) do
+        if player ~= Me
+           and (player.Name:lower():find(q,1,true)
+                or player.DisplayName:lower():find(q,1,true)) then
+            shown = shown + 1
+            local selected = targetPlayerNames[player.Name] == true
+            local rung = rungPlayers[player.Name] == true
+            local rowColor = ROW
+            if rung then rowColor = Color3.fromRGB(90,60,60)
+            elseif selected then rowColor = Color3.fromRGB(58,78,110) end
+
+            local Row = make("TextButton", {Size=UDim2.new(1,-18,0,60),
+                LayoutOrder=shown, BackgroundColor3=rowColor,
+                BorderSizePixel=0, AutoButtonColor=false, Text=""}, List)
+            round(Row, 10)
+            Row.MouseEnter:Connect(function()
+                if not selected then Row.BackgroundColor3 = ROWHI end
+            end)
+            Row.MouseLeave:Connect(function()
+                if not selected then Row.BackgroundColor3 = ROW end
+            end)
+            local pic = make("ImageLabel", {Position=UDim2.fromOffset(36,8),
+                Size=UDim2.fromOffset(44,44), BackgroundColor3=PANEL, Image=""}, Row)
+            round(pic, 22)
+            local check = make("Frame", {Position=UDim2.fromOffset(8,17),
+                Size=UDim2.fromOffset(24,24), BackgroundColor3=Color3.fromRGB(60,70,95),
+                BorderSizePixel=0}, Row)
+            round(check, 6)
+            make("UIStroke", {Color=Color3.fromRGB(80,92,118), Thickness=1}, check)
+            local checkTxt = "✓"
+            local checkCol = Color3.fromRGB(60,230,130)
+            if rung then checkTxt = "✗"; checkCol = Color3.fromRGB(230,110,110) end
+            make("TextLabel", {Size=UDim2.fromScale(1,1), BackgroundTransparency=1,
+                Text=checkTxt, TextColor3=checkCol,
+                Font=Enum.Font.GothamBold, TextSize=16, Visible=selected}, check)
+            local dl = label(player.DisplayName .. (rung and "  [RUNG]" or ""), 14,
+                UDim2.fromOffset(88,8), UDim2.new(1,-96,0,22), Row)
+            dl.Font = Enum.Font.GothamBold
+            if rung then dl.TextColor3 = Color3.fromRGB(230,110,110) end
+            local ul = label("@"..player.Name, 11, UDim2.fromOffset(88,32),
+                UDim2.new(1,-96,0,18), Row)
+            ul.TextColor3 = MUTED
+            loadAvatar(player, pic, Enum.ThumbnailSize.Size100x100)
+            Row.MouseButton1Click:Connect(function()
+                if targetPlayerNames[player.Name] then
+                    targetPlayerNames[player.Name] = nil
+                    rungPlayers[player.Name] = nil
+                else
+                    targetPlayerNames[player.Name] = true
+                    rungPlayers[player.Name] = nil
+                end
+                refreshPlayers()
+                local n = selectedCount()
+                setStatus(n == 0 and "Target: self (no selection)" or ("Selected: "..n),
+                    n == 0 and MUTED or Color3.fromRGB(80,180,200))
+            end)
+            rows[player] = Row
+        end
+    end
+    Count.Text = string.format("%d online · %d shown · %d selected · %d rung",
+        #all, shown, selectedCount(), rungCount())
+end
+
+SelectAllBtn.MouseButton1Click:Connect(function()
+    for _, player in ipairs(Players:GetPlayers()) do
+        if player ~= Me then
+            targetPlayerNames[player.Name] = true
+            rungPlayers[player.Name] = nil
+        end
+    end
+    refreshPlayers()
+    setStatus("Selected: "..selectedCount(), Color3.fromRGB(80,180,200))
+end)
+ClearBtn.MouseButton1Click:Connect(function()
+    table.clear(targetPlayerNames)
+    table.clear(rungPlayers)
+    lastTargetPos = nil
+    orbitTargetName = nil
+    refreshPlayers()
+    setStatus("Target: self (no selection)", MUTED)
+end)
+ResetRungBtn.MouseButton1Click:Connect(function()
+    table.clear(rungPlayers)
+    lastTargetPos = nil
+    orbitTargetName = nil
+    refreshPlayers()
+    setStatus("Rung list reset", Color3.fromRGB(200,160,60))
+end)
+
+Search:GetPropertyChangedSignal("Text"):Connect(function()
+    List.CanvasPosition = Vector2.zero
+    refreshPlayers()
+end)
+Players.PlayerAdded:Connect(function() task.defer(refreshPlayers) end)
+Players.PlayerRemoving:Connect(function(p)
+    targetPlayerNames[p.Name] = nil
+    rungPlayers[p.Name] = nil
+    task.defer(refreshPlayers)
+end)
+
+-- ============================================================
+-- RING PAGE
+-- ============================================================
+local RingHeading = label("SUPER RING OLD", 12, UDim2.fromOffset(10,14),
+    UDim2.new(1,-20,0,22), RingPage)
+RingHeading.Font = Enum.Font.GothamBold
+RingHeading.TextColor3 = ACCENT
+
+local RingHint = label("Ring orbits nearest non-rung selected player. Self-Immunity keeps parts out of your safe radius.",
+    11, UDim2.fromOffset(10,40), UDim2.new(1,-20,0,52), RingPage)
+RingHint.TextWrapped = true
+RingHint.TextColor3 = MUTED
+
+local RingToggle = make("TextButton", {Text="Ring: OFF", Font=Enum.Font.GothamBold,
+    TextSize=14, TextColor3=WHITE, BackgroundColor3=RED, AutoButtonColor=false}, RingPage)
+round(RingToggle, 10)
+RingToggle.MouseButton1Click:Connect(function()
+    local ch = Me.Character
+    local hrp = ch and ch:FindFirstChild("HumanoidRootPart")
+    if not hrp and OrbitState ~= 0 then setStatus("No character", RED); return end
+    if OrbitState == 0 then
+        OrbitState = 1
+        RingToggle.Text = "Ring: ON"
+        RingToggle.BackgroundColor3 = GREEN
+        setStatus("Orbit active", GREEN, "Targeting selected players")
+    elseif OrbitState == 1 then
+        LockedPosition = hrp.Position
+        OrbitState = 2
+        RingToggle.Text = "Ring: LOCKED"
+        RingToggle.BackgroundColor3 = AMBER
+        setStatus("Orbit locked", AMBER, "Center frozen")
+    else
+        OrbitState = 0
+        LockedPosition = nil
+        RingToggle.Text = "Ring: OFF"
+        RingToggle.BackgroundColor3 = RED
+        for _, v in pairs(itemsInRing) do
+            if v and v.Parent then
+                local bp = v:FindFirstChild("OrbitBP")
+                if bp then bp:Destroy() end
+            end
+        end
+        itemsInRing = {}
+        itemsInRingLookup = {}
+        table.clear(rungPlayers)
+        lastTargetPos = nil
+        orbitTargetName = nil
+        refreshPlayers()
+        setStatus("Orbit off", MUTED)
+    end
+end)
+
+local ringRows = {}
+local function createRingRow(labelText, minV, maxV, stepV, getFn, setFn)
+    local lbl = label(labelText, 11, UDim2.fromOffset(10,0), UDim2.fromOffset(200,16), RingPage)
+    lbl.Font = Enum.Font.GothamBold
+    lbl.TextColor3 = MUTED
+    local dec = make("TextButton", {Text="−", Font=Enum.Font.GothamBold, TextSize=20,
+        TextColor3=WHITE, BackgroundColor3=ROW, AutoButtonColor=false}, RingPage)
+    round(dec, 8)
+    local box = make("TextBox", {Text=tostring(getFn()), ClearTextOnFocus=false,
+        TextColor3=WHITE, TextSize=13, Font=Enum.Font.GothamBold,
+        BackgroundColor3=PANEL, TextXAlignment=Enum.TextXAlignment.Center}, RingPage)
+    round(box, 8)
+    local inc = make("TextButton", {Text="+", Font=Enum.Font.GothamBold, TextSize=20,
+        TextColor3=WHITE, BackgroundColor3=ROW, AutoButtonColor=false}, RingPage)
+    round(inc, 8)
+    dec.MouseButton1Click:Connect(function()
+        setFn(math.clamp(getFn()-stepV,minV,maxV)); box.Text = tostring(getFn())
+    end)
+    inc.MouseButton1Click:Connect(function()
+        setFn(math.clamp(getFn()+stepV,minV,maxV)); box.Text = tostring(getFn())
+    end)
+    box.FocusLost:Connect(function(enter)
+        if enter then local n = tonumber(box.Text); if n then setFn(math.clamp(n,minV,maxV)) end end
+        box.Text = tostring(getFn())
+    end)
+    table.insert(ringRows, {label=lbl, dec=dec, box=box, inc=inc})
+end
+
+createRingRow("Radius A",       1, 500, 1, function() return config.radiusA end, function(v) config.radiusA = v end)
+createRingRow("Radius B",       1, 500, 1, function() return config.radiusB end, function(v) config.radiusB = v end)
+createRingRow("Height A",    -200, 400, 1, function() return config.heightA end, function(v) config.heightA = v end)
+createRingRow("Height B",    -200, 400, 1, function() return config.heightB end, function(v) config.heightB = v end)
+createRingRow("Spin Speed",     1, 100, 1, function() return config.speed end,   function(v) config.speed = v end)
+createRingRow("Target Radius",  0, 500, 5, function() return config.targetRadius end, function(v) config.targetRadius = v end)
+createRingRow("Scan Radius",   50, 2000, 50, function() return config.scanRadius end, function(v) config.scanRadius = v end)
+createRingRow("Success Time",   1, 30, 0.5, function() return config.ringSuccessTime end, function(v) config.ringSuccessTime = v end)
+createRingRow("Immunity Radius", 2, 100, 1, function() return config.immunityRadius end, function(v) config.immunityRadius = v end)
+
+local SelfImmunityToggle = make("TextButton", {
+    Text = "Self-Immunity: " .. (config.selfImmunity and "ON" or "OFF"),
+    Font = Enum.Font.GothamBold, TextSize = 13, TextColor3 = WHITE,
+    BackgroundColor3 = config.selfImmunity and GREEN or ROW,
+    AutoButtonColor = false}, RingPage)
+round(SelfImmunityToggle, 8)
+SelfImmunityToggle.MouseButton1Click:Connect(function()
+    config.selfImmunity = not config.selfImmunity
+    SelfImmunityToggle.Text = "Self-Immunity: " .. (config.selfImmunity and "ON" or "OFF")
+    SelfImmunityToggle.BackgroundColor3 = config.selfImmunity and GREEN or ROW
+    setStatus("Self-Immunity " .. (config.selfImmunity and "ON" or "OFF"),
+        config.selfImmunity and GREEN or MUTED,
+        "Safe radius: " .. config.immunityRadius .. " studs")
+end)
+
+local RingNote = label("Right Shift = emergency off.",
+    10, UDim2.fromOffset(10,0), UDim2.new(1,-20,0,24), RingPage)
+RingNote.TextWrapped = true
+RingNote.TextColor3 = MUTED
+
+-- ============================================================
+-- FPS BOOST
+-- ============================================================
+local fpsActive = false
+local function applyFPSBoost()
+    local set = _G.Settings or {}
+    local noParts  = set["No Particles"] ~= false
+    local noCam    = set["No Camera Effects"] ~= false
+    local noExp    = set["No Explosions"] ~= false
+    local noShadow = set["No Shadows"] ~= false
+    local lowQual  = set["Low Quality Parts"] ~= false
+
+    if noParts then
+        for _, obj in ipairs(workspace:GetDescendants()) do
+            if obj:IsA("ParticleEmitter") or obj:IsA("Trail") or obj:IsA("Smoke")
+               or obj:IsA("Fire") or obj:IsA("Sparkles") then
+                obj.Enabled = false
+            end
+        end
+        workspace.DescendantAdded:Connect(function(obj)
+            if obj:IsA("ParticleEmitter") or obj:IsA("Trail") or obj:IsA("Smoke")
+               or obj:IsA("Fire") or obj:IsA("Sparkles") then
+                obj.Enabled = false
+            end
+        end)
+    end
+    if noCam then
+        for _, obj in ipairs(Lighting:GetChildren()) do
+            if obj:IsA("PostEffect") then obj.Enabled = false end
+        end
+    end
+    if noExp then
+        for _, obj in ipairs(workspace:GetDescendants()) do
+            if obj:IsA("Explosion") then obj.Visible = false end
+        end
+        workspace.DescendantAdded:Connect(function(obj)
+            if obj:IsA("Explosion") then obj.Visible = false end
+        end)
+    end
+    if noShadow then
+        Lighting.GlobalShadows = false
+        Lighting.FogEnd = 100000
+        for _, obj in ipairs(workspace:GetDescendants()) do
+            if obj:IsA("BasePart") then obj.CastShadow = false end
+        end
+        workspace.DescendantAdded:Connect(function(obj)
+            if obj:IsA("BasePart") then obj.CastShadow = false end
+        end)
+    end
+    if lowQual then
+        for _, obj in ipairs(workspace:GetDescendants()) do
+            if obj:IsA("BasePart") then
+                pcall(function() obj.Material = Enum.Material.SmoothPlastic end)
+            end
+        end
+    end
+end
+
+-- ============================================================
+-- FLING ALL
+-- ============================================================
+local flingAllRunning = false
+local function flingAll()
+    if flingAllRunning then return end
+    flingAllRunning = true
+    getgenv().FPDH = workspace.FallenPartsDestroyHeight
+
+    local function msg(t, x, dur)
+        pcall(function()
+            game:GetService("StarterGui"):SetCore("SendNotification",
+                {Title=t, Text=x, Duration=dur or 5})
+        end)
+    end
+
+    local function skidFling(TargetPlayer)
+        local Character = Me.Character
+        local Humanoid = Character and Character:FindFirstChildOfClass("Humanoid")
+        local RootPart = Humanoid and Humanoid.RootPart
+        if not (Character and Humanoid and RootPart) then return end
+        local TCharacter = TargetPlayer.Character
+        if not TCharacter then return end
+        local THumanoid = TCharacter:FindFirstChildOfClass("Humanoid")
+        local TRootPart = THumanoid and THumanoid.RootPart
+        local THead = TCharacter:FindFirstChild("Head")
+        local Accessory = TCharacter:FindFirstChildOfClass("Accessory")
+        local Handle = Accessory and Accessory:FindFirstChild("Handle")
+
+        if RootPart.Velocity.Magnitude < 50 then getgenv().OldPos = RootPart.CFrame end
+        if THumanoid and THumanoid.Sit then return end
+        if not TCharacter:FindFirstChildWhichIsA("BasePart") then return end
+
+        local function FPos(bp, pos, ang)
+            RootPart.CFrame = CFrame.new(bp.Position) * pos * ang
+            Character:SetPrimaryPartCFrame(CFrame.new(bp.Position) * pos * ang)
+            RootPart.Velocity = Vector3.new(9e7, 9e7*10, 9e7)
+            RootPart.RotVelocity = Vector3.new(9e8, 9e8, 9e8)
+        end
+
+        local function SFBasePart(BasePart)
+            local Time = tick()
+            local Angle = 0
+            repeat
+                if not (RootPart and THumanoid) then break end
+                if BasePart.Velocity.Magnitude < 50 then
+                    Angle = Angle + 100
+                    FPos(BasePart, CFrame.new(0,1.5,0) + THumanoid.MoveDirection * BasePart.Velocity.Magnitude/1.25, CFrame.Angles(math.rad(Angle),0,0)); task.wait()
+                    FPos(BasePart, CFrame.new(0,-1.5,0) + THumanoid.MoveDirection * BasePart.Velocity.Magnitude/1.25, CFrame.Angles(math.rad(Angle),0,0)); task.wait()
+                    FPos(BasePart, CFrame.new(2.25,1.5,-2.25) + THumanoid.MoveDirection * BasePart.Velocity.Magnitude/1.25, CFrame.Angles(math.rad(Angle),0,0)); task.wait()
+                    FPos(BasePart, CFrame.new(-2.25,-1.5,2.25) + THumanoid.MoveDirection * BasePart.Velocity.Magnitude/1.25, CFrame.Angles(math.rad(Angle),0,0)); task.wait()
+                    FPos(BasePart, CFrame.new(0,1.5,0) + THumanoid.MoveDirection, CFrame.Angles(math.rad(Angle),0,0)); task.wait()
+                    FPos(BasePart, CFrame.new(0,-1.5,0) + THumanoid.MoveDirection, CFrame.Angles(math.rad(Angle),0,0)); task.wait()
+                else
+                    FPos(BasePart, CFrame.new(0,1.5,THumanoid.WalkSpeed), CFrame.Angles(math.rad(90),0,0)); task.wait()
+                    FPos(BasePart, CFrame.new(0,-1.5,-THumanoid.WalkSpeed), CFrame.Angles(0,0,0)); task.wait()
+                    FPos(BasePart, CFrame.new(0,1.5,THumanoid.WalkSpeed), CFrame.Angles(math.rad(90),0,0)); task.wait()
+                    FPos(BasePart, CFrame.new(0,1.5,TRootPart.Velocity.Magnitude/1.25), CFrame.Angles(math.rad(90),0,0)); task.wait()
+                    FPos(BasePart, CFrame.new(0,-1.5,-TRootPart.Velocity.Magnitude/1.25), CFrame.Angles(0,0,0)); task.wait()
+                    FPos(BasePart, CFrame.new(0,1.5,TRootPart.Velocity.Magnitude/1.25), CFrame.Angles(math.rad(90),0,0)); task.wait()
+                    FPos(BasePart, CFrame.new(0,-1.5,0), CFrame.Angles(math.rad(90),0,0)); task.wait()
+                    FPos(BasePart, CFrame.new(0,-1.5,0), CFrame.Angles(0,0,0)); task.wait()
+                    FPos(BasePart, CFrame.new(0,-1.5,0), CFrame.Angles(math.rad(-90),0,0)); task.wait()
+                    FPos(BasePart, CFrame.new(0,-1.5,0), CFrame.Angles(0,0,0)); task.wait()
+                end
+            until BasePart.Velocity.Magnitude > 500
+                or BasePart.Parent ~= TargetPlayer.Character
+                or TargetPlayer.Parent ~= Players
+                or THumanoid.Sit
+                or Humanoid.Health <= 0
+                or tick() > Time + 2
+        end
+
+        workspace.FallenPartsDestroyHeight = 0/0
+        local BV = Instance.new("BodyVelocity")
+        BV.Name = "EpixVel"
+        BV.Parent = RootPart
+        BV.Velocity = Vector3.new(9e8, 9e8, 9e8)
+        BV.MaxForce = Vector3.new(1/0, 1/0, 1/0)
+        Humanoid:SetStateEnabled(Enum.HumanoidStateType.Seated, false)
+
+        if TRootPart and THead then
+            if (TRootPart.CFrame.p - THead.CFrame.p).Magnitude > 5 then
+                SFBasePart(THead)
+            else
+                SFBasePart(TRootPart)
+            end
+        elseif TRootPart then SFBasePart(TRootPart)
+        elseif THead then SFBasePart(THead)
+        elseif Handle then SFBasePart(Handle)
+        else return msg("Fling All", "Target missing parts") end
+
+        BV:Destroy()
+        Humanoid:SetStateEnabled(Enum.HumanoidStateType.Seated, true)
+        repeat
+            RootPart.CFrame = getgenv().OldPos * CFrame.new(0,.5,0)
+            Character:SetPrimaryPartCFrame(getgenv().OldPos * CFrame.new(0,.5,0))
+            Humanoid:ChangeState("GettingUp")
+            for _, x in ipairs(Character:GetChildren()) do
+                if x:IsA("BasePart") then x.Velocity = Vector3.zero; x.RotVelocity = Vector3.zero end
+            end
+            task.wait()
+        until (RootPart.Position - getgenv().OldPos.p).Magnitude < 25
+        workspace.FallenPartsDestroyHeight = getgenv().FPDH
+    end
+
+    for _, target in ipairs(Players:GetPlayers()) do
+        if target ~= Me then
+            pcall(skidFling, target)
+        end
+    end
+    flingAllRunning = false
+    msg("Fling All", "Done", 3)
+end
+
+-- ============================================================
+-- FLY GUI
+-- ============================================================
 local function loadFlyGui()
     if Me.PlayerGui:FindFirstChild("main") then Me.PlayerGui.main:Destroy() end
 
@@ -27,7 +675,7 @@ local function loadFlyGui()
     Frame.Parent = main
     Frame.BackgroundColor3 = Color3.fromRGB(163, 255, 137)
     Frame.BorderColor3 = Color3.fromRGB(103, 221, 213)
-    Frame.Position = UDim2.new(0.100320168, 0, 0.379746825, 0)
+    Frame.Position = UDim2.new(0.1, 0, 0.35, 0)
     Frame.Size = UDim2.new(0, 210, 0, 60)
 
     up.Parent = Frame; up.BackgroundColor3 = Color3.fromRGB(79, 255, 152)
@@ -85,16 +733,10 @@ local function loadFlyGui()
     local flySpeed = 50
     local FLY_MIN, FLY_MAX = 10, 500
     local FLY_STEP = 25
-
     local nowe = false
     local speaker = Players.LocalPlayer
 
     speed.Text = tostring(flySpeed)
-
-    pcall(function()
-        game:GetService("StarterGui"):SetCore("SendNotification", {
-            Title = "FLY GUI V3"; Text = "BY XNEO"})
-    end)
 
     Frame.Active = true
     Frame.Draggable = true
@@ -263,7 +905,9 @@ local function loadFlyGui()
     end)
 end
 
--- Anti-Fling
+-- ============================================================
+-- ANTI-FLING
+-- ============================================================
 local antiFlingEnabled = false
 local antiFlingConn = nil
 local antiFlingSafeCF = nil
@@ -330,7 +974,9 @@ local function stopAntiFling()
     antiFlingSafeCF = nil
 end
 
--- Mass Fling state + functions
+-- ============================================================
+-- MASS FLING
+-- ============================================================
 local massState = {
     enabled = false, parts = {}, lookup = {},
     scanRadius = 3000, itemsPerScan = 200,
@@ -459,7 +1105,9 @@ local function massClear()
     table.clear(massState.lookup)
 end
 
--- Mass page UI
+-- ============================================================
+-- MASS PAGE
+-- ============================================================
 local MassHeading = label("MASS FLING", 12, UDim2.fromOffset(10,14),
     UDim2.new(1,-20,0,22), MassPage)
 MassHeading.Font = Enum.Font.GothamBold
@@ -567,19 +1215,21 @@ task.spawn(function()
     end
 end)
 
-local MassNote = label("FLING NOW targets: selected player > nearest > locked pos.",
-    10, UDim2.fromOffset(10,0), UDim2.new(1,-20,0,30), MassPage)
+local MassNote = label("FLING NOW targets: selected > nearest > locked pos.",
+    10, UDim2.fromOffset(10,0), UDim2.new(1,-20,0,24), MassPage)
 MassNote.TextWrapped = true
 MassNote.TextColor3 = MUTED
 
--- Tools page
+-- ============================================================
+-- TOOLS PAGE
+-- ============================================================
 local ToolsHeading = label("EXTERNAL TOOLS", 12, UDim2.fromOffset(10,14),
     UDim2.new(1,-20,0,22), ToolsPage)
 ToolsHeading.Font = Enum.Font.GothamBold
 ToolsHeading.TextColor3 = ACCENT
 
-local ToolsHint = label("Hardcoded — no loadstrings, no external URLs.",
-    11, UDim2.fromOffset(10,40), UDim2.new(1,-20,0,24), ToolsPage)
+local ToolsHint = label("Hardcoded — no loadstrings.",
+    11, UDim2.fromOffset(10,40), UDim2.new(1,-20,0,20), ToolsPage)
 ToolsHint.TextWrapped = true
 ToolsHint.TextColor3 = MUTED
 
@@ -635,7 +1285,9 @@ end)
 
 make("UIListLayout", {SortOrder=Enum.SortOrder.LayoutOrder, Padding=UDim.new(0,8)}, ToolsPage)
 
--- Tab controller
+-- ============================================================
+-- TAB CONTROLLER
+-- ============================================================
 local tabButtons = {}
 local currentTab = "Players"
 local function showTab(name)
@@ -692,7 +1344,6 @@ local function reflow(panelWidth, panelHeight)
     place(List, 10, listY, innerWidth, listH)
     List.CanvasSize = UDim2.fromOffset(0, math.ceil(ListLayout.AbsoluteContentSize.Y) + 22)
 
-    -- Ring
     local ringY = 14
     place(RingHeading, 10, ringY, innerWidth, 22); ringY = ringY + 26
     place(RingHint, 10, ringY, innerWidth, 52); ringY = ringY + 60
@@ -705,10 +1356,9 @@ local function reflow(panelWidth, panelHeight)
         ringY = ringY + 66
     end
     place(SelfImmunityToggle, 10, ringY, innerWidth, 44); ringY = ringY + 50
-    place(RingNote, 10, ringY, innerWidth, 30)
-    RingPage.CanvasSize = UDim2.fromOffset(0, ringY + 50)
+    place(RingNote, 10, ringY, innerWidth, 24)
+    RingPage.CanvasSize = UDim2.fromOffset(0, ringY + 40)
 
-    -- Mass
     local massY = 14
     place(MassHeading, 10, massY, innerWidth, 22); massY = massY + 26
     place(MassHint, 10, massY, innerWidth, 42); massY = massY + 50
@@ -723,12 +1373,11 @@ local function reflow(panelWidth, panelHeight)
     end
     place(MassFlingBtn, 10, massY, innerWidth, 54); massY = massY + 64
     place(MassClearBtn, 10, massY, innerWidth, 42); massY = massY + 50
-    place(MassNote, 10, massY, innerWidth, 30)
-    MassPage.CanvasSize = UDim2.fromOffset(0, massY + 50)
+    place(MassNote, 10, massY, innerWidth, 24)
+    MassPage.CanvasSize = UDim2.fromOffset(0, massY + 40)
 
-    -- Tools
     place(ToolsHeading, 10, 14, innerWidth, 22)
-    place(ToolsHint, 10, 40, innerWidth, 24)
+    place(ToolsHint, 10, 40, innerWidth, 20)
     ToolsPage.CanvasSize = UDim2.fromOffset(0, 400)
 end
 
@@ -748,7 +1397,6 @@ updateWindow = function()
     local hudTop = math.max(insetY + 4, 8)
     local usableH = math.max(180, vp.Y - hudTop - 12)
     local h = math.min(PANEL_H, usableH)
-    -- mobile: shrink width to viewport
     local w = math.min(PANEL_W, math.max(280, vp.X - 16))
     local compact = h < 480
     local headerH = compact and 40 or 56
@@ -781,7 +1429,6 @@ updateWindow = function()
     reflow(w, h)
     showTab(currentTab)
 end
-_G.__GR33D_UPDATE = updateWindow
 
 MinButton.MouseButton1Click:Connect(function()
     minimized = true
@@ -815,7 +1462,9 @@ local cam = workspace.CurrentCamera
 if cam then cam:GetPropertyChangedSignal("ViewportSize"):Connect(updateWindow) end
 CloseButton.MouseButton1Click:Connect(function() Gui:Destroy() end)
 
--- Ring core
+-- ============================================================
+-- RING CORE
+-- ============================================================
 pcall(function() Me.ReplicationFocus = workspace end)
 pcall(function() sethiddenproperty(Me, "SimulationRadius", config.simRadius) end)
 Me.CharacterAdded:Connect(function()
@@ -1024,9 +1673,12 @@ UIS.InputBegan:Connect(function(input, gpe)
     end
 end)
 
+-- ============================================================
+-- BOOT
+-- ============================================================
 refreshPlayers()
 showTab("Players")
 updateWindow()
 setStatus("Ready · press Ring or Mass to start", MUTED,
     "Self-immunity: " .. (config.selfImmunity and "ON" or "OFF"))
-print("[GR33D EXPLOIT] loaded — full UI active")
+print("[GR33D EXPLOIT] loaded")
