@@ -1,1288 +1,1041 @@
 --[[
-    PLAYER FLING v23.7 + SUPER RING (ownership mode)
-    • Fling core untouched
-    • Super Ring now claims SetNetworkOwner + widens ReplicationFocus
-    • CanCollide stays ON so ring can push parts
-    • Your own character is still excluded + ForceField + keep-out radius
-    • Kill switch: Right Shift = ring off
+    GR33D EXPLOIT
+      • Super Ring Old logic (BodyPosition orbit)
+      • Multi-tab UI
+      • Hardcoded Fly GUI (XNEOFF source)
+      • Hardcoded Fling All (Targets source)
+      • Hardcoded FPS Boost (_G.Settings source)
+      • No loadstrings anywhere
 ]]
-
-local FlingFunctions = {}
 
 local Players    = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local UIS        = game:GetService("UserInputService")
-local CollectionService = game:GetService("CollectionService")
-local Stats      = game:GetService("Stats")
+local Lighting   = game:GetService("Lighting")
 
 local Me        = Players.LocalPlayer
 local PlayerGui = Me:WaitForChild("PlayerGui")
 
-local CONFIG = {
-    TimeToWait = 4.0, LandingClearance = 1.4, LandingRadius = 9,
-    LandingMaxSlope = 0.72, LandingSettleFrames = 10,
-    AngleStep = 25, KickSpeed = 110, KickYSpeed = 48, KickRot = 28,
-    Cooldown = 0.15, FlingDetectSpeed = 400, FlingDetectFrames = 8,
-    MinFlingTime = 0.5, ResetStates = true, SelfHealthCap = 1e6,
-    ApproachDist = 6, FollowHz = 25, SettleWait = 1.0, StunTarget = true,
-    SpeedBoost = 3.0, AimFOV = 200, AimSmooth = 1,
-    AimHoldKey = Enum.UserInputType.MouseButton2,
-    ThreatDist = 10, ThreatVel = 500, GuardVelCap = 200,
-    AnchorHold = 0.05, HoldAfterHit = 1.0,
-    PredictionSeconds = 0.065, PredictionMaxSeconds = 0.12,
-    PredictionMaxStuds = 2.35, PredictionMaxSpeed = 60,
-    PredictionDirectionReset = 0.35,
-    OverlapCheckInterval = 0.025, MinimumResponseDelta = 35,
-    AutoFreezeTarget = false,
-    AltSliceTime  = 1.2,
-    AltMaxCycles  = 6,
-    AltReturnWait = 0.15,
-    AimUpFraction = 0.30,
-    AimUpFractionHRP = 0.10,
+-- ============================================================
+-- STATE
+-- ============================================================
+local OrbitState = 0
+local LockedPosition = nil
+local targetPlayerName = ""
+local itemsInRing = {}
+local itemsInRingLookup = {}
+
+local config = {
+    radiusA = 10, radiusB = 10,
+    heightA = 1, heightB = 1,
+    speed = 15, targetRadius = 50,
+    baseSpeedMultiplier = 2.0,
+    scanRadius = 500,
+    maxItemsPerLoop = 60,
+    simRadius = 2048,
 }
-local HRP_BURST = { MaxAttempts = 8, SuccessPeakVel = 90, DelayBetween = 0.15, SampleAfter = 0.30 }
 
-local KICK_PART_ORDER = { "LeftLowerArm", "LeftUpperArm", "LeftHand", "Left Arm" }
-
-local TARGET_OPTIONS = {
-    {id = "arm", label = "L-LowerArm (upper)"},
-    {id = "hrp", label = "HRP (upper)"},
-}
-local currentAimTarget = "arm"
-function FlingFunctions.getCurrentTargetLabel()
-    for _, o in ipairs(TARGET_OPTIONS) do
-        if o.id == currentAimTarget then return o.label end
-    end
-    return "L-LowerArm (upper)"
-end
-
-local FLING_TYPE_OPTIONS = {
-    {id = "original", label = "Original"},
-    {id = "alt",      label = "Alt (slice / return / repeat)"},
-}
-local currentFlingType = "original"
-function FlingFunctions.getCurrentFlingLabel()
-    for _, o in ipairs(FLING_TYPE_OPTIONS) do
-        if o.id == currentFlingType then return o.label end
-    end
-    return "Original"
-end
-
-local PREDICTION_TIME = CONFIG.PredictionSeconds
-
-do
-    local ok, ping = pcall(function()
-        return Stats.Network.ServerStatsItem["Data Ping"]:GetValue()
-    end)
-    if ok and type(ping) == "number" and ping > 150 then
-        CONFIG.TimeToWait = CONFIG.TimeToWait * 1.3
-    end
-end
-
-local old = PlayerGui:FindFirstChild("PlayerOrbitV3")
+local old = PlayerGui:FindFirstChild("GR33D_EXPLOIT")
 if old then old:Destroy() end
 
-local globalEnv = _G
-if type(getgenv) == "function" then
-    local ok, env = pcall(getgenv)
-    if ok and type(env) == "table" then globalEnv = env end
-end
-globalEnv.FPDH = workspace.FallenPartsDestroyHeight
-
-local returnSnapshot, lastGrounded, lastSafeReturn = nil, nil, nil
-local returning, FlingActive, selfFlinging = false, false, false
-local followActive, followTarget = false, nil
-local connections, rows = {}, {}
-local SelectedTargets = {}
-local minimized, maximized = false, false
-local currentTarget = nil
-local startFling
-local noclipActive, speedActive, savedWalkSpeed = false, false, nil
-local originalAnchored, noclipOriginalCollision = {}, {}
-local grabActive, grabbedPart, grabbedAnchor = false, nil, nil
-local aimActive, currentCameraAimTarget, followEnabled = false, nil, false
-local guardFF, guardVelConn, guardHealthConn = nil, nil, nil
-local guardAnchoredSelf = false
-local freezeActive, freezeThreads = {}, {}
-local flungTargets = {}
-
 -- ============================================================
--- UNIVERSAL PART TRACKER + PREDICTION
+-- UI HELPERS
 -- ============================================================
-local PartTracker = {}
-local CharParts   = {}
-
-function FlingFunctions.trackCharacter(char)
-    if not char then return end
-    local old = CharParts[char]
-    if old then
-        for _, p in ipairs(old) do PartTracker[p] = nil end
-    end
-    local parts = {}
-    for _, d in ipairs(char:GetDescendants()) do
-        if d:IsA("BasePart") then
-            PartTracker[d] = { pos = d.Position, vel = d.AssemblyLinearVelocity, time = os.clock() }
-            parts[#parts + 1] = d
-        end
-    end
-    CharParts[char] = parts
-end
-function FlingFunctions.untrackCharacter(char)
-    if not char then return end
-    local parts = CharParts[char]
-    if parts then
-        for _, p in ipairs(parts) do PartTracker[p] = nil end
-        CharParts[char] = nil
-    end
-end
-function FlingFunctions.bindPlayer(plr)
-    if plr == Me then return end
-    local function onChar(char)
-        FlingFunctions.trackCharacter(char)
-        char.DescendantAdded:Connect(function(d)
-            if d:IsA("BasePart") and not PartTracker[d] then
-                PartTracker[d] = { pos = d.Position, vel = d.AssemblyLinearVelocity, time = os.clock() }
-                local list = CharParts[char]
-                if list then list[#list + 1] = d end
-            end
-        end)
-        char.DescendantRemoving:Connect(function(d)
-            if PartTracker[d] then PartTracker[d] = nil end
-        end)
-    end
-    plr.CharacterAdded:Connect(onChar)
-    if plr.Character then onChar(plr.Character) end
-end
-for _, p in ipairs(Players:GetPlayers()) do FlingFunctions.bindPlayer(p) end
-Players.PlayerAdded:Connect(FlingFunctions.bindPlayer)
-Players.PlayerRemoving:Connect(function(p)
-    if p.Character then FlingFunctions.untrackCharacter(p.Character) end
-end)
-table.insert(connections, RunService.RenderStepped:Connect(function()
-    for char, parts in pairs(CharParts) do
-        if not char.Parent then
-            FlingFunctions.untrackCharacter(char)
-        else
-            for i = #parts, 1, -1 do
-                local d = parts[i]
-                if d.Parent then
-                    local t = PartTracker[d]
-                    if t then
-                        t.pos  = d.Position
-                        t.vel  = d.AssemblyLinearVelocity
-                        t.time = os.clock()
-                    end
-                else
-                    PartTracker[d] = nil
-                    table.remove(parts, i)
-                end
-            end
-        end
-    end
-end))
-function FlingFunctions.predictPart(part, extraTime)
-    if not part then return nil end
-    local data = PartTracker[part]
-    if not data then return part.Position end
-    local dt = (os.clock() - (data.time or os.clock())) + (extraTime or 0)
-    if dt > 0.35 then dt = 0.35 end
-    if dt < 0 then dt = 0 end
-    local v = data.vel or Vector3.zero
-    if v.Magnitude > 250 then v = v.Unit * 250 end
-    return data.pos + v * dt
-end
-
 local BG=Color3.fromRGB(19,23,35) local PANEL=Color3.fromRGB(30,37,53)
 local ROW=Color3.fromRGB(41,49,69) local ROWHI=Color3.fromRGB(52,62,86)
 local ACCENT=Color3.fromRGB(83,138,255) local ACCENTD=Color3.fromRGB(60,100,200)
 local WHITE=Color3.fromRGB(245,247,255) local MUTED=Color3.fromRGB(155,169,193)
 local RED=Color3.fromRGB(184,68,84) local GREEN=Color3.fromRGB(64,160,96)
-local AMBER=Color3.fromRGB(200,160,60) local PURPLE=Color3.fromRGB(120,80,200)
-local CYAN=Color3.fromRGB(80,180,200)
+local AMBER=Color3.fromRGB(200,160,60)
 
-function FlingFunctions.make(c,p,parent) local o=Instance.new(c) for k,v in pairs(p) do o[k]=v end o.Parent=parent return o end
-function FlingFunctions.round(o,r) FlingFunctions.make("UICorner",{CornerRadius=UDim.new(0,r)},o) end
-function FlingFunctions.label(t,s,pos,dim,parent)
-    return FlingFunctions.make("TextLabel",{Text=t,TextSize=s,Font=Enum.Font.Gotham,TextColor3=WHITE,
-        TextXAlignment=Enum.TextXAlignment.Left,TextTruncate=Enum.TextTruncate.AtEnd,
-        BackgroundTransparency=1,Position=pos,Size=dim},parent)
+local function make(c, p, parent)
+    local o = Instance.new(c)
+    for k, v in pairs(p) do o[k] = v end
+    o.Parent = parent
+    return o
 end
-
--- HIT DEBUG
-local HitDebug = {}
-do
-local hitObservations = {}
-local HIT_LOG_LIMIT = 32
-HitDebug.focus = "Both"
-local LIMB_FAMILIES = {LeftUpperArm="Arms",RightUpperArm="Arms",LeftLowerArm="Arms",
-    RightLowerArm="Arms",LeftHand="Arms",RightHand="Arms",LeftUpperLeg="Legs",
-    RightUpperLeg="Legs",LeftLowerLeg="Legs",RightLowerLeg="Legs",LeftFoot="Legs",
-    RightFoot="Legs",["Left Arm"]="Arms",["Right Arm"]="Arms",
-    ["Left Leg"]="Legs",["Right Leg"]="Legs"}
-HitDebug.partFamily = function(part, character)
-    if not part or not character or part.Parent ~= character then return nil end
-    if not part:IsA("BasePart") then return nil end
-    if part.Name == "HumanoidRootPart" then return "HRP" end
-    if part.Name == "Head" or part.Name == "Torso"
-        or part.Name == "UpperTorso" or part.Name == "LowerTorso" then
-        return "Torso"
-    end
-    return LIMB_FAMILIES[part.Name]
-end
-HitDebug.acceptsPart = function(part, character, aimMode)
-    local family = HitDebug.partFamily(part, character)
-    if not family then return false end
-    if aimMode == "hrp" then return family == "HRP" end
-    if aimMode == "arm" then return family == "Arms" end
-    return true
-end
-function FlingFunctions.hitVec(v) return string.format("(%.1f, %.1f, %.1f)", v.X, v.Y, v.Z) end
-function FlingFunctions.hitEvidence(record)
-    local e = {}
-    if record.touched then table.insert(e,"Touched") end
-    if record.overlap then table.insert(e,"query overlap") end
-    if record.geometric then table.insert(e,"local geometry") end
-    if record.response then table.insert(e,"motion") end
-    return #e > 0 and table.concat(e, " + ") or "unverified"
-end
-function FlingFunctions.renderHitInfo()
-    if not HitDebug.summary or not HitDebug.summary.Parent then return end
-    local shown = {}
-    for _, r in ipairs(hitObservations) do
-        local family = r.family or "?"
-        if HitDebug.focus == "Both" or HitDebug.focus == family then
-            shown[#shown + 1] = r
-        end
-    end
-    local newest = shown[1]
-    if not newest then
-        HitDebug.summary.Text = "No contact observed for " .. HitDebug.focus
-        HitDebug.details.Text = "Filter: " .. HitDebug.focus
-        HitDebug.log.Text = "No matching observations."
-        return
-    end
-    HitDebug.summary.Text = string.format("@%s  •  %s  •  %s", newest.target, newest.partName, newest.zone)
-    HitDebug.details.Text = string.format("Aimed: %s\nPoint: %s\nEvidence: %s",
-        newest.aimedPart or "?", FlingFunctions.hitVec(newest.point), FlingFunctions.hitEvidence(newest))
-    local lines = {}
-    for i, event in ipairs(shown) do
-        lines[#lines + 1] = string.format("%02d @%s [try %s] Aim=%s Observed=%s | %s",
-            i, event.target, tostring(event.attempt), event.aimedPart or "?",
-            event.partName, event.zone)
-    end
-    HitDebug.log.Text = table.concat(lines, "\n")
-end
-local hitRenderQueued = false
-function FlingFunctions.queueHitRender()
-    if hitRenderQueued then return end
-    hitRenderQueued = true
-    task.defer(function() hitRenderQueued = false; FlingFunctions.renderHitInfo() end)
-end
-function FlingFunctions.clearHitInfo() table.clear(hitObservations); FlingFunctions.renderHitInfo() end
-function FlingFunctions.approximateHitZone(part, myRoot)
-    local approx = part.Position
-    pcall(function() approx = part:GetClosestPointOnSurface(myRoot.Position) end)
-    local lp = part.CFrame:PointToObjectSpace(approx)
-    local sx, sy, sz = math.max(part.Size.X*0.5,0.01), math.max(part.Size.Y*0.5,0.01), math.max(part.Size.Z*0.5,0.01)
-    local h = "center"
-    local x, z = lp.X/sx, lp.Z/sz
-    if math.abs(x) > math.abs(z) and math.abs(x) > 0.35 then h = x > 0 and "right" or "left"
-    elseif math.abs(z) > 0.35 then h = z < 0 and "front" or "back" end
-    local y = lp.Y/sy
-    local v = y > 0.35 and "upper" or (y < -0.35 and "lower" or "middle")
-    return v .. " / " .. h, approx
-end
-function FlingFunctions.hitPartLabel(part, character)
-    local anc = part.Parent
-    if anc and anc ~= character and anc:IsA("Accessory") then return anc.Name.."."..part.Name end
-    return part.Name
-end
-function FlingFunctions.recordHitObservation(monitor, part, myRoot, kind)
-    if not monitor or not myRoot or not HitDebug.acceptsPart(part, monitor.targetCharacter, monitor.aimMode) then return nil end
-    local now = os.clock()
-    monitor.hitRecords = monitor.hitRecords or {}
-    local record = monitor.hitRecords[part]
-    local changed = false
-    if not record then
-        local zone, point = FlingFunctions.approximateHitZone(part, myRoot)
-        record = {target=monitor.targetName or "?", partName=FlingFunctions.hitPartLabel(part, monitor.targetCharacter),
-            aimedPart=monitor.aimedPartName or "?", zone=zone, point=point,
-            family=HitDebug.partFamily(part, monitor.targetCharacter),
-            attempt=monitor.attempt or "?", overlap=false, geometric=false,
-            touched=false, response=false,
-            timestamp=now}
-        monitor.hitRecords[part] = record
-        table.insert(hitObservations, 1, record)
-        if #hitObservations > HIT_LOG_LIMIT then table.remove(hitObservations) end
-        changed = true
-    end
-    if kind == "Touched" and not record.touched then
-        record.touched = true; monitor.lastTouchedRecord = record; monitor.lastTouchedAt = now; changed = true
-    elseif kind == "Overlap" and not record.overlap then
-        record.overlap = true; changed = true
-    elseif kind == "Geometry" and not record.geometric then
-        record.geometric = true; changed = true
-    end
-    record.timestamp = now
-    monitor.lastObservedRecord = record
-    monitor.overlapPart = record.partName
-    if changed then FlingFunctions.queueHitRender() end
-    return record
-end
-function FlingFunctions.flagMotionResponse(monitor)
-    local now = os.clock()
-    local pref = nil
-    if monitor.lastTouchedAt and now - monitor.lastTouchedAt <= 0.4 then pref = monitor.lastTouchedRecord end
-    if not pref and monitor.lastObservedRecord and now - monitor.lastObservedRecord.timestamp <= 0.4 then
-        pref = monitor.lastObservedRecord
-    end
-    if pref and not pref.response then
-        pref.response = true; pref.timestamp = now
-        for i, r in ipairs(hitObservations) do
-            if r == pref then table.remove(hitObservations, i); table.insert(hitObservations, 1, pref); break end
-        end
-        FlingFunctions.queueHitRender()
-    end
-    monitor.contactPartName = pref and pref.partName or monitor.overlapPart
-end
-HitDebug.record = FlingFunctions.recordHitObservation
-HitDebug.flag = FlingFunctions.flagMotionResponse
-HitDebug.render = FlingFunctions.renderHitInfo
-HitDebug.clear = FlingFunctions.clearHitInfo
+local function round(o, r) make("UICorner", {CornerRadius = UDim.new(0, r)}, o) end
+local function label(t, s, pos, dim, parent)
+    return make("TextLabel", {Text=t, TextSize=s, Font=Enum.Font.Gotham, TextColor3=WHITE,
+        TextXAlignment=Enum.TextXAlignment.Left, TextTruncate=Enum.TextTruncate.AtEnd,
+        BackgroundTransparency=1, Position=pos, Size=dim}, parent)
 end
 
 -- ============================================================
--- [RING] SUPER RING — ownership mode
+-- ROOT GUI
 -- ============================================================
-local RING_CONFIG = {
-    radius             = 50,
-    height             = 100,
-    rotationSpeed      = 10,
-    attractionStrength = 150,
-    keepOut            = 6,
-    damageOthers       = true,   -- false = visual only
-}
-local ringPartsEnabled = false
-local ringParts = {}
-local ringFF = nil
-local RING_CLAIM_INTERVAL = 0.5
-local lastRingClaim = 0
-
-pcall(function() LocalPlayer.ReplicationFocus = workspace end)
-pcall(function() sethiddenproperty(LocalPlayer, "SimulationRadius", math.huge) end)
-
-Me.CharacterAdded:Connect(function()
-    task.wait(0.5)
-    pcall(function() LocalPlayer.ReplicationFocus = workspace end)
-    pcall(function() sethiddenproperty(LocalPlayer, "SimulationRadius", math.huge) end)
-end)
-
-local function isMyPart(p)
-    local myChar = Me.Character
-    return myChar ~= nil and p:IsDescendantOf(myChar)
-end
-
-local function ringRetainPart(p)
-    if not p:IsA("BasePart") then return false end
-    if p.Anchored then return false end
-    if not p:IsDescendantOf(workspace) then return false end
-    if isMyPart(p) then return false end
-    if p.Name == "Handle" then return false end
-    if p.Parent and p.Parent:IsA("Accessory") then return false end
-    return true
-end
-
-local function ringClaimOwner(p)
-    if not p or not p.Parent or p.Anchored then return end
-    pcall(function()
-        if p:GetNetworkOwner() ~= Me then
-            p:SetNetworkOwner(Me)
-        end
-    end)
-end
-
-local function ringAddPart(p)
-    if ringRetainPart(p) and not table.find(ringParts, p) then
-        table.insert(ringParts, p)
-        ringClaimOwner(p)
-    end
-end
-
-local function ringRemovePart(p)
-    local i = table.find(ringParts, p)
-    if i then table.remove(ringParts, i) end
-end
-
-for _, p in pairs(workspace:GetDescendants()) do ringAddPart(p) end
-workspace.DescendantAdded:Connect(ringAddPart)
-workspace.DescendantRemoving:Connect(ringRemovePart)
-
-local function ringReclaimAll(force)
-    local now = os.clock()
-    if not force and now - lastRingClaim < RING_CLAIM_INTERVAL then return end
-    lastRingClaim = now
-    for _, p in pairs(ringParts) do
-        if p.Parent and not p.Anchored then
-            pcall(function()
-                if p:GetNetworkOwner() ~= Me then
-                    p:SetNetworkOwner(Me)
-                end
-            end)
-        end
-    end
-end
-
-local function ringProtectChar(char)
-    if not char then return end
-    if ringFF and ringFF.Parent then ringFF:Destroy() end
-    ringFF = Instance.new("ForceField")
-    ringFF.Visible = false
-    ringFF.Parent = char
-end
-if Me.Character then ringProtectChar(Me.Character) end
-Me.CharacterAdded:Connect(function(ch)
-    task.wait(0.5)
-    ringProtectChar(ch)
-end)
-
-table.insert(connections, RunService.Heartbeat:Connect(function()
-    if not ringPartsEnabled then return end
-    local char = Me.Character
-    local hrp = char and char:FindFirstChild("HumanoidRootPart")
-    if not hrp then return end
-
-    ringReclaimAll(false)
-
-    local center = hrp.Position
-    local strength = RING_CONFIG.attractionStrength
-    for _, p in pairs(ringParts) do
-        if p.Parent and not p.Anchored and not isMyPart(p) then
-            p.Massless = true
-            p.CustomPhysicalProperties = PhysicalProperties.new(0.01, 0, 0, 0, 0)
-            p.CanCollide = RING_CONFIG.damageOthers and true or false
-
-            local pos = p.Position
-            local flatDelta = Vector3.new(pos.X, center.Y, pos.Z) - center
-            local dist = flatDelta.Magnitude
-            if dist > RING_CONFIG.keepOut then
-                local angle = math.atan2(pos.Z - center.Z, pos.X - center.X)
-                local newAngle = angle + math.rad(RING_CONFIG.rotationSpeed)
-                local targetPos = Vector3.new(
-                    center.X + math.cos(newAngle) * math.min(RING_CONFIG.radius, dist),
-                    center.Y + (RING_CONFIG.height * math.abs(math.sin((pos.Y - center.Y) / RING_CONFIG.height))),
-                    center.Z + math.sin(newAngle) * math.min(RING_CONFIG.radius, dist)
-                )
-                local dir = (targetPos - p.Position).Unit
-                p.AssemblyLinearVelocity = dir * strength
-            else
-                p.AssemblyLinearVelocity = Vector3.zero
-            end
-        end
-    end
-end))
-
--- Emergency kill switch
-table.insert(connections, UIS.InputBegan:Connect(function(input, gpe)
-    if gpe then return end
-    if input.KeyCode == Enum.KeyCode.RightShift then
-        ringPartsEnabled = false
-        if RingToggle then
-            RingToggle.Text = "Ring: OFF"
-            RingToggle.BackgroundColor3 = ROW
-        end
-        pcall(function() FlingFunctions.setStatus("Ring emergency off", AMBER) end)
-    end
-end))
-
--- GUI
-local Gui = FlingFunctions.make("ScreenGui", {Name="PlayerOrbitV3", ResetOnSpawn=false,
+local Gui = make("ScreenGui", {Name="GR33D_EXPLOIT", ResetOnSpawn=false,
     IgnoreGuiInset=true, ZIndexBehavior=Enum.ZIndexBehavior.Sibling}, PlayerGui)
 
 local PANEL_W = 460
 local PANEL_H = 1400
 
-local Main = FlingFunctions.make("Frame", {AnchorPoint=Vector2.new(0.5,0),
-    Position=UDim2.new(0.5,0,0,0.02),
-    Size=UDim2.fromOffset(PANEL_W, PANEL_H),
+local Main = make("Frame", {AnchorPoint=Vector2.new(0.5,0),
+    Position=UDim2.new(0.5,0,0,0.02), Size=UDim2.fromOffset(PANEL_W, PANEL_H),
     BackgroundColor3=BG, BorderSizePixel=0, Active=true}, Gui)
-FlingFunctions.round(Main, 16)
-FlingFunctions.make("UIStroke", {Color=Color3.fromRGB(62,75,105), Thickness=1.5}, Main)
-local Scale = FlingFunctions.make("UIScale", {Scale=1}, Main)
+round(Main, 16)
+make("UIStroke", {Color=Color3.fromRGB(62,75,105), Thickness=1.5}, Main)
+local Scale = make("UIScale", {Scale=1}, Main)
 
-local Header = FlingFunctions.make("Frame", {Size=UDim2.new(1,0,0,56), BackgroundTransparency=1, Active=true}, Main)
-FlingFunctions.make("Frame", {Position=UDim2.fromOffset(0,0), Size=UDim2.new(0,4,1,0),
+local Header = make("Frame", {Size=UDim2.new(1,0,0,56), BackgroundTransparency=1, Active=true}, Main)
+make("Frame", {Position=UDim2.fromOffset(0,0), Size=UDim2.new(0,4,1,0),
     BackgroundColor3=ACCENT, BorderSizePixel=0}, Header)
-local Title = FlingFunctions.label("FLING  ·  v23.7", 15, UDim2.fromOffset(20,10), UDim2.new(1,-180,0,20), Header)
+local Title = label("GR33D EXPLOIT", 15, UDim2.fromOffset(20,10), UDim2.new(1,-180,0,20), Header)
 Title.Font = Enum.Font.GothamBold
-local SubTitle = FlingFunctions.label("Dual target  ·  Arm upper / HRP", 10,
+local SubTitle = label("Super Ring Old  ·  hardcoded tools", 10,
     UDim2.fromOffset(20,30), UDim2.new(1,-180,0,14), Header)
 SubTitle.TextColor3 = MUTED
 
-local MinButton = FlingFunctions.make("TextButton", {Text="−", Font=Enum.Font.GothamBold, TextSize=22,
+local MinButton = make("TextButton", {Text="−", Font=Enum.Font.GothamBold, TextSize=22,
     TextColor3=WHITE, BackgroundColor3=ROW, Position=UDim2.new(1,-150,0,12),
     Size=UDim2.fromOffset(34,34)}, Header)
-FlingFunctions.round(MinButton, 9)
-local MaxButton = FlingFunctions.make("TextButton", {Text="▢", Font=Enum.Font.GothamBold, TextSize=15,
+round(MinButton, 9)
+local MaxButton = make("TextButton", {Text="▢", Font=Enum.Font.GothamBold, TextSize=15,
     TextColor3=WHITE, BackgroundColor3=ROW, Position=UDim2.new(1,-110,0,12),
     Size=UDim2.fromOffset(34,34)}, Header)
-FlingFunctions.round(MaxButton, 9)
-local CloseButton = FlingFunctions.make("TextButton", {Text="✕", Font=Enum.Font.GothamBold, TextSize=14,
+round(MaxButton, 9)
+local CloseButton = make("TextButton", {Text="✕", Font=Enum.Font.GothamBold, TextSize=14,
     TextColor3=WHITE, BackgroundColor3=RED, Position=UDim2.new(1,-70,0,12),
     Size=UDim2.fromOffset(34,34)}, Header)
-FlingFunctions.round(CloseButton, 9)
+round(CloseButton, 9)
 
-local Content = FlingFunctions.make("Frame", {Position=UDim2.fromOffset(0,56),
+local Content = make("Frame", {Position=UDim2.fromOffset(0,56),
     Size=UDim2.new(1,0,1,-56), BackgroundTransparency=1}, Main)
 
-local sectionFrames = {}
-function FlingFunctions.sectionLabel(text, yAnchor, yOffset)
-    local s = FlingFunctions.make("Frame", {Position=UDim2.new(0,14,yAnchor,yOffset),
-        Size=UDim2.new(1,-28,0,14), BackgroundTransparency=1}, Content)
-    FlingFunctions.make("Frame", {Position=UDim2.fromOffset(0,5), Size=UDim2.fromOffset(3,8),
-        BackgroundColor3=ACCENT, BorderSizePixel=0}, s)
-    local t = FlingFunctions.label(text, 10, UDim2.fromOffset(10,0), UDim2.new(1,-10,1,0), s)
-    t.Font = Enum.Font.GothamBold
-    t.TextColor3 = MUTED
-    table.insert(sectionFrames, s)
-    return s
-end
-
-FlingFunctions.sectionLabel("COMMAND", 0, 8)
-local CmdBar = FlingFunctions.make("TextBox", {Position=UDim2.fromOffset(14,26), Size=UDim2.new(1,-28,0,38),
-    Text="", PlaceholderText="/hits  /testreturn  /scan  /help", ClearTextOnFocus=false,
-    TextColor3=WHITE, PlaceholderColor3=MUTED, TextSize=12, Font=Enum.Font.Code,
-    BackgroundColor3=Color3.fromRGB(24,28,42), TextXAlignment=Enum.TextXAlignment.Left}, Content)
-FlingFunctions.round(CmdBar, 10)
-FlingFunctions.make("UIPadding", {PaddingLeft=UDim.new(0,10)}, CmdBar)
-
-FlingFunctions.sectionLabel("PLAYERS", 0, 78)
-local Search = FlingFunctions.make("TextBox", {Position=UDim2.fromOffset(14,96), Size=UDim2.new(1,-28,0,36),
-    Text="", PlaceholderText="🔍  Search players...", ClearTextOnFocus=false,
-    TextColor3=WHITE, PlaceholderColor3=MUTED, TextSize=13, Font=Enum.Font.Gotham,
-    BackgroundColor3=PANEL, TextXAlignment=Enum.TextXAlignment.Left}, Content)
-FlingFunctions.round(Search, 10)
-FlingFunctions.make("UIPadding", {PaddingLeft=UDim.new(0,12)}, Search)
-
-local Count = FlingFunctions.label("Loading players...", 11, UDim2.fromOffset(16,138), UDim2.new(1,-28,0,16), Content)
-Count.TextColor3 = MUTED
-
-local List = FlingFunctions.make("ScrollingFrame", {Position=UDim2.fromOffset(14,160), Size=UDim2.new(1,-28,1,-580),
-    BackgroundColor3=PANEL, BorderSizePixel=0, ScrollBarThickness=4,
-    ScrollBarImageColor3=ACCENT, CanvasSize=UDim2.fromOffset(0,0),
-    AutomaticCanvasSize=Enum.AutomaticSize.None,
-    ScrollingDirection=Enum.ScrollingDirection.Y, ScrollingEnabled=true,
-    ClipsDescendants=true}, Content)
-FlingFunctions.round(List, 10)
-FlingFunctions.make("UIPadding", {PaddingTop=UDim.new(0,6), PaddingBottom=UDim.new(0,6),
-    PaddingLeft=UDim.new(0,6), PaddingRight=UDim.new(0,6)}, List)
-local PlayerRowLayout = FlingFunctions.make("UIListLayout", {SortOrder=Enum.SortOrder.LayoutOrder,
-    Padding=UDim.new(0,6)}, List)
-function FlingFunctions.getPlayerListContentHeight()
-    return math.ceil(PlayerRowLayout.AbsoluteContentSize.Y) + 22
-end
-
-local StatusPanel = FlingFunctions.make("Frame", {Position=UDim2.new(0,14,1,-420),
-    Size=UDim2.new(1,-28,0,44), BackgroundColor3=PANEL, BorderSizePixel=0}, Content)
-FlingFunctions.round(StatusPanel, 10)
-FlingFunctions.make("UIStroke", {Color=Color3.fromRGB(48,56,76), Thickness=1}, StatusPanel)
-local Status = FlingFunctions.label("Ready", 12, UDim2.fromOffset(12,8), UDim2.new(1,-24,0,18), StatusPanel)
-Status.Font = Enum.Font.GothamMedium
-local StatusSub = FlingFunctions.label("Select a target, then press FLING", 10,
-    UDim2.fromOffset(12,26), UDim2.new(1,-24,0,14), StatusPanel)
-StatusSub.TextColor3 = MUTED
-function FlingFunctions.setStatus(main, color, sub)
-    Status.Text = main
-    Status.TextColor3 = color or WHITE
-    StatusSub.Text = sub or ""
-end
-
-FlingFunctions.sectionLabel("TARGET ACTIONS", 1, -366)
-function FlingFunctions.makeActionBtn(text, xOffset, yOffset, w, h, color)
-    local b = FlingFunctions.make("TextButton", {Text=text, Font=Enum.Font.GothamBold, TextSize=11,
-        TextColor3=WHITE, BackgroundColor3=color, Position=UDim2.new(0,xOffset,1,yOffset),
-        Size=UDim2.fromOffset(w,h), AutoButtonColor=false}, Content)
-    FlingFunctions.round(b, 8)
-    b.MouseEnter:Connect(function() b.BackgroundColor3 = color:Lerp(Color3.new(1,1,1), 0.15) end)
-    b.MouseLeave:Connect(function() b.BackgroundColor3 = color end)
-    return b
-end
-
-local r1_y, r1_h, r1_w, r1_gap, r1_s = -344, 36, 62, 6, 14
-local TPButton       = FlingFunctions.makeActionBtn("TP",       r1_s,                      r1_y, r1_w, r1_h, PURPLE)
-local BringButton    = FlingFunctions.makeActionBtn("Bring",    r1_s + (r1_w+r1_gap)*1,     r1_y, r1_w, r1_h, PURPLE)
-local FreezeButton   = FlingFunctions.makeActionBtn("Freeze",   r1_s + (r1_w+r1_gap)*2,     r1_y, r1_w, r1_h, PURPLE)
-local UnfreezeButton = FlingFunctions.makeActionBtn("Unfreeze", r1_s + (r1_w+r1_gap)*3,     r1_y, r1_w, r1_h, CYAN)
-local AnchorButton   = FlingFunctions.makeActionBtn("Anchor",   r1_s + (r1_w+r1_gap)*4,     r1_y, r1_w, r1_h, PURPLE)
-local UnanchorButton = FlingFunctions.makeActionBtn("Unanchor", r1_s + (r1_w+r1_gap)*5,     r1_y, r1_w, r1_h, PURPLE)
-
-local r2_y, r2_h, r2_w, r2_gap = -300, 36, 124, 8
-local AimbotButton = FlingFunctions.makeActionBtn("Aimbot: OFF", 14,                     r2_y, r2_w, r2_h, ROW)
-local FollowButton = FlingFunctions.makeActionBtn("Follow: OFF", 14 + (r2_w+r2_gap)*1,   r2_y, r2_w, r2_h, ROW)
-local NoclipButton = FlingFunctions.makeActionBtn("Noclip: OFF", 14 + (r2_w+r2_gap)*2,   r2_y, r2_w, r2_h, ROW)
-
-local r3_y, r3_h, r3_w, r3_gap = -256, 36, 124, 8
-local SpeedButton      = FlingFunctions.makeActionBtn("Speed: OFF",    14,                    r3_y, r3_w, r3_h, ROW)
-local GrabObjectButton = FlingFunctions.makeActionBtn("Grab Obj: OFF", 14 + (r3_w+r3_gap)*1, r3_y, r3_w, r3_h, ROW)
-local RescueButton     = FlingFunctions.makeActionBtn("RESCUE ME",     14 + (r3_w+r3_gap)*2, r3_y, r3_w, r3_h, AMBER)
-
-local r4_y = -212
-local fovLabel = FlingFunctions.label("Aim FOV", 11, UDim2.new(0,14,1,r4_y), UDim2.fromOffset(60,36), Content)
-fovLabel.TextColor3 = MUTED
-fovLabel.TextYAlignment = Enum.TextYAlignment.Center
-local FovBox = FlingFunctions.make("TextBox", {Position=UDim2.new(0,78,1,r4_y), Size=UDim2.fromOffset(80,36),
-    Text=tostring(CONFIG.AimFOV), ClearTextOnFocus=false, TextColor3=WHITE, TextSize=13,
-    Font=Enum.Font.GothamBold, BackgroundColor3=PANEL,
-    TextXAlignment=Enum.TextXAlignment.Center}, Content)
-FlingFunctions.round(FovBox, 8)
-local smoothLabel = FlingFunctions.label("Smooth", 11, UDim2.new(0,168,1,r4_y), UDim2.fromOffset(60,36), Content)
-smoothLabel.TextColor3 = MUTED
-smoothLabel.TextYAlignment = Enum.TextYAlignment.Center
-local SmoothBox = FlingFunctions.make("TextBox", {Position=UDim2.new(0,232,1,r4_y), Size=UDim2.fromOffset(80,36),
-    Text=tostring(CONFIG.AimSmooth), ClearTextOnFocus=false, TextColor3=WHITE, TextSize=13,
-    Font=Enum.Font.GothamBold, BackgroundColor3=PANEL,
-    TextXAlignment=Enum.TextXAlignment.Center}, Content)
-FlingFunctions.round(SmoothBox, 8)
-FovBox.FocusLost:Connect(function()
-    local n = tonumber(FovBox.Text)
-    if n and n > 0 then CONFIG.AimFOV = n else FovBox.Text = tostring(CONFIG.AimFOV) end
-end)
-SmoothBox.FocusLost:Connect(function()
-    local n = tonumber(SmoothBox.Text)
-    if n and n >= 1 then CONFIG.AimSmooth = n else SmoothBox.Text = tostring(CONFIG.AimSmooth) end
-end)
-
-FlingFunctions.sectionLabel("SELECTION", 1, -190)
-local s_y, s_h, s_w, s_gap = -168, 34, 124, 8
-local SelectAll     = FlingFunctions.makeActionBtn("ALL",  14,                    s_y, s_w, s_h, ROW)
-local DeselectAll   = FlingFunctions.makeActionBtn("NONE", 14 + (s_w+s_gap)*1,    s_y, s_w, s_h, ROW)
-local InspectButton = FlingFunctions.makeActionBtn("SCAN", 14 + (s_w+s_gap)*2,    s_y, s_w, s_h, ACCENTD)
-
 -- ============================================================
--- TARGET dropdown
+-- TABS
 -- ============================================================
-local TargetHeading = FlingFunctions.label("TARGET", 11, UDim2.fromOffset(14,0),
-    UDim2.new(1,-28,0,16), Content)
-TargetHeading.Font = Enum.Font.GothamBold
-TargetHeading.TextColor3 = MUTED
-local TargetButton = FlingFunctions.make("TextButton", {
-    Text = "Target: " .. FlingFunctions.getCurrentTargetLabel() .. "  ▼",
-    Font = Enum.Font.GothamBold, TextSize = 12, TextColor3 = WHITE,
-    BackgroundColor3 = Color3.fromRGB(45,55,75),
-    TextXAlignment = Enum.TextXAlignment.Left, AutoButtonColor = false,
-    Size = UDim2.new(1,-28,0,36), Position = UDim2.fromOffset(14,22)}, Content)
-FlingFunctions.round(TargetButton, 8)
-FlingFunctions.make("UIPadding", {PaddingLeft=UDim.new(0,10)}, TargetButton)
-TargetButton.MouseEnter:Connect(function()
-    TargetButton.BackgroundColor3 = Color3.fromRGB(58,70,95)
-end)
-TargetButton.MouseLeave:Connect(function()
-    TargetButton.BackgroundColor3 = Color3.fromRGB(45,55,75)
-end)
-
-local TargetDropdown = FlingFunctions.make("ScrollingFrame", {
-    Position=UDim2.fromOffset(14,62), Size=UDim2.new(1,-28,0,80),
-    BackgroundColor3=Color3.fromRGB(26,32,46), BorderSizePixel=0, Visible=false,
-    ScrollBarThickness=4, ScrollBarImageColor3=ACCENT,
-    CanvasSize=UDim2.fromOffset(0,0), AutomaticCanvasSize=Enum.AutomaticSize.Y,
-    ZIndex=6}, Content)
-FlingFunctions.round(TargetDropdown, 8)
-FlingFunctions.make("UIPadding", {PaddingTop=UDim.new(0,4), PaddingBottom=UDim.new(0,4),
-    PaddingLeft=UDim.new(0,4), PaddingRight=UDim.new(0,4)}, TargetDropdown)
-FlingFunctions.make("UIStroke", {Color=ACCENT, Thickness=1}, TargetDropdown)
-FlingFunctions.make("UIListLayout", {SortOrder=Enum.SortOrder.LayoutOrder, Padding=UDim.new(0,3)}, TargetDropdown)
-
-local tgButtons = {}
-for i, opt in ipairs(TARGET_OPTIONS) do
-    local selected = (opt.id == currentAimTarget)
-    local b = FlingFunctions.make("TextButton", {Text=opt.label, Font=Enum.Font.Gotham, TextSize=12,
-        TextColor3=WHITE, BackgroundColor3=selected and ACCENTD or ROW,
-        TextXAlignment=Enum.TextXAlignment.Left, AutoButtonColor=false,
-        LayoutOrder=i, Size=UDim2.new(1,0,0,28), ZIndex=7}, TargetDropdown)
-    FlingFunctions.round(b, 6)
-    FlingFunctions.make("UIPadding", {PaddingLeft=UDim.new(0,10)}, b)
-    tgButtons[opt.id] = b
-    b.MouseEnter:Connect(function()
-        if opt.id ~= currentAimTarget then b.BackgroundColor3 = ROWHI end
-    end)
-    b.MouseLeave:Connect(function()
-        if opt.id ~= currentAimTarget then b.BackgroundColor3 = ROW end
-    end)
-    b.MouseButton1Click:Connect(function()
-        currentAimTarget = opt.id
-        TargetButton.Text = "Target: " .. opt.label .. "  ▼"
-        TargetDropdown.Visible = false
-        for id, btn in pairs(tgButtons) do
-            btn.BackgroundColor3 = (id == opt.id) and ACCENTD or ROW
-        end
-        FlingFunctions.setStatus("Target: " .. opt.label, CYAN,
-            opt.id == "hrp" and "Aiming at HumanoidRootPart upper"
-            or "Aiming at LeftLowerArm upper")
-    end)
-end
-TargetButton.MouseButton1Click:Connect(function()
-    TargetDropdown.Visible = not TargetDropdown.Visible
-end)
-
--- ============================================================
--- FLING TYPE dropdown
--- ============================================================
-local FlingTypeHeading = FlingFunctions.label("FLING TYPE", 11, UDim2.fromOffset(14,0),
-    UDim2.new(1,-28,0,16), Content)
-FlingTypeHeading.Font = Enum.Font.GothamBold
-FlingTypeHeading.TextColor3 = MUTED
-local FlingTypeButton = FlingFunctions.make("TextButton", {
-    Text = "Type: " .. FlingFunctions.getCurrentFlingLabel() .. "  ▼",
-    Font = Enum.Font.GothamBold, TextSize = 12, TextColor3 = WHITE,
-    BackgroundColor3 = Color3.fromRGB(45,55,75),
-    TextXAlignment = Enum.TextXAlignment.Left, AutoButtonColor = false,
-    Size = UDim2.new(1,-28,0,36), Position = UDim2.fromOffset(14,22)}, Content)
-FlingFunctions.round(FlingTypeButton, 8)
-FlingFunctions.make("UIPadding", {PaddingLeft=UDim.new(0,10)}, FlingTypeButton)
-FlingTypeButton.MouseEnter:Connect(function()
-    FlingTypeButton.BackgroundColor3 = Color3.fromRGB(58,70,95)
-end)
-FlingTypeButton.MouseLeave:Connect(function()
-    FlingTypeButton.BackgroundColor3 = Color3.fromRGB(45,55,75)
-end)
-
-local FlingTypeDropdown = FlingFunctions.make("ScrollingFrame", {
-    Position=UDim2.fromOffset(14,62), Size=UDim2.new(1,-28,0,80),
-    BackgroundColor3=Color3.fromRGB(26,32,46), BorderSizePixel=0, Visible=false,
-    ScrollBarThickness=4, ScrollBarImageColor3=ACCENT,
-    CanvasSize=UDim2.fromOffset(0,0), AutomaticCanvasSize=Enum.AutomaticSize.Y,
-    ZIndex=6}, Content)
-FlingFunctions.round(FlingTypeDropdown, 8)
-FlingFunctions.make("UIPadding", {PaddingTop=UDim.new(0,4), PaddingBottom=UDim.new(0,4),
-    PaddingLeft=UDim.new(0,4), PaddingRight=UDim.new(0,4)}, FlingTypeDropdown)
-FlingFunctions.make("UIStroke", {Color=ACCENT, Thickness=1}, FlingTypeDropdown)
-FlingFunctions.make("UIListLayout", {SortOrder=Enum.SortOrder.LayoutOrder, Padding=UDim.new(0,3)}, FlingTypeDropdown)
-
-local ftButtons = {}
-for i, opt in ipairs(FLING_TYPE_OPTIONS) do
-    local selected = (opt.id == currentFlingType)
-    local b = FlingFunctions.make("TextButton", {Text=opt.label, Font=Enum.Font.Gotham, TextSize=12,
-        TextColor3=WHITE, BackgroundColor3=selected and ACCENTD or ROW,
-        TextXAlignment=Enum.TextXAlignment.Left, AutoButtonColor=false,
-        LayoutOrder=i, Size=UDim2.new(1,0,0,28), ZIndex=7}, FlingTypeDropdown)
-    FlingFunctions.round(b, 6)
-    FlingFunctions.make("UIPadding", {PaddingLeft=UDim.new(0,10)}, b)
-    ftButtons[opt.id] = b
-    b.MouseEnter:Connect(function()
-        if opt.id ~= currentFlingType then b.BackgroundColor3 = ROWHI end
-    end)
-    b.MouseLeave:Connect(function()
-        if opt.id ~= currentFlingType then b.BackgroundColor3 = ROW end
-    end)
-    b.MouseButton1Click:Connect(function()
-        currentFlingType = opt.id
-        FlingTypeButton.Text = "Type: " .. opt.label .. "  ▼"
-        FlingTypeDropdown.Visible = false
-        for id, btn in pairs(ftButtons) do
-            btn.BackgroundColor3 = (id == opt.id) and ACCENTD or ROW
-        end
-        FlingFunctions.setStatus("Fling type: " .. opt.label, CYAN,
-            opt.id == "original" and "KILASIK 4s rotation"
-            or "v23.4 slice → TP back → repeat")
-    end)
-end
-FlingTypeButton.MouseButton1Click:Connect(function()
-    FlingTypeDropdown.Visible = not FlingTypeDropdown.Visible
-end)
-
--- ============================================================
--- PREDICTION
--- ============================================================
-local PredHeading = FlingFunctions.label("PREDICTION (ms)", 11, UDim2.fromOffset(14,0),
-    UDim2.new(1,-28,0,16), Content)
-PredHeading.Font = Enum.Font.GothamBold
-PredHeading.TextColor3 = MUTED
-local PredBox = FlingFunctions.make("TextBox", {
-    Text = tostring(math.floor(PREDICTION_TIME * 1000)),
-    ClearTextOnFocus = false, TextColor3 = WHITE,
-    TextSize = 13, Font = Enum.Font.GothamBold,
-    BackgroundColor3 = PANEL,
-    TextXAlignment = Enum.TextXAlignment.Center,
-    Size = UDim2.new(1,-28,0,34),
-    Position = UDim2.fromOffset(14,22)}, Content)
-FlingFunctions.round(PredBox, 8)
-PredBox.FocusLost:Connect(function()
-    local n = tonumber(PredBox.Text)
-    if n and n >= 0 and n <= 350 then
-        PREDICTION_TIME = n / 1000
-        FlingFunctions.setStatus("Prediction: " .. n .. " ms", CYAN,
-            "0 = raw v23.4. Use 100-150 for high-ping.")
-    else
-        PredBox.Text = tostring(math.floor(PREDICTION_TIME * 1000))
-    end
-end)
-
-local FlingButton = FlingFunctions.make("TextButton", {Text="▶  FLING", Font=Enum.Font.GothamBold,
-    TextSize=15, TextColor3=WHITE, BackgroundColor3=GREEN, Position=UDim2.new(0,14,1,-84),
-    Size=UDim2.new(0.5,-18,0,48), AutoButtonColor=false}, Content)
-FlingFunctions.round(FlingButton, 12)
-FlingButton.MouseEnter:Connect(function() FlingButton.BackgroundColor3 = GREEN:Lerp(Color3.new(1,1,1), 0.15) end)
-FlingButton.MouseLeave:Connect(function() FlingButton.BackgroundColor3 = GREEN end)
-local Stop = FlingFunctions.make("TextButton", {Text="■  STOP", Font=Enum.Font.GothamBold,
-    TextSize=15, TextColor3=WHITE, BackgroundColor3=RED, Position=UDim2.new(0.5,4,1,-84),
-    Size=UDim2.new(0.5,-18,0,48), AutoButtonColor=false}, Content)
-FlingFunctions.round(Stop, 12)
-Stop.MouseEnter:Connect(function() Stop.BackgroundColor3 = RED:Lerp(Color3.new(1,1,1), 0.15) end)
-Stop.MouseLeave:Connect(function() Stop.BackgroundColor3 = RED end)
-
-local InspectOverlay = FlingFunctions.make("Frame", {Position=UDim2.fromOffset(10,62),
-    Size=UDim2.new(1,-20,1,-72), BackgroundColor3=PANEL, BorderSizePixel=0,
-    Visible=false, Active=true, ZIndex=20}, Main)
-FlingFunctions.round(InspectOverlay, 12)
-FlingFunctions.make("UIStroke", {Color=ACCENT, Thickness=1.5}, InspectOverlay)
-local InspectTitle = FlingFunctions.label("SCAN RESULTS", 13, UDim2.fromOffset(16,12),
-    UDim2.new(1,-70,0,24), InspectOverlay)
-InspectTitle.Font = Enum.Font.GothamBold
-InspectTitle.ZIndex = 22
-local InspectClose = FlingFunctions.make("TextButton", {Text="✕", Font=Enum.Font.GothamBold,
-    TextSize=14, BackgroundColor3=RED, TextColor3=WHITE,
-    Position=UDim2.new(1,-44,0,12), Size=UDim2.fromOffset(32,30), ZIndex=22}, InspectOverlay)
-FlingFunctions.round(InspectClose, 8)
-local InspectScroll = FlingFunctions.make("ScrollingFrame", {Position=UDim2.fromOffset(12,52),
-    Size=UDim2.new(1,-24,1,-66), BackgroundColor3=BG, BorderSizePixel=0,
-    ScrollBarThickness=5, ScrollBarImageColor3=ACCENT,
-    AutomaticCanvasSize=Enum.AutomaticSize.Y, CanvasSize=UDim2.fromOffset(0,0),
-    ZIndex=21}, InspectOverlay)
-FlingFunctions.round(InspectScroll, 10)
-local InspectText = FlingFunctions.make("TextLabel", {Position=UDim2.fromOffset(12,12),
-    Size=UDim2.new(1,-30,0,0), AutomaticSize=Enum.AutomaticSize.Y,
-    BackgroundTransparency=1, TextColor3=WHITE, TextXAlignment=Enum.TextXAlignment.Left,
-    TextYAlignment=Enum.TextYAlignment.Top, TextWrapped=true,
-    Font=Enum.Font.Code, TextSize=11,
-    Text="Type /scan, /scanenv, or /scanall to view.", ZIndex=22}, InspectScroll)
-InspectClose.MouseButton1Click:Connect(function() InspectOverlay.Visible = false end)
-
-local updateWindow
-do
-local Navigation = FlingFunctions.make("Frame", {Name="Tabs", Position=UDim2.fromOffset(12,8),
+local Navigation = make("Frame", {Name="Tabs", Position=UDim2.fromOffset(12,8),
     Size=UDim2.new(1,-24,0,44), BackgroundTransparency=1}, Content)
-local PageHost = FlingFunctions.make("Frame", {Name="Pages", Position=UDim2.fromOffset(12,60),
+local PageHost = make("Frame", {Name="Pages", Position=UDim2.fromOffset(12,60),
     Size=UDim2.new(1,-24,1,-200), BackgroundColor3=PANEL,
     BorderSizePixel=0, ClipsDescendants=true}, Content)
-FlingFunctions.round(PageHost, 12)
+round(PageHost, 12)
 
-function FlingFunctions.makePage(name)
-    return FlingFunctions.make("ScrollingFrame", {Name=name, Size=UDim2.fromScale(1,1),
+local function makePage(name)
+    return make("ScrollingFrame", {Name=name, Size=UDim2.fromScale(1,1),
         BackgroundTransparency=1, Visible=false, BorderSizePixel=0,
         ScrollingDirection=Enum.ScrollingDirection.Y, ScrollBarThickness=4,
         ScrollBarImageColor3=ACCENT, CanvasSize=UDim2.fromOffset(0,460)}, PageHost)
 end
-local PlayerPage  = FlingFunctions.makePage("Players")
-local RingPage    = FlingFunctions.makePage("Ring")
-local ActionPage  = FlingFunctions.makePage("Actions")
-local UtilityPage = FlingFunctions.makePage("Tools")
-local HitPage     = FlingFunctions.makePage("Hits")
-HitPage.ScrollingEnabled = false
+local PlayerPage = makePage("Players")
+local RingPage   = makePage("Ring")
+local ToolsPage  = makePage("Tools")
 
-local Footer = FlingFunctions.make("Frame", {Name="FixedFooter", Position=UDim2.new(0,12,1,-128),
+local Footer = make("Frame", {Name="Footer", Position=UDim2.new(0,12,1,-128),
     Size=UDim2.new(1,-24,0,122), BackgroundTransparency=1}, Content)
-
-for _, obj in ipairs({sectionFrames[1], CmdBar, sectionFrames[2], Search,
-    Count, List, sectionFrames[4], SelectAll, DeselectAll, InspectButton}) do
-    obj.Parent = PlayerPage
-end
-for _, obj in ipairs({sectionFrames[3], TPButton, BringButton,
-    FreezeButton, UnfreezeButton, AnchorButton, UnanchorButton,
-    TargetHeading, TargetButton, TargetDropdown,
-    FlingTypeHeading, FlingTypeButton, FlingTypeDropdown,
-    PredHeading, PredBox}) do
-    obj.Parent = ActionPage
-end
-for _, obj in ipairs({AimbotButton, FollowButton, NoclipButton,
-    SpeedButton, GrabObjectButton, RescueButton,
-    fovLabel, FovBox, smoothLabel, SmoothBox}) do
-    obj.Parent = UtilityPage
-end
-for _, obj in ipairs({StatusPanel, FlingButton, Stop}) do
-    obj.Parent = Footer
+local StatusPanel = make("Frame", {Position=UDim2.new(0,0,0,0),
+    Size=UDim2.new(1,0,0,52), BackgroundColor3=PANEL, BorderSizePixel=0}, Footer)
+round(StatusPanel, 10)
+make("UIStroke", {Color=Color3.fromRGB(48,56,76), Thickness=1}, StatusPanel)
+local StatusLbl = label("Ready", 12, UDim2.fromOffset(12,8), UDim2.new(1,-24,0,18), StatusPanel)
+StatusLbl.Font = Enum.Font.GothamMedium
+local StatusSub = label("Press Ring · Right Shift = emergency off", 10,
+    UDim2.fromOffset(12,26), UDim2.new(1,-24,0,14), StatusPanel)
+StatusSub.TextColor3 = MUTED
+local function setStatus(main, color, sub)
+    StatusLbl.Text = main
+    StatusLbl.TextColor3 = color or WHITE
+    StatusSub.Text = sub or ""
 end
 
-local UtilityTitle = FlingFunctions.label("MOVEMENT & UTILITIES", 12, UDim2.fromOffset(10,16),
-    UDim2.fromOffset(300,20), UtilityPage)
-UtilityTitle.Font = Enum.Font.GothamBold
-UtilityTitle.TextColor3 = MUTED
-local ActionsHint = FlingFunctions.label("Actions use the selected player on the Players tab.", 11,
-    UDim2.fromOffset(10,245), UDim2.new(1,-20,0,34), ActionPage)
-ActionsHint.TextWrapped = true
-ActionsHint.TextColor3 = MUTED
-local ToolsHint = FlingFunctions.label("Use the Players tab for /help, /scan, and /testreturn.", 11,
-    UDim2.fromOffset(10,295), UDim2.new(1,-20,0,35), UtilityPage)
-ToolsHint.TextWrapped = true
-ToolsHint.TextColor3 = MUTED
+-- ============================================================
+-- PLAYERS PAGE
+-- ============================================================
+local sectionPlayers = label("PLAYERS", 10, UDim2.fromOffset(10,10), UDim2.new(1,-20,0,16), PlayerPage)
+sectionPlayers.Font = Enum.Font.GothamBold
+sectionPlayers.TextColor3 = MUTED
 
-local HitHeading = FlingFunctions.label("CONTACT OBSERVATIONS", 12, UDim2.fromOffset(10,14),
-    UDim2.fromOffset(300,22), HitPage)
-HitHeading.Font = Enum.Font.GothamBold
-HitHeading.TextColor3 = CYAN
-HitDebug.summary = FlingFunctions.label("No contact observations yet", 13, UDim2.fromOffset(10,46),
-    UDim2.new(1,-20,0,54), HitPage)
-HitDebug.summary.Font = Enum.Font.GothamBold
-HitDebug.summary.TextWrapped = true
-HitDebug.summary.TextTruncate = Enum.TextTruncate.None
-HitDebug.summary.TextYAlignment = Enum.TextYAlignment.Center
-HitDebug.details = FlingFunctions.label("Shows body part, local zone, and evidence", 11,
-    UDim2.fromOffset(10,108), UDim2.new(1,-20,0,92), HitPage)
-HitDebug.details.TextWrapped = true
-HitDebug.details.TextTruncate = Enum.TextTruncate.None
-HitDebug.details.TextYAlignment = Enum.TextYAlignment.Top
-HitDebug.details.TextColor3 = MUTED
-local ClearHits = FlingFunctions.make("TextButton", {Text="CLEAR HISTORY", Font=Enum.Font.GothamBold,
-    TextSize=12, TextColor3=WHITE, BackgroundColor3=ROW,
-    Position=UDim2.fromOffset(10,205), Size=UDim2.fromOffset(200,36)}, HitPage)
-FlingFunctions.round(ClearHits, 8)
-ClearHits.MouseButton1Click:Connect(HitDebug.clear)
-local LimbFocusButton = FlingFunctions.make("TextButton", {Name="LimbFocus", Text="SHOW: ALL",
-    Font=Enum.Font.GothamBold, TextSize=12, TextColor3=WHITE, BackgroundColor3=ACCENTD,
-    AutoButtonColor=true, Position=UDim2.fromOffset(220,205), Size=UDim2.fromOffset(200,36)}, HitPage)
-FlingFunctions.round(LimbFocusButton, 8)
-LimbFocusButton.MouseButton1Click:Connect(function()
-    local nextMode = {Both="HRP", HRP="Arms", Arms="Legs", Legs="Both"}
-    HitDebug.focus = nextMode[HitDebug.focus] or "Both"
-    LimbFocusButton.Text = "SHOW: " .. string.upper(HitDebug.focus == "Both" and "ALL" or HitDebug.focus)
-    HitDebug.render()
-    FlingFunctions.setStatus("Filter: " .. HitDebug.focus, CYAN)
+local Search = make("TextBox", {Text="", PlaceholderText="🔍  Search players...",
+    ClearTextOnFocus=false, TextColor3=WHITE, PlaceholderColor3=MUTED,
+    TextSize=13, Font=Enum.Font.Gotham, BackgroundColor3=PANEL,
+    TextXAlignment=Enum.TextXAlignment.Left}, PlayerPage)
+round(Search, 10)
+make("UIPadding", {PaddingLeft=UDim.new(0,12)}, Search)
+
+local Count = label("Loading players...", 11, UDim2.fromOffset(10,0),
+    UDim2.new(1,-20,0,16), PlayerPage)
+Count.TextColor3 = MUTED
+
+local List = make("ScrollingFrame", {BackgroundColor3=PANEL, BorderSizePixel=0,
+    ScrollBarThickness=4, ScrollBarImageColor3=ACCENT,
+    CanvasSize=UDim2.fromOffset(0,0),
+    ScrollingDirection=Enum.ScrollingDirection.Y, ScrollingEnabled=true,
+    ClipsDescendants=true}, PlayerPage)
+round(List, 10)
+make("UIPadding", {PaddingTop=UDim.new(0,6), PaddingBottom=UDim.new(0,6),
+    PaddingLeft=UDim.new(0,6), PaddingRight=UDim.new(0,6)}, List)
+local ListLayout = make("UIListLayout", {SortOrder=Enum.SortOrder.LayoutOrder,
+    Padding=UDim.new(0,6)}, List)
+
+local rows = {}
+local function loadAvatar(player, image, size)
+    image:SetAttribute("AvatarUserId", player.UserId)
+    image.Image = ""
+    task.spawn(function()
+        local ok, url = pcall(function()
+            return Players:GetUserThumbnailAsync(player.UserId, Enum.ThumbnailType.HeadShot, size)
+        end)
+        if ok and image.Parent and image:GetAttribute("AvatarUserId") == player.UserId then
+            image.Image = url
+        end
+    end)
+end
+
+local function refreshPlayers()
+    for _, r in pairs(rows) do r:Destroy() end
+    table.clear(rows)
+    local all = Players:GetPlayers()
+    table.sort(all, function(a,b) return a.Name:lower() < b.Name:lower() end)
+    local q = Search.Text:lower()
+    local shown = 0
+    for _, player in ipairs(all) do
+        if player ~= Me
+           and (player.Name:lower():find(q,1,true)
+                or player.DisplayName:lower():find(q,1,true)) then
+            shown = shown + 1
+            local selected = (targetPlayerName == player.Name)
+            local Row = make("TextButton", {Size=UDim2.new(1,-18,0,56),
+                LayoutOrder=shown,
+                BackgroundColor3 = selected and Color3.fromRGB(58,78,110) or ROW,
+                BorderSizePixel=0, AutoButtonColor=false, Text=""}, List)
+            round(Row, 10)
+            Row.MouseEnter:Connect(function()
+                if targetPlayerName ~= player.Name then Row.BackgroundColor3 = ROWHI end
+            end)
+            Row.MouseLeave:Connect(function()
+                if targetPlayerName ~= player.Name then Row.BackgroundColor3 = ROW end
+            end)
+            local pic = make("ImageLabel", {Position=UDim2.fromOffset(36,6),
+                Size=UDim2.fromOffset(40,40), BackgroundColor3=PANEL, Image=""}, Row)
+            round(pic, 20)
+            local check = make("Frame", {Position=UDim2.fromOffset(8,15),
+                Size=UDim2.fromOffset(22,22), BackgroundColor3=Color3.fromRGB(60,70,95),
+                BorderSizePixel=0}, Row)
+            round(check, 6)
+            make("UIStroke", {Color=Color3.fromRGB(80,92,118), Thickness=1}, check)
+            make("TextLabel", {Size=UDim2.fromScale(1,1), BackgroundTransparency=1,
+                Text="✓", TextColor3=Color3.fromRGB(60,230,130),
+                Font=Enum.Font.GothamBold, TextSize=16, Visible=selected}, check)
+            local dl = label(player.DisplayName, 14, UDim2.fromOffset(84,6),
+                UDim2.new(1,-92,0,22), Row)
+            dl.Font = Enum.Font.GothamBold
+            local ul = label("@"..player.Name, 11, UDim2.fromOffset(84,28),
+                UDim2.new(1,-92,0,18), Row)
+            ul.TextColor3 = MUTED
+            loadAvatar(player, pic, Enum.ThumbnailSize.Size100x100)
+            Row.MouseButton1Click:Connect(function()
+                if targetPlayerName == player.Name then
+                    targetPlayerName = ""
+                else
+                    targetPlayerName = player.Name
+                end
+                refreshPlayers()
+                setStatus(targetPlayerName == "" and "Target: self" or ("Target: "..player.Name),
+                    targetPlayerName == "" and MUTED or Color3.fromRGB(80,180,200))
+            end)
+            rows[player] = Row
+        end
+    end
+    Count.Text = string.format("%d online · %d shown · target: %s",
+        #all, shown, targetPlayerName == "" and "self" or targetPlayerName)
+end
+
+Search:GetPropertyChangedSignal("Text"):Connect(function()
+    List.CanvasPosition = Vector2.zero
+    refreshPlayers()
 end)
-local HitHistory = FlingFunctions.make("ScrollingFrame", {Position=UDim2.fromOffset(10,252),
-    Size=UDim2.new(1,-20,1,-262), BackgroundColor3=BG, BorderSizePixel=0,
-    ScrollBarThickness=5, ScrollBarImageColor3=ACCENT,
-    AutomaticCanvasSize=Enum.AutomaticSize.Y, CanvasSize=UDim2.fromOffset(0,0),
-    ScrollingDirection=Enum.ScrollingDirection.Y}, HitPage)
-FlingFunctions.round(HitHistory, 8)
-HitDebug.log = FlingFunctions.make("TextLabel", {Position=UDim2.fromOffset(10,10),
-    Size=UDim2.new(1,-25,0,0), AutomaticSize=Enum.AutomaticSize.Y,
-    BackgroundTransparency=1, TextColor3=WHITE, TextWrapped=true,
-    TextXAlignment=Enum.TextXAlignment.Left, TextYAlignment=Enum.TextYAlignment.Top,
-    Font=Enum.Font.Code, TextSize=11,
-    Text="The most recent 32 observations appear here."}, HitHistory)
-HitDebug.render()
+Players.PlayerAdded:Connect(function() task.defer(refreshPlayers) end)
+Players.PlayerRemoving:Connect(function(p)
+    if p.Name == targetPlayerName then targetPlayerName = "" end
+    task.defer(refreshPlayers)
+end)
 
 -- ============================================================
--- [RING] RING PAGE UI
+-- RING PAGE
 -- ============================================================
-local RingHeading = FlingFunctions.label("SUPER RING", 12, UDim2.fromOffset(10,14),
-    UDim2.fromOffset(300,22), RingPage)
+local RingHeading = label("SUPER RING OLD", 12, UDim2.fromOffset(10,14),
+    UDim2.new(1,-20,0,22), RingPage)
 RingHeading.Font = Enum.Font.GothamBold
 RingHeading.TextColor3 = ACCENT
 
-local RingHint = FlingFunctions.label("Pulls loose parts (and other players if damageOthers is on). Ownership is claimed via SetNetworkOwner.",
-    11, UDim2.fromOffset(10,40), UDim2.new(1,-20,0,42), RingPage)
+local RingHint = label("3-state toggle. Radius/Height swap every 1 second. Target uses the player selected on the Players tab.",
+    11, UDim2.fromOffset(10,40), UDim2.new(1,-20,0,52), RingPage)
 RingHint.TextWrapped = true
 RingHint.TextColor3 = MUTED
 
-local RingToggle = FlingFunctions.make("TextButton", {Text="Ring: OFF", Font=Enum.Font.GothamBold,
-    TextSize=14, TextColor3=WHITE, BackgroundColor3=ROW, AutoButtonColor=false}, RingPage)
-FlingFunctions.round(RingToggle, 10)
+local RingToggle = make("TextButton", {Text="Ring: OFF", Font=Enum.Font.GothamBold,
+    TextSize=14, TextColor3=WHITE, BackgroundColor3=RED, AutoButtonColor=false}, RingPage)
+round(RingToggle, 10)
 RingToggle.MouseButton1Click:Connect(function()
-    ringPartsEnabled = not ringPartsEnabled
-    if ringPartsEnabled then
-        ringReclaimAll(true)
-        pcall(function() LocalPlayer.ReplicationFocus = workspace end)
-        pcall(function() sethiddenproperty(LocalPlayer, "SimulationRadius", math.huge) end)
+    local ch = Me.Character
+    local hrp = ch and ch:FindFirstChild("HumanoidRootPart")
+    if not hrp and OrbitState ~= 0 then setStatus("No character", RED); return end
+    if OrbitState == 0 then
+        OrbitState = 1
+        RingToggle.Text = "Ring: ON"
+        RingToggle.BackgroundColor3 = GREEN
+        setStatus("Orbit active", GREEN, "Radius and height swapping every 1s")
+    elseif OrbitState == 1 then
+        LockedPosition = hrp.Position
+        OrbitState = 2
+        RingToggle.Text = "Ring: LOCKED"
+        RingToggle.BackgroundColor3 = AMBER
+        setStatus("Orbit locked", AMBER, "Center frozen at current position")
+    else
+        OrbitState = 0
+        LockedPosition = nil
+        RingToggle.Text = "Ring: OFF"
+        RingToggle.BackgroundColor3 = RED
+        for _, v in pairs(itemsInRing) do
+            if v and v.Parent then
+                local bp = v:FindFirstChild("OrbitBP")
+                if bp then bp:Destroy() end
+            end
+        end
+        itemsInRing = {}
+        itemsInRingLookup = {}
+        setStatus("Orbit off", MUTED)
     end
-    RingToggle.Text = "Ring: " .. (ringPartsEnabled and "ON" or "OFF")
-    RingToggle.BackgroundColor3 = ringPartsEnabled and GREEN or ROW
-    FlingFunctions.setStatus("Ring " .. (ringPartsEnabled and "ON" or "OFF"),
-        ringPartsEnabled and GREEN or MUTED,
-        ringPartsEnabled and "Ownership claimed — CanCollide on" or "")
 end)
 
 local ringRows = {}
 local function createRingRow(labelText, minV, maxV, stepV, getFn, setFn)
-    local lbl = FlingFunctions.label(labelText, 11, UDim2.fromOffset(10, 0), UDim2.fromOffset(200, 16), RingPage)
+    local lbl = label(labelText, 11, UDim2.fromOffset(10,0), UDim2.fromOffset(200,16), RingPage)
     lbl.Font = Enum.Font.GothamBold
     lbl.TextColor3 = MUTED
-
-    local dec = FlingFunctions.make("TextButton", {Text="−", Font=Enum.Font.GothamBold, TextSize=20,
+    local dec = make("TextButton", {Text="−", Font=Enum.Font.GothamBold, TextSize=20,
         TextColor3=WHITE, BackgroundColor3=ROW, AutoButtonColor=false}, RingPage)
-    FlingFunctions.round(dec, 8)
-
-    local box = FlingFunctions.make("TextBox", {Text=tostring(getFn()), ClearTextOnFocus=false,
+    round(dec, 8)
+    local box = make("TextBox", {Text=tostring(getFn()), ClearTextOnFocus=false,
         TextColor3=WHITE, TextSize=13, Font=Enum.Font.GothamBold,
         BackgroundColor3=PANEL, TextXAlignment=Enum.TextXAlignment.Center}, RingPage)
-    FlingFunctions.round(box, 8)
-
-    local inc = FlingFunctions.make("TextButton", {Text="+", Font=Enum.Font.GothamBold, TextSize=20,
+    round(box, 8)
+    local inc = make("TextButton", {Text="+", Font=Enum.Font.GothamBold, TextSize=20,
         TextColor3=WHITE, BackgroundColor3=ROW, AutoButtonColor=false}, RingPage)
-    FlingFunctions.round(inc, 8)
-
-    dec.MouseButton1Click:Connect(function()
-        setFn(math.clamp(getFn() - stepV, minV, maxV))
-        box.Text = tostring(getFn())
-    end)
-    inc.MouseButton1Click:Connect(function()
-        setFn(math.clamp(getFn() + stepV, minV, maxV))
-        box.Text = tostring(getFn())
-    end)
+    round(inc, 8)
+    dec.MouseButton1Click:Connect(function() setFn(math.clamp(getFn()-stepV,minV,maxV)); box.Text = tostring(getFn()) end)
+    inc.MouseButton1Click:Connect(function() setFn(math.clamp(getFn()+stepV,minV,maxV)); box.Text = tostring(getFn()) end)
     box.FocusLost:Connect(function(enter)
-        if enter then
-            local n = tonumber(box.Text)
-            if n then setFn(math.clamp(n, minV, maxV)) end
-        end
+        if enter then local n = tonumber(box.Text); if n then setFn(math.clamp(n,minV,maxV)) end end
         box.Text = tostring(getFn())
     end)
-
     table.insert(ringRows, {label=lbl, dec=dec, box=box, inc=inc})
 end
 
-createRingRow("Radius",         5, 500,   5, function() return RING_CONFIG.radius end,
-    function(v) RING_CONFIG.radius = v end)
-createRingRow("Height",        10, 400,   5, function() return RING_CONFIG.height end,
-    function(v) RING_CONFIG.height = v end)
-createRingRow("Rotation Speed", 0,  40,   1, function() return RING_CONFIG.rotationSpeed end,
-    function(v) RING_CONFIG.rotationSpeed = v end)
-createRingRow("Attraction",    10, 400,  10, function() return RING_CONFIG.attractionStrength end,
-    function(v) RING_CONFIG.attractionStrength = v end)
-createRingRow("Keep-out",       0,  30,   1, function() return RING_CONFIG.keepOut end,
-    function(v) RING_CONFIG.keepOut = v end)
+createRingRow("Radius A",      1, 500, 1, function() return config.radiusA end, function(v) config.radiusA = v end)
+createRingRow("Radius B",      1, 500, 1, function() return config.radiusB end, function(v) config.radiusB = v end)
+createRingRow("Height A",   -200, 400, 1, function() return config.heightA end, function(v) config.heightA = v end)
+createRingRow("Height B",   -200, 400, 1, function() return config.heightB end, function(v) config.heightB = v end)
+createRingRow("Spin Speed",    1, 100, 1, function() return config.speed end,   function(v) config.speed = v end)
+createRingRow("Target Radius", 0, 500, 5, function() return config.targetRadius end, function(v) config.targetRadius = v end)
+createRingRow("Scan Radius",  50, 2000, 50, function() return config.scanRadius end, function(v) config.scanRadius = v end)
 
-local RingCollideToggle = FlingFunctions.make("TextButton", {
-    Text = "Damage others: " .. (RING_CONFIG.damageOthers and "ON" or "OFF"),
-    Font = Enum.Font.GothamBold, TextSize = 13, TextColor3 = WHITE,
-    BackgroundColor3 = RING_CONFIG.damageOthers and GREEN or ROW,
-    AutoButtonColor = false}, RingPage)
-FlingFunctions.round(RingCollideToggle, 8)
-RingCollideToggle.MouseButton1Click:Connect(function()
-    RING_CONFIG.damageOthers = not RING_CONFIG.damageOthers
-    RingCollideToggle.Text = "Damage others: " .. (RING_CONFIG.damageOthers and "ON" or "OFF")
-    RingCollideToggle.BackgroundColor3 = RING_CONFIG.damageOthers and GREEN or ROW
-end)
-
-local RingNote = FlingFunctions.label(
-    "Right Shift = emergency ring off. High attraction or low keep-out can hurt you too.",
+local RingNote = label(
+    "Right Shift = emergency off. Super Ring Old uses CanCollide=false (no damage to players).",
     10, UDim2.fromOffset(10,0), UDim2.new(1,-20,0,44), RingPage)
 RingNote.TextWrapped = true
 RingNote.TextColor3 = MUTED
-RingNote.LayoutOrder = 99
 
-local tabButtons = {}
-local currentTab = "Players"
-function FlingFunctions.showTab(name)
-    currentTab = name
-    PlayerPage.Visible  = name == "Players"
-    RingPage.Visible    = name == "Ring"
-    ActionPage.Visible  = name == "Actions"
-    UtilityPage.Visible = name == "Tools"
-    HitPage.Visible     = name == "Hits"
-    for tabName, btn in pairs(tabButtons) do
-        btn.BackgroundColor3 = (name == tabName) and ACCENTD or ROW
-        btn.TextColor3 = (name == tabName) and WHITE or MUTED
-    end
-end
-for _, tab in ipairs({"Players", "Ring", "Actions", "Tools", "Hits"}) do
-    local btn = FlingFunctions.make("TextButton", {Name="Tab"..tab, Text=tab, TextSize=13,
-        Font=Enum.Font.GothamBold, TextColor3=WHITE, BackgroundColor3=ROW,
-        AutoButtonColor=true}, Navigation)
-    FlingFunctions.round(btn, 8)
-    btn.MouseButton1Click:Connect(function() FlingFunctions.showTab(tab) end)
-    tabButtons[tab] = btn
-end
-HitDebug.showHits = function() FlingFunctions.showTab("Hits") end
+-- ============================================================
+-- HARDCODED TOOL FUNCTIONS
+-- ============================================================
 
-function FlingFunctions.place(obj,x,y,w,h) obj.Position=UDim2.fromOffset(x,y) obj.Size=UDim2.fromOffset(w,h) end
+-- [TOOL 1] FPS BOOST
+local fpsActive = false
+local function applyFPSBoost()
+    local set = _G.Settings or {}
+    local noParts  = set["No Particles"] ~= false
+    local noCam    = set["No Camera Effects"] ~= false
+    local noExp    = set["No Explosions"] ~= false
+    local noShadow = set["No Shadows"] ~= false
+    local lowQual  = set["Low Quality Parts"] ~= false
 
-function FlingFunctions.reflowContents(panelWidth, panelHeight)
-    local gap = 10
-    local innerWidth = panelWidth - 44
-    local innerHeight = math.max(1, PageHost.Size.Y.Offset)
-    local compact = innerHeight < 350
-    ActionPage.CanvasSize = UDim2.fromOffset(0, 700)
-    UtilityPage.CanvasSize = UDim2.fromOffset(0, innerWidth < 335 and 365 or 340)
-    HitPage.ScrollingEnabled = compact
-    HitPage.ScrollBarThickness = compact and 6 or 0
-    HitPage.AutomaticCanvasSize = compact and Enum.AutomaticSize.Y or Enum.AutomaticSize.None
-    HitPage.CanvasSize = UDim2.fromOffset(0, 0)
-    local half = math.floor((innerWidth - gap) / 2)
-    local third = math.floor((innerWidth - gap * 2) / 3)
-    local navWidth = panelWidth - 24
-    local tabList = {"Players", "Ring", "Actions", "Tools", "Hits"}
-    local tabCount = #tabList
-    local tabW = math.floor((navWidth - (tabCount-1) * gap) / tabCount)
-    for i, name in ipairs(tabList) do
-        local x = (i - 1) * (tabW + gap)
-        local ww = (i == tabCount) and (navWidth - x) or tabW
-        FlingFunctions.place(tabButtons[name], x, 0, ww, 42)
-        tabButtons[name].TextSize = 11
-    end
-    FlingFunctions.place(sectionFrames[1], 10, 10, innerWidth, 18)
-    FlingFunctions.place(CmdBar, 10, 32, innerWidth, 40)
-    FlingFunctions.place(sectionFrames[2], 10, 84, innerWidth, 18)
-    FlingFunctions.place(Search, 10, 106, innerWidth, 40)
-    FlingFunctions.place(Count, 10, 149, innerWidth, 20)
-    local narrow = innerWidth < 335
-    local listY = 175
-    local listHeight
-    if compact then listHeight = math.max(64, FlingFunctions.getPlayerListContentHeight())
-    else listHeight = math.max(60, innerHeight - listY - (narrow and 123 or 82)) end
-    local selectionY = listY + listHeight + 10
-    FlingFunctions.place(List, 10, listY, innerWidth, listHeight)
-    List.CanvasSize = UDim2.fromOffset(0, FlingFunctions.getPlayerListContentHeight())
-    List.ScrollingEnabled = not compact
-    List.ScrollBarThickness = compact and 0 or 6
-    PlayerPage.ScrollingEnabled = compact
-    PlayerPage.ScrollBarThickness = compact and 6 or 0
-    PlayerPage.CanvasSize = UDim2.fromOffset(0,
-        math.max(innerHeight, selectionY + (narrow and 108 or 68)))
-    FlingFunctions.place(sectionFrames[4], 10, selectionY + 2, innerWidth, 16)
-    if narrow then
-        FlingFunctions.place(SelectAll, 10, selectionY + 24, half, 34)
-        FlingFunctions.place(DeselectAll, 10 + half + gap, selectionY + 24, half, 34)
-        FlingFunctions.place(InspectButton, 10, selectionY + 64, innerWidth, 34)
-    else
-        FlingFunctions.place(SelectAll, 10, selectionY + 22, third, 36)
-        FlingFunctions.place(DeselectAll, 10 + third + gap, selectionY + 22, third, 36)
-        FlingFunctions.place(InspectButton, 10 + 2 * (third + gap), selectionY + 22,
-            innerWidth - 2 * (third + gap), 36)
-    end
-    FlingFunctions.place(sectionFrames[3], 10, 14, innerWidth, 18)
-    local targetButtons = {TPButton, BringButton, FreezeButton,
-        UnfreezeButton, AnchorButton, UnanchorButton}
-    for i, btn in ipairs(targetButtons) do
-        FlingFunctions.place(btn, 10 + ((i-1) % 2) * (half + gap),
-            42 + math.floor((i-1) / 2) * 56, half, 46)
-        btn.TextSize = 13
-    end
-    FlingFunctions.place(ActionsHint, 10, 228, innerWidth, 44)
-    FlingFunctions.place(TargetHeading, 10, 280, innerWidth, 18)
-    FlingFunctions.place(TargetButton, 10, 300, innerWidth, 38)
-    FlingFunctions.place(TargetDropdown, 10, 344, innerWidth, 80)
-    FlingFunctions.place(FlingTypeHeading, 10, 434, innerWidth, 18)
-    FlingFunctions.place(FlingTypeButton, 10, 454, innerWidth, 38)
-    FlingFunctions.place(FlingTypeDropdown, 10, 498, innerWidth, 80)
-    FlingFunctions.place(PredHeading, 10, 590, innerWidth, 18)
-    FlingFunctions.place(PredBox,     10, 612, innerWidth, 34)
-    FlingFunctions.place(UtilityTitle, 10, 14, innerWidth, 22)
-    local utilityButtons = {AimbotButton, FollowButton, NoclipButton,
-        SpeedButton, GrabObjectButton, RescueButton}
-    for i, btn in ipairs(utilityButtons) do
-        FlingFunctions.place(btn, 10 + ((i-1) % 2) * (half + gap),
-            44 + math.floor((i-1) / 2) * 56, half, 46)
-        btn.TextSize = 12
-    end
-    if innerWidth < 335 then
-        FlingFunctions.place(fovLabel, 10, 223, 75, 32)
-        FlingFunctions.place(FovBox, 87, 223, innerWidth - 77, 32)
-        FlingFunctions.place(smoothLabel, 10, 263, 75, 32)
-        FlingFunctions.place(SmoothBox, 87, 263, innerWidth - 77, 32)
-        FlingFunctions.place(ToolsHint, 10, 307, innerWidth, 44)
-    else
-        FlingFunctions.place(fovLabel, 10, 232, 65, 34)
-        FlingFunctions.place(FovBox, 76, 232, half - 66, 34)
-        FlingFunctions.place(smoothLabel, 10 + half + gap, 232, 63, 34)
-        FlingFunctions.place(SmoothBox, 74 + half + gap, 232, half - 64, 34)
-        FlingFunctions.place(ToolsHint, 10, 283, innerWidth, 44)
-    end
-    -- Ring page
-    do
-        local ringY = 14
-        FlingFunctions.place(RingHeading, 10, ringY, innerWidth, 22)
-        ringY = ringY + 26
-        FlingFunctions.place(RingHint, 10, ringY, innerWidth, 42)
-        ringY = ringY + 50
-        FlingFunctions.place(RingToggle, 10, ringY, innerWidth, 46)
-        ringY = ringY + 58
-        for _, row in ipairs(ringRows) do
-            FlingFunctions.place(row.label, 10, ringY, innerWidth, 16)
-            FlingFunctions.place(row.dec, 10, ringY + 22, 42, 34)
-            FlingFunctions.place(row.box, 60, ringY + 22, innerWidth - 100, 34)
-            FlingFunctions.place(row.inc, 10 + innerWidth - 42, ringY + 22, 42, 34)
-            ringY = ringY + 62
+    if noParts then
+        for _, obj in ipairs(workspace:GetDescendants()) do
+            if obj:IsA("ParticleEmitter") or obj:IsA("Trail") or obj:IsA("Smoke")
+               or obj:IsA("Fire") or obj:IsA("Sparkles") then
+                obj.Enabled = false
+            end
         end
-        FlingFunctions.place(RingCollideToggle, 10, ringY, innerWidth, 40)
-        ringY = ringY + 50
-        FlingFunctions.place(RingNote, 10, ringY, innerWidth, 44)
-        RingPage.CanvasSize = UDim2.fromOffset(0, ringY + 60)
+        workspace.DescendantAdded:Connect(function(obj)
+            if obj:IsA("ParticleEmitter") or obj:IsA("Trail") or obj:IsA("Smoke")
+               or obj:IsA("Fire") or obj:IsA("Sparkles") then
+                obj.Enabled = false
+            end
+        end)
     end
-    -- Hits
-    FlingFunctions.place(HitHeading, 10, 14, innerWidth, 24)
-    FlingFunctions.place(HitDebug.summary, 10, 43, innerWidth, 55)
-    FlingFunctions.place(HitDebug.details, 10, 106, innerWidth, 89)
-    FlingFunctions.place(ClearHits, 10, 202, half, 36)
-    FlingFunctions.place(LimbFocusButton, 10 + half + gap, 202, half, 36)
-    if compact then
-        HitHistory.Visible = false
-        HitDebug.log.Parent = HitPage
-        FlingFunctions.place(HitDebug.log, 16, 253, innerWidth - 25, 0)
-    else
-        HitDebug.log.Parent = HitHistory
-        FlingFunctions.place(HitDebug.log, 10, 10, innerWidth - 25, 0)
-        HitHistory.Visible = true
-        FlingFunctions.place(HitHistory, 10, 248, innerWidth, math.max(55, innerHeight - 258))
+
+    if noCam then
+        for _, obj in ipairs(Lighting:GetChildren()) do
+            if obj:IsA("PostEffect") then obj.Enabled = false end
+        end
     end
-    local statusH = panelHeight < 480 and 29 or 52
-    local btnY = panelHeight < 480 and 34 or 62
-    local btnH = panelHeight < 480 and 39 or 52
-    StatusPanel.Position = UDim2.fromOffset(0, 0)
-    StatusPanel.Size = UDim2.new(1, 0, 0, statusH)
-    Status.Position = UDim2.fromOffset(10, panelHeight < 480 and 5 or 8)
-    Status.Size = UDim2.new(1, -20, 0, 18)
-    StatusSub.Visible = panelHeight >= 480
-    FlingButton.Position = UDim2.fromOffset(0, btnY)
-    FlingButton.Size = UDim2.new(0.5, -6, 0, btnH)
-    Stop.Position = UDim2.new(0.5, 6, 0, btnY)
-    Stop.Size = UDim2.new(0.5, -6, 0, btnH)
+
+    if noExp then
+        for _, obj in ipairs(workspace:GetDescendants()) do
+            if obj:IsA("Explosion") then obj.Visible = false end
+        end
+        workspace.DescendantAdded:Connect(function(obj)
+            if obj:IsA("Explosion") then obj.Visible = false end
+        end)
+    end
+
+    if noShadow then
+        Lighting.GlobalShadows = false
+        Lighting.FogEnd = 100000
+        for _, obj in ipairs(workspace:GetDescendants()) do
+            if obj:IsA("BasePart") then obj.CastShadow = false end
+        end
+        workspace.DescendantAdded:Connect(function(obj)
+            if obj:IsA("BasePart") then obj.CastShadow = false end
+        end)
+    end
+
+    if lowQual then
+        for _, obj in ipairs(workspace:GetDescendants()) do
+            if obj:IsA("BasePart") then
+                pcall(function() obj.Material = Enum.Material.SmoothPlastic end)
+            end
+        end
+    end
 end
 
-local playerLayoutUpdatePending = false
-PlayerRowLayout:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(function()
-    if playerLayoutUpdatePending then return end
-    playerLayoutUpdatePending = true
-    task.defer(function()
-        playerLayoutUpdatePending = false
-        if not Gui.Parent then return end
-        List.CanvasSize = UDim2.fromOffset(0, FlingFunctions.getPlayerListContentHeight())
-        if PlayerPage.ScrollingEnabled then
-            FlingFunctions.reflowContents(Main.Size.X.Offset, Main.Size.Y.Offset)
+-- [TOOL 2] FLING ALL
+local flingAllRunning = false
+local function flingAll()
+    if flingAllRunning then return end
+    flingAllRunning = true
+    getgenv().FPDH = workspace.FallenPartsDestroyHeight
+
+    local function msg(t, x, dur)
+        pcall(function()
+            game:GetService("StarterGui"):SetCore("SendNotification",
+                {Title=t, Text=x, Duration=dur or 5})
+        end)
+    end
+
+    local function skidFling(TargetPlayer)
+        local Character = Me.Character
+        local Humanoid = Character and Character:FindFirstChildOfClass("Humanoid")
+        local RootPart = Humanoid and Humanoid.RootPart
+        if not (Character and Humanoid and RootPart) then return end
+        local TCharacter = TargetPlayer.Character
+        if not TCharacter then return end
+        local THumanoid = TCharacter:FindFirstChildOfClass("Humanoid")
+        local TRootPart = THumanoid and THumanoid.RootPart
+        local THead = TCharacter:FindFirstChild("Head")
+        local Accessory = TCharacter:FindFirstChildOfClass("Accessory")
+        local Handle = Accessory and Accessory:FindFirstChild("Handle")
+
+        if RootPart.Velocity.Magnitude < 50 then getgenv().OldPos = RootPart.CFrame end
+        if THumanoid and THumanoid.Sit then return end
+        if not TCharacter:FindFirstChildWhichIsA("BasePart") then return end
+
+        local function FPos(bp, pos, ang)
+            RootPart.CFrame = CFrame.new(bp.Position) * pos * ang
+            Character:SetPrimaryPartCFrame(CFrame.new(bp.Position) * pos * ang)
+            RootPart.Velocity = Vector3.new(9e7, 9e7*10, 9e7)
+            RootPart.RotVelocity = Vector3.new(9e8, 9e8, 9e8)
+        end
+
+        local function SFBasePart(BasePart)
+            local Time = tick()
+            local Angle = 0
+            repeat
+                if not (RootPart and THumanoid) then break end
+                if BasePart.Velocity.Magnitude < 50 then
+                    Angle = Angle + 100
+                    FPos(BasePart, CFrame.new(0,1.5,0) + THumanoid.MoveDirection * BasePart.Velocity.Magnitude/1.25, CFrame.Angles(math.rad(Angle),0,0)); task.wait()
+                    FPos(BasePart, CFrame.new(0,-1.5,0) + THumanoid.MoveDirection * BasePart.Velocity.Magnitude/1.25, CFrame.Angles(math.rad(Angle),0,0)); task.wait()
+                    FPos(BasePart, CFrame.new(2.25,1.5,-2.25) + THumanoid.MoveDirection * BasePart.Velocity.Magnitude/1.25, CFrame.Angles(math.rad(Angle),0,0)); task.wait()
+                    FPos(BasePart, CFrame.new(-2.25,-1.5,2.25) + THumanoid.MoveDirection * BasePart.Velocity.Magnitude/1.25, CFrame.Angles(math.rad(Angle),0,0)); task.wait()
+                    FPos(BasePart, CFrame.new(0,1.5,0) + THumanoid.MoveDirection, CFrame.Angles(math.rad(Angle),0,0)); task.wait()
+                    FPos(BasePart, CFrame.new(0,-1.5,0) + THumanoid.MoveDirection, CFrame.Angles(math.rad(Angle),0,0)); task.wait()
+                else
+                    FPos(BasePart, CFrame.new(0,1.5,THumanoid.WalkSpeed), CFrame.Angles(math.rad(90),0,0)); task.wait()
+                    FPos(BasePart, CFrame.new(0,-1.5,-THumanoid.WalkSpeed), CFrame.Angles(0,0,0)); task.wait()
+                    FPos(BasePart, CFrame.new(0,1.5,THumanoid.WalkSpeed), CFrame.Angles(math.rad(90),0,0)); task.wait()
+                    FPos(BasePart, CFrame.new(0,1.5,TRootPart.Velocity.Magnitude/1.25), CFrame.Angles(math.rad(90),0,0)); task.wait()
+                    FPos(BasePart, CFrame.new(0,-1.5,-TRootPart.Velocity.Magnitude/1.25), CFrame.Angles(0,0,0)); task.wait()
+                    FPos(BasePart, CFrame.new(0,1.5,TRootPart.Velocity.Magnitude/1.25), CFrame.Angles(math.rad(90),0,0)); task.wait()
+                    FPos(BasePart, CFrame.new(0,-1.5,0), CFrame.Angles(math.rad(90),0,0)); task.wait()
+                    FPos(BasePart, CFrame.new(0,-1.5,0), CFrame.Angles(0,0,0)); task.wait()
+                    FPos(BasePart, CFrame.new(0,-1.5,0), CFrame.Angles(math.rad(-90),0,0)); task.wait()
+                    FPos(BasePart, CFrame.new(0,-1.5,0), CFrame.Angles(0,0,0)); task.wait()
+                end
+            until BasePart.Velocity.Magnitude > 500
+                or BasePart.Parent ~= TargetPlayer.Character
+                or TargetPlayer.Parent ~= Players
+                or THumanoid.Sit
+                or Humanoid.Health <= 0
+                or tick() > Time + 2
+        end
+
+        workspace.FallenPartsDestroyHeight = 0/0
+        local BV = Instance.new("BodyVelocity")
+        BV.Name = "EpixVel"
+        BV.Parent = RootPart
+        BV.Velocity = Vector3.new(9e8, 9e8, 9e8)
+        BV.MaxForce = Vector3.new(1/0, 1/0, 1/0)
+        Humanoid:SetStateEnabled(Enum.HumanoidStateType.Seated, false)
+
+        if TRootPart and THead then
+            if (TRootPart.CFrame.p - THead.CFrame.p).Magnitude > 5 then
+                SFBasePart(THead)
+            else
+                SFBasePart(TRootPart)
+            end
+        elseif TRootPart then SFBasePart(TRootPart)
+        elseif THead then SFBasePart(THead)
+        elseif Handle then SFBasePart(Handle)
+        else return msg("Fling All", "Target missing parts") end
+
+        BV:Destroy()
+        Humanoid:SetStateEnabled(Enum.HumanoidStateType.Seated, true)
+        repeat
+            RootPart.CFrame = getgenv().OldPos * CFrame.new(0,.5,0)
+            Character:SetPrimaryPartCFrame(getgenv().OldPos * CFrame.new(0,.5,0))
+            Humanoid:ChangeState("GettingUp")
+            for _, x in ipairs(Character:GetChildren()) do
+                if x:IsA("BasePart") then x.Velocity = Vector3.zero; x.RotVelocity = Vector3.zero end
+            end
+            task.wait()
+        until (RootPart.Position - getgenv().OldPos.p).Magnitude < 25
+        workspace.FallenPartsDestroyHeight = getgenv().FPDH
+    end
+
+    for _, target in ipairs(Players:GetPlayers()) do
+        if target ~= Me then
+            pcall(skidFling, target)
+        end
+    end
+    flingAllRunning = false
+    msg("Fling All", "Done", 3)
+end
+
+-- [TOOL 3] FLY GUI
+local function loadFlyGui()
+    if Me.PlayerGui:FindFirstChild("main") then
+        Me.PlayerGui.main:Destroy()
+    end
+
+    local main = Instance.new("ScreenGui")
+    local Frame = Instance.new("Frame")
+    local up = Instance.new("TextButton")
+    local down = Instance.new("TextButton")
+    local onof = Instance.new("TextButton")
+    local TextLabel = Instance.new("TextLabel")
+    local plus = Instance.new("TextButton")
+    local speed = Instance.new("TextLabel")
+    local mine = Instance.new("TextButton")
+    local closebutton = Instance.new("TextButton")
+    local mini = Instance.new("TextButton")
+    local mini2 = Instance.new("TextButton")
+
+    main.Name = "main"
+    main.Parent = Me:WaitForChild("PlayerGui")
+    main.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+    main.ResetOnSpawn = false
+
+    Frame.Parent = main
+    Frame.BackgroundColor3 = Color3.fromRGB(163, 255, 137)
+    Frame.BorderColor3 = Color3.fromRGB(103, 221, 213)
+    Frame.Position = UDim2.new(0.100320168, 0, 0.379746825, 0)
+    Frame.Size = UDim2.new(0, 190, 0, 57)
+
+    up.Parent = Frame
+    up.BackgroundColor3 = Color3.fromRGB(79, 255, 152)
+    up.Size = UDim2.new(0, 44, 0, 28)
+    up.Font = Enum.Font.SourceSans
+    up.Text = "UP"
+    up.TextColor3 = Color3.new(0, 0, 0)
+    up.TextSize = 14
+
+    down.Parent = Frame
+    down.BackgroundColor3 = Color3.fromRGB(215, 255, 121)
+    down.Position = UDim2.new(0, 0, 0.491228074, 0)
+    down.Size = UDim2.new(0, 44, 0, 28)
+    down.Font = Enum.Font.SourceSans
+    down.Text = "DOWN"
+    down.TextColor3 = Color3.new(0, 0, 0)
+    down.TextSize = 14
+
+    onof.Parent = Frame
+    onof.BackgroundColor3 = Color3.fromRGB(255, 249, 74)
+    onof.Position = UDim2.new(0.702823281, 0, 0.491228074, 0)
+    onof.Size = UDim2.new(0, 56, 0, 28)
+    onof.Font = Enum.Font.SourceSans
+    onof.Text = "fly"
+    onof.TextColor3 = Color3.new(0, 0, 0)
+    onof.TextSize = 14
+
+    TextLabel.Parent = Frame
+    TextLabel.BackgroundColor3 = Color3.fromRGB(242, 60, 255)
+    TextLabel.Position = UDim2.new(0.469327301, 0, 0, 0)
+    TextLabel.Size = UDim2.new(0, 100, 0, 28)
+    TextLabel.Font = Enum.Font.SourceSans
+    TextLabel.Text = "FLY GUI V3"
+    TextLabel.TextColor3 = Color3.new(0, 0, 0)
+    TextLabel.TextScaled = true
+    TextLabel.TextSize = 14
+    TextLabel.TextWrapped = true
+
+    plus.Parent = Frame
+    plus.BackgroundColor3 = Color3.fromRGB(133, 145, 255)
+    plus.Position = UDim2.new(0.231578946, 0, 0, 0)
+    plus.Size = UDim2.new(0, 45, 0, 28)
+    plus.Font = Enum.Font.SourceSans
+    plus.Text = "+"
+    plus.TextColor3 = Color3.new(0, 0, 0)
+    plus.TextScaled = true
+    plus.TextWrapped = true
+
+    speed.Parent = Frame
+    speed.BackgroundColor3 = Color3.fromRGB(255, 85, 0)
+    speed.Position = UDim2.new(0.468421042, 0, 0.491228074, 0)
+    speed.Size = UDim2.new(0, 44, 0, 28)
+    speed.Font = Enum.Font.SourceSans
+    speed.Text = "1"
+    speed.TextColor3 = Color3.new(0, 0, 0)
+    speed.TextScaled = true
+    speed.TextWrapped = true
+
+    mine.Parent = Frame
+    mine.BackgroundColor3 = Color3.fromRGB(123, 255, 247)
+    mine.Position = UDim2.new(0.231578946, 0, 0.491228074, 0)
+    mine.Size = UDim2.new(0, 45, 0, 29)
+    mine.Font = Enum.Font.SourceSans
+    mine.Text = "-"
+    mine.TextColor3 = Color3.new(0, 0, 0)
+    mine.TextScaled = true
+    mine.TextWrapped = true
+
+    closebutton.Name = "Close"
+    closebutton.Parent = Frame
+    closebutton.BackgroundColor3 = Color3.fromRGB(225, 25, 0)
+    closebutton.Font = Enum.Font.SourceSans
+    closebutton.Size = UDim2.new(0, 45, 0, 28)
+    closebutton.Text = "X"
+    closebutton.TextSize = 30
+    closebutton.Position = UDim2.new(0, 0, -1, 27)
+
+    mini.Name = "minimize"
+    mini.Parent = Frame
+    mini.BackgroundColor3 = Color3.fromRGB(192, 150, 230)
+    mini.Font = Enum.Font.SourceSans
+    mini.Size = UDim2.new(0, 45, 0, 28)
+    mini.Text = "-"
+    mini.TextSize = 40
+    mini.Position = UDim2.new(0, 44, -1, 27)
+
+    mini2.Name = "minimize2"
+    mini2.Parent = Frame
+    mini2.BackgroundColor3 = Color3.fromRGB(192, 150, 230)
+    mini2.Font = Enum.Font.SourceSans
+    mini2.Size = UDim2.new(0, 45, 0, 28)
+    mini2.Text = "+"
+    mini2.TextSize = 40
+    mini2.Position = UDim2.new(0, 44, -1, 57)
+    mini2.Visible = false
+
+    local speeds = 1
+    local nowe = false
+
+    local speaker = Players.LocalPlayer
+
+    pcall(function()
+        game:GetService("StarterGui"):SetCore("SendNotification", {
+            Title = "FLY GUI V3";
+            Text = "BY XNEO";
+            Icon = "rbxthumb://type=Asset&id=5107182114&w=150&h=150"})
+    end)
+
+    Frame.Active = true
+    Frame.Draggable = true
+
+    onof.MouseButton1Down:Connect(function()
+        if nowe == true then
+            nowe = false
+            local hum = speaker.Character and speaker.Character:FindFirstChildOfClass("Humanoid")
+            if hum then
+                for _, st in ipairs({Enum.HumanoidStateType.Climbing,
+                    Enum.HumanoidStateType.FallingDown, Enum.HumanoidStateType.Flying,
+                    Enum.HumanoidStateType.Freefall, Enum.HumanoidStateType.GettingUp,
+                    Enum.HumanoidStateType.Jumping, Enum.HumanoidStateType.Landed,
+                    Enum.HumanoidStateType.Physics, Enum.HumanoidStateType.PlatformStanding,
+                    Enum.HumanoidStateType.Ragdoll, Enum.HumanoidStateType.Running,
+                    Enum.HumanoidStateType.RunningNoPhysics, Enum.HumanoidStateType.Seated,
+                    Enum.HumanoidStateType.StrafingNoPhysics, Enum.HumanoidStateType.Swimming}) do
+                    pcall(function() hum:SetStateEnabled(st, true) end)
+                end
+                pcall(function() hum:ChangeState(Enum.HumanoidStateType.RunningNoPhysics) end)
+            end
+        else
+            nowe = true
+
+            for i = 1, speeds do
+                task.spawn(function()
+                    local hb = RunService.Heartbeat
+                    tpwalking = true
+                    local chr = speaker.Character
+                    local hum = chr and chr:FindFirstChildWhichIsA("Humanoid")
+                    while tpwalking and hb:Wait() and chr and hum and hum.Parent do
+                        if hum.MoveDirection.Magnitude > 0 then
+                            chr:TranslateBy(hum.MoveDirection)
+                        end
+                    end
+                end)
+            end
+
+            if speaker.Character and speaker.Character:FindFirstChild("Animate") then
+                speaker.Character.Animate.Disabled = true
+            end
+            local Char = speaker.Character
+            local Hum = Char and (Char:FindFirstChildOfClass("Humanoid") or Char:FindFirstChildOfClass("AnimationController"))
+            if Hum then
+                for _, v in next, Hum:GetPlayingAnimationTracks() do v:AdjustSpeed(0) end
+            end
+
+            local hum = Char and Char:FindFirstChildOfClass("Humanoid")
+            if hum then
+                for _, st in ipairs({Enum.HumanoidStateType.Climbing,
+                    Enum.HumanoidStateType.FallingDown, Enum.HumanoidStateType.Flying,
+                    Enum.HumanoidStateType.Freefall, Enum.HumanoidStateType.GettingUp,
+                    Enum.HumanoidStateType.Jumping, Enum.HumanoidStateType.Landed,
+                    Enum.HumanoidStateType.Physics, Enum.HumanoidStateType.PlatformStanding,
+                    Enum.HumanoidStateType.Ragdoll, Enum.HumanoidStateType.Running,
+                    Enum.HumanoidStateType.RunningNoPhysics, Enum.HumanoidStateType.Seated,
+                    Enum.HumanoidStateType.StrafingNoPhysics, Enum.HumanoidStateType.Swimming}) do
+                    pcall(function() hum:SetStateEnabled(st, false) end)
+                end
+                pcall(function() hum:ChangeState(Enum.HumanoidStateType.Swimming) end)
+            end
+        end
+
+        local rigType = Enum.HumanoidRigType.R15
+        if speaker.Character then
+            local h = speaker.Character:FindFirstChildOfClass("Humanoid")
+            if h then rigType = h.RigType end
+        end
+
+        local BodyPart
+        if rigType == Enum.HumanoidRigType.R6 then
+            BodyPart = speaker.Character and speaker.Character:FindFirstChild("Torso")
+        else
+            BodyPart = speaker.Character and speaker.Character:FindFirstChild("UpperTorso")
+        end
+        if not BodyPart then return end
+
+        local bg = Instance.new("BodyGyro", BodyPart)
+        bg.P = 9e4
+        bg.maxTorque = Vector3.new(9e9, 9e9, 9e9)
+        bg.cframe = BodyPart.CFrame
+        local bv = Instance.new("BodyVelocity", BodyPart)
+        bv.velocity = Vector3.new(0, 0.1, 0)
+        bv.maxForce = Vector3.new(9e9, 9e9, 9e9)
+        local hum = speaker.Character:FindFirstChildOfClass("Humanoid")
+        if nowe == true and hum then hum.PlatformStand = true end
+
+        local ctrl = {f=0,b=0,l=0,r=0}
+        local lastctrl = {f=0,b=0,l=0,r=0}
+        local maxspeed = 50
+        local speedVal = 0
+
+        local heartbeat = RunService.Heartbeat
+        while nowe == true do
+            heartbeat:Wait()
+            local cam = workspace.CurrentCamera
+            if not cam then break end
+
+            if ctrl.l + ctrl.r ~= 0 or ctrl.f + ctrl.b ~= 0 then
+                speedVal = speedVal + 0.5 + (speedVal / maxspeed)
+                if speedVal > maxspeed then speedVal = maxspeed end
+            elseif speedVal ~= 0 then
+                speedVal = speedVal - 1
+                if speedVal < 0 then speedVal = 0 end
+            end
+
+            if (ctrl.l + ctrl.r) ~= 0 or (ctrl.f + ctrl.b) ~= 0 then
+                bv.velocity = ((cam.CoordinateFrame.lookVector * (ctrl.f+ctrl.b)) + ((cam.CoordinateFrame * CFrame.new(ctrl.l+ctrl.r,(ctrl.f+ctrl.b)*0.2,0).p) - cam.CoordinateFrame.p)) * speedVal
+                lastctrl = {f=ctrl.f, b=ctrl.b, l=ctrl.l, r=ctrl.r}
+            elseif (ctrl.l + ctrl.r) == 0 and (ctrl.f + ctrl.b) == 0 and speedVal ~= 0 then
+                bv.velocity = ((cam.CoordinateFrame.lookVector * (lastctrl.f+lastctrl.b)) + ((cam.CoordinateFrame * CFrame.new(lastctrl.l+lastctrl.r,(lastctrl.f+lastctrl.b)*0.2,0).p) - cam.CoordinateFrame.p)) * speedVal
+            else
+                bv.velocity = Vector3.new(0,0,0)
+            end
+
+            bg.cframe = cam.CoordinateFrame * CFrame.Angles(-math.rad((ctrl.f+ctrl.b)*50*speedVal/maxspeed), 0, 0)
+        end
+
+        bg:Destroy()
+        bv:Destroy()
+        if hum then hum.PlatformStand = false end
+        if speaker.Character and speaker.Character:FindFirstChild("Animate") then
+            speaker.Character.Animate.Disabled = false
+        end
+        tpwalking = false
+    end)
+
+    UIS.InputBegan:Connect(function(input, gpe)
+        if gpe then return end
+        if not nowe then return end
+        if input.KeyCode == Enum.KeyCode.W then ctrl.f = 1 end
+        if input.KeyCode == Enum.KeyCode.S then ctrl.b = -1 end
+        if input.KeyCode == Enum.KeyCode.A then ctrl.l = -1 end
+        if input.KeyCode == Enum.KeyCode.D then ctrl.r = 1 end
+    end)
+
+    local tis
+    up.MouseButton1Down:Connect(function()
+        tis = up.MouseEnter:Connect(function()
+            while tis do
+                task.wait()
+                local ch = speaker.Character
+                local hrp = ch and ch:FindFirstChild("HumanoidRootPart")
+                if hrp then hrp.CFrame = hrp.CFrame * CFrame.new(0,1,0) end
+            end
+        end)
+    end)
+    up.MouseLeave:Connect(function()
+        if tis then tis:Disconnect(); tis = nil end
+    end)
+
+    local dis
+    down.MouseButton1Down:Connect(function()
+        dis = down.MouseEnter:Connect(function()
+            while dis do
+                task.wait()
+                local ch = speaker.Character
+                local hrp = ch and ch:FindFirstChild("HumanoidRootPart")
+                if hrp then hrp.CFrame = hrp.CFrame * CFrame.new(0,-1,0) end
+            end
+        end)
+    end)
+    down.MouseLeave:Connect(function()
+        if dis then dis:Disconnect(); dis = nil end
+    end)
+
+    speaker.CharacterAdded:Connect(function(char)
+        task.wait(0.7)
+        local h = char:FindFirstChildOfClass("Humanoid")
+        if h then h.PlatformStand = false end
+        if char:FindFirstChild("Animate") then char.Animate.Disabled = false end
+    end)
+
+    plus.MouseButton1Down:Connect(function()
+        speeds = speeds + 1
+        speed.Text = speeds
+        if nowe == true then
+            tpwalking = false
+            for i = 1, speeds do
+                task.spawn(function()
+                    local hb = RunService.Heartbeat
+                    tpwalking = true
+                    local chr = speaker.Character
+                    local hum = chr and chr:FindFirstChildWhichIsA("Humanoid")
+                    while tpwalking and hb:Wait() and chr and hum and hum.Parent do
+                        if hum.MoveDirection.Magnitude > 0 then
+                            chr:TranslateBy(hum.MoveDirection)
+                        end
+                    end
+                end)
+            end
         end
     end)
+
+    mine.MouseButton1Down:Connect(function()
+        if speeds == 1 then
+            speed.Text = 'min 1'
+            task.wait(1)
+            speed.Text = speeds
+        else
+            speeds = speeds - 1
+            speed.Text = speeds
+            if nowe == true then
+                tpwalking = false
+                for i = 1, speeds do
+                    task.spawn(function()
+                        local hb = RunService.Heartbeat
+                        tpwalking = true
+                        local chr = speaker.Character
+                        local hum = chr and chr:FindFirstChildWhichIsA("Humanoid")
+                        while tpwalking and hb:Wait() and chr and hum and hum.Parent do
+                            if hum.MoveDirection.Magnitude > 0 then
+                                chr:TranslateBy(hum.MoveDirection)
+                            end
+                        end
+                    end)
+                end
+            end
+        end
+    end)
+
+    closebutton.MouseButton1Click:Connect(function()
+        main:Destroy()
+    end)
+
+    mini.MouseButton1Click:Connect(function()
+        up.Visible = false; down.Visible = false; onof.Visible = false
+        plus.Visible = false; speed.Visible = false; mine.Visible = false
+        mini.Visible = false; mini2.Visible = true
+        Frame.BackgroundTransparency = 1
+        closebutton.Position = UDim2.new(0, 0, -1, 57)
+    end)
+
+    mini2.MouseButton1Click:Connect(function()
+        up.Visible = true; down.Visible = true; onof.Visible = true
+        plus.Visible = true; speed.Visible = true; mine.Visible = true
+        mini.Visible = true; mini2.Visible = false
+        Frame.BackgroundTransparency = 0
+        closebutton.Position = UDim2.new(0, 0, -1, 27)
+    end)
+end
+
+-- ============================================================
+-- TOOLS PAGE UI
+-- ============================================================
+local ToolsHeading = label("EXTERNAL TOOLS", 12, UDim2.fromOffset(10,14),
+    UDim2.new(1,-20,0,22), ToolsPage)
+ToolsHeading.Font = Enum.Font.GothamBold
+ToolsHeading.TextColor3 = ACCENT
+
+local ToolsHint = label("All tools below are hardcoded — no loadstrings, no external URLs.",
+    11, UDim2.fromOffset(10,40), UDim2.new(1,-20,0,34), ToolsPage)
+ToolsHint.TextWrapped = true
+ToolsHint.TextColor3 = MUTED
+
+local function makeToolButton(text, order, color, callback)
+    local b = make("TextButton", {Text=text, Font=Enum.Font.GothamBold, TextSize=13,
+        TextColor3=WHITE, BackgroundColor3=color, LayoutOrder=order,
+        AutoButtonColor=false, Size=UDim2.new(1,0,0,44)}, ToolsPage)
+    round(b, 8)
+    b.MouseEnter:Connect(function() b.BackgroundColor3 = color:Lerp(Color3.new(1,1,1), 0.15) end)
+    b.MouseLeave:Connect(function() b.BackgroundColor3 = color end)
+    b.MouseButton1Click:Connect(function()
+        local ok, err = pcall(callback, b, color)
+        if not ok then
+            b.Text = "Error"
+            b.BackgroundColor3 = RED
+            setStatus("Tool error", RED, tostring(err):sub(1,80))
+        end
+    end)
+    return b
+end
+
+makeToolButton("Open Fly GUI", 10, Color3.fromRGB(70,90,160), function()
+    loadFlyGui()
+    setStatus("Fly GUI opened", GREEN, "Press 'fly' in the fly panel")
 end)
 
+makeToolButton("Fling All Players", 11, Color3.fromRGB(160,70,70), function()
+    task.spawn(flingAll)
+    setStatus("Fling All running...", AMBER, "Attacking every player")
+end)
+
+makeToolButton("Apply FPS Boost", 12, Color3.fromRGB(160,120,60), function()
+    if fpsActive then
+        setStatus("FPS Boost already on", MUTED); return
+    end
+    applyFPSBoost()
+    fpsActive = true
+    setStatus("FPS Boost applied", GREEN, "Particles, shadows, post-FX disabled")
+end)
+
+make("UIListLayout", {SortOrder=Enum.SortOrder.LayoutOrder, Padding=UDim.new(0,8)}, ToolsPage)
+
+-- ============================================================
+-- TAB CONTROLLER
+-- ============================================================
+local tabButtons = {}
+local currentTab = "Players"
+local function showTab(name)
+    currentTab = name
+    PlayerPage.Visible = name == "Players"
+    RingPage.Visible   = name == "Ring"
+    ToolsPage.Visible  = name == "Tools"
+    for n, btn in pairs(tabButtons) do
+        btn.BackgroundColor3 = (name == n) and ACCENTD or ROW
+        btn.TextColor3 = (name == n) and WHITE or MUTED
+    end
+end
+for _, tab in ipairs({"Players", "Ring", "Tools"}) do
+    local btn = make("TextButton", {Name="Tab"..tab, Text=tab, TextSize=13,
+        Font=Enum.Font.GothamBold, TextColor3=WHITE, BackgroundColor3=ROW,
+        AutoButtonColor=true}, Navigation)
+    round(btn, 8)
+    btn.MouseButton1Click:Connect(function() showTab(tab) end)
+    tabButtons[tab] = btn
+end
+
+-- ============================================================
+-- LAYOUT
+-- ============================================================
+local function place(obj, x, y, w, h)
+    obj.Position = UDim2.fromOffset(x, y)
+    obj.Size = UDim2.fromOffset(w, h)
+end
+
+local function reflow(panelWidth, panelHeight)
+    local innerWidth = panelWidth - 44
+    local innerHeight = math.max(1, PageHost.Size.Y.Offset)
+    local gap = 10
+    local navWidth = panelWidth - 24
+    local tabCount = 3
+    local tabW = math.floor((navWidth - (tabCount-1) * gap) / tabCount)
+    for i, name in ipairs({"Players", "Ring", "Tools"}) do
+        local x = (i - 1) * (tabW + gap)
+        local ww = (i == tabCount) and (navWidth - x) or tabW
+        place(tabButtons[name], x, 0, ww, 42)
+        tabButtons[name].TextSize = 12
+    end
+
+    place(sectionPlayers, 10, 10, innerWidth, 16)
+    place(Search, 10, 32, innerWidth, 40)
+    place(Count, 10, 78, innerWidth, 16)
+    local listY = 100
+    local listH = math.max(80, innerHeight - listY - 10)
+    place(List, 10, listY, innerWidth, listH)
+    List.CanvasSize = UDim2.fromOffset(0, math.ceil(ListLayout.AbsoluteContentSize.Y) + 22)
+
+    local ringY = 14
+    place(RingHeading, 10, ringY, innerWidth, 22); ringY = ringY + 26
+    place(RingHint, 10, ringY, innerWidth, 52); ringY = ringY + 60
+    place(RingToggle, 10, ringY, innerWidth, 46); ringY = ringY + 58
+    for _, row in ipairs(ringRows) do
+        place(row.label, 10, ringY, innerWidth, 16)
+        place(row.dec, 10, ringY + 22, 42, 34)
+        place(row.box, 60, ringY + 22, innerWidth - 100, 34)
+        place(row.inc, 10 + innerWidth - 42, ringY + 22, 42, 34)
+        ringY = ringY + 62
+    end
+    place(RingNote, 10, ringY, innerWidth, 44)
+    RingPage.CanvasSize = UDim2.fromOffset(0, ringY + 60)
+
+    place(ToolsHeading, 10, 14, innerWidth, 22)
+    place(ToolsHint, 10, 40, innerWidth, 34)
+    ToolsPage.CanvasSize = UDim2.fromOffset(0, 400)
+end
+
+-- ============================================================
+-- WINDOW
+-- ============================================================
+local minimized = false
+local updateWindow
 updateWindow = function()
     local cam = workspace.CurrentCamera
     local vp = cam and cam.ViewportSize or Vector2.new(1024, 768)
     local insetY = 0
-    pcall(function()
-        insetY = game:GetService("GuiService"):GetGuiInset().Y
-    end)
+    pcall(function() insetY = game:GetService("GuiService"):GetGuiInset().Y end)
     local touch = UIS.TouchEnabled
-    local isLandscape = vp.X > vp.Y
-    local hudTop, hudBottom
-    if not touch then
-        hudTop = math.max(insetY + 4, 8); hudBottom = 6
-    elseif isLandscape then
-        hudTop = 2; hudBottom = 2
-    else
-        hudTop = math.max(insetY + 4, math.floor(vp.Y * 0.06))
-        hudBottom = math.max(40, math.floor(vp.Y * 0.08))
-    end
-    if vp.Y - hudTop - hudBottom < 200 then
-        hudTop = math.max(insetY + 2, 2); hudBottom = 2
-    end
-    local maxWidth  = maximized and 720 or PANEL_W
-    local maxHeight = maximized and 1400 or PANEL_H
-    local usableH = math.max(180, vp.Y - hudTop - hudBottom)
-    local h = minimized and 44 or math.min(maxHeight, usableH)
-    local aspectCap
-    if maximized then aspectCap = 1.6
-    elseif touch and isLandscape then aspectCap = 2.4
-    else aspectCap = 0.9 end
-    local aspectWidth = math.floor(h * aspectCap)
-    local viewportWidth = math.max(250, vp.X - 16)
-    local w = math.min(maxWidth, aspectWidth, viewportWidth)
-    w = math.max(300, w)
+    local hudTop = math.max(insetY + 4, 8)
+    local usableH = math.max(180, vp.Y - hudTop - 12)
+    local h = minimized and 44 or math.min(PANEL_H, usableH)
+    local w = math.min(PANEL_W, math.max(300, vp.X - 16))
     local compact = h < 480
-    local headerH = compact and 36 or 60
-    local tabsH   = compact and 34 or 42
-    local footerH = compact and 72 or 118
-    local navY    = compact and 3 or 6
-    local hostY   = navY + tabsH + 6
-    local contentH = h - headerH
+    local headerH = compact and 36 or 56
     Main.Position = UDim2.new(0.5, 0, 0, hudTop)
     Main.Size = UDim2.fromOffset(w, h)
-    Scale.Scale = 1
     Header.Size = UDim2.new(1, 0, 0, headerH)
     Title.Position = UDim2.fromOffset(14, compact and 6 or 10)
     Title.TextSize = compact and 13 or 15
@@ -1298,1607 +1051,199 @@ updateWindow = function()
     Content.Position = UDim2.fromOffset(0, headerH)
     Content.Size     = UDim2.new(1, 0, 1, -headerH)
     Content.Visible  = not minimized
-    if minimized then InspectOverlay.Visible = false end
     MinButton.Text = minimized and "+" or "−"
-    MaxButton.Text = maximized and "❐" or "▢"
-    Navigation.Position = UDim2.fromOffset(12, navY)
+    local tabsH   = compact and 34 or 42
+    local footerH = compact and 72 or 118
+    Navigation.Position = UDim2.fromOffset(12, compact and 3 or 6)
     Navigation.Size     = UDim2.new(1, -24, 0, tabsH)
-    PageHost.Position   = UDim2.fromOffset(12, hostY)
+    PageHost.Position   = UDim2.fromOffset(12, (compact and 3 or 6) + tabsH + 6)
     PageHost.Size       = UDim2.new(1, -24, 0,
-        math.max(34, contentH - hostY - footerH - 6))
+        math.max(34, (h - headerH) - ((compact and 3 or 6) + tabsH + 6) - footerH - 6))
     Footer.Position     = UDim2.new(0, 12, 1, -(footerH + 4))
     Footer.Size         = UDim2.new(1, -24, 0, footerH)
-    InspectOverlay.Position = UDim2.fromOffset(10, headerH + 6)
-    InspectOverlay.Size     = UDim2.new(1, -20, 1, -(headerH + 16))
-    FlingFunctions.reflowContents(w, h)
-    if compact then
-        for _, b in pairs(tabButtons) do b.TextSize = 10 end
-        for _, b in pairs(tabButtons) do
-            b.Size = UDim2.fromOffset(b.Size.X.Offset, tabsH)
-        end
-    end
-    FlingFunctions.showTab(currentTab)
+    reflow(w, h)
+    showTab(currentTab)
 end
-FlingFunctions.showTab("Players")
 MinButton.MouseButton1Click:Connect(function() minimized = not minimized; updateWindow() end)
-MaxButton.MouseButton1Click:Connect(function() maximized = not maximized; minimized = false; updateWindow() end)
-end
+MaxButton.MouseButton1Click:Connect(function() updateWindow() end)
 
-function FlingFunctions.loadAvatar(player, image, size)
-    image:SetAttribute("AvatarUserId", player.UserId)
-    image.Image = ""
-    task.spawn(function()
-        local ok, url = pcall(function()
-            return Players:GetUserThumbnailAsync(player.UserId, Enum.ThumbnailType.HeadShot, size)
-        end)
-        if ok and image.Parent and image:GetAttribute("AvatarUserId") == player.UserId then
-            image.Image = url
-        end
-    end)
-end
-
--- DAMAGE GUARD
-function FlingFunctions.isGuardActive() return true end
-function FlingFunctions.startDamageGuard()
-    local ch = Me.Character
-    local hum = ch and ch:FindFirstChildOfClass("Humanoid")
-    if not ch or not hum then return end
-    pcall(function()
-        if guardFF and guardFF.Parent then guardFF:Destroy() end
-        guardFF = Instance.new("ForceField")
-        guardFF.Name = "FlingDamageGuard_FF"
-        guardFF.Visible = false
-        guardFF.Parent = ch
-    end)
-    if not guardVelConn then
-        guardVelConn = RunService.Stepped:Connect(function()
-            local c2 = Me.Character
-            local root = c2 and c2:FindFirstChild("HumanoidRootPart")
-            local h2 = c2 and c2:FindFirstChildOfClass("Humanoid")
-            if not root or not h2 or h2.Health <= 0 then
-                if guardAnchoredSelf and root and root.Parent then
-                    pcall(function() root.Anchored = false end)
-                    guardAnchoredSelf = false
-                end
-                return
-            end
-            if returning or selfFlinging then return end
-            pcall(function()
-                local v = root.AssemblyLinearVelocity
-                if v.Magnitude > CONFIG.GuardVelCap then
-                    local capped = v.Unit * CONFIG.GuardVelCap
-                    root.AssemblyLinearVelocity  = capped
-                    root.AssemblyAngularVelocity = Vector3.zero
-                    root.Velocity    = capped
-                    root.RotVelocity = Vector3.zero
-                end
-            end)
-            pcall(function()
-                h2.PlatformStand = false
-                local st = h2:GetState()
-                if st == Enum.HumanoidStateType.Ragdoll
-                   or st == Enum.HumanoidStateType.Physics
-                   or st == Enum.HumanoidStateType.FallingDown
-                   or st == Enum.HumanoidStateType.PlatformStanding then
-                    h2:ChangeState(Enum.HumanoidStateType.Running)
-                end
-            end)
-        end)
-    end
-    if guardHealthConn then pcall(function() guardHealthConn:Disconnect() end) end
-    guardHealthConn = hum.HealthChanged:Connect(function(newH)
-        if not FlingFunctions.isGuardActive() then return end
-        local c2 = Me.Character
-        local h2 = c2 and c2:FindFirstChildOfClass("Humanoid")
-        if h2 and h2.Parent and newH < h2.MaxHealth then
-            pcall(function()
-                h2.Health = h2.MaxHealth
-                if h2.Health <= 0 then
-                    h2.Health = h2.MaxHealth
-                    h2:ChangeState(Enum.HumanoidStateType.Running)
-                end
-            end)
-        end
-    end)
-end
-function FlingFunctions.stopDamageGuard()
-    if guardVelConn then guardVelConn:Disconnect(); guardVelConn = nil end
-    if guardHealthConn then guardHealthConn:Disconnect(); guardHealthConn = nil end
-    pcall(function()
-        if guardFF and guardFF.Parent then guardFF:Destroy() end
-        guardFF = nil
-    end)
-    if guardAnchoredSelf then
-        local ch = Me.Character
-        local root = ch and ch:FindFirstChild("HumanoidRootPart")
-        if root and root.Parent then pcall(function() root.Anchored = false end) end
-        guardAnchoredSelf = false
-    end
-end
-
--- SAFE RETURN
-function FlingFunctions.zeroCharacterMotion(ch)
-    if not ch then return end
-    for _, part in ipairs(ch:GetDescendants()) do
-        if part:IsA("BasePart") then
-            pcall(function()
-                part.AssemblyLinearVelocity = Vector3.zero
-                part.AssemblyAngularVelocity = Vector3.zero
-                part.Velocity = Vector3.zero
-                part.RotVelocity = Vector3.zero
-            end)
-        end
-    end
-end
-function FlingFunctions.captureReturn(ch, root, hum)
-    if returnSnapshot and returnSnapshot.character == ch
-        and os.clock() - returnSnapshot.time < 180 then return end
-    local pivot = ch:GetPivot()
-    if lastGrounded and lastGrounded.character == ch
-        and os.clock() - lastGrounded.time <= 20 then
-        pivot = lastGrounded.pivot
-    end
-    local seated = true
-    pcall(function() seated = hum:GetStateEnabled(Enum.HumanoidStateType.Seated) end)
-    returnSnapshot = {character=ch, root=root, humanoid=hum, pivot=pivot,
-        rootAnchored=root.Anchored, seatedEnabled=seated, time=os.clock()}
-    lastSafeReturn = returnSnapshot
-end
-function FlingFunctions.recoveryCheckpoint()
-    local ch = Me.Character
-    if not ch then return nil end
-    local root = ch:FindFirstChild("HumanoidRootPart")
-    local hum = ch:FindFirstChildOfClass("Humanoid")
-    if not (root and hum and root.Parent and hum.Health > 0) then return nil end
-    if returnSnapshot and returnSnapshot.character == ch then return returnSnapshot end
-    if lastSafeReturn and lastSafeReturn.character == ch
-        and os.clock() - lastSafeReturn.time <= 45 then return lastSafeReturn end
-    if lastGrounded and lastGrounded.character == ch
-        and os.clock() - lastGrounded.time <= 45 then
-        local seated = true
-        pcall(function() seated = hum:GetStateEnabled(Enum.HumanoidStateType.Seated) end)
-        return {character=ch, root=root, humanoid=hum, pivot=lastGrounded.pivot,
-            rootAnchored=false, seatedEnabled=seated, time=lastGrounded.time}
-    end
-    return nil
-end
-function FlingFunctions.clearOurBodyForce(root)
-    if root and root.Parent then
-        local f = root:FindFirstChild("PlayerOrbitTemporaryForce")
-        if f and f:IsA("BodyVelocity") then f:Destroy() end
-    end
-end
-function FlingFunctions.isBadLandingHit(result)
-    if not result or result.Normal.Y < CONFIG.LandingMaxSlope then return true end
-    if result.Material == Enum.Material.Water or result.Material == Enum.Material.CrackedLava then return true end
-    local part = result.Instance
-    if not part then return true end
-    local nm = part.Name:lower() .. " " .. (part.Parent and part.Parent.Name:lower() or "")
-    for _, w in ipairs({"lava","kill","damage","hazard","acid","void","nuke"}) do
-        if nm:find(w, 1, true) then return true end
-    end
-    if part:GetAttribute("Hazard") == true or part:GetAttribute("Kill") == true
-        or CollectionService:HasTag(part, "Hazard")
-        or CollectionService:HasTag(part, "KillBrick") then return true end
-    return false
-end
-local LANDING_OFFSETS = {
-    Vector3.new(0,0,0), Vector3.new(3,0,0), Vector3.new(-3,0,0),
-    Vector3.new(0,0,3), Vector3.new(0,0,-3), Vector3.new(6,0,0),
-    Vector3.new(-6,0,0), Vector3.new(0,0,6), Vector3.new(0,0,-6),
-    Vector3.new(6,0,6), Vector3.new(-6,0,6), Vector3.new(6,0,-6),
-    Vector3.new(-6,0,-6), Vector3.new(9,0,0), Vector3.new(-9,0,0),
-}
-function FlingFunctions.findSafeLanding(saved)
-    local ch, root, hum = saved.character, saved.root, saved.humanoid
-    local base = saved.pivot.Position
-    local rp = RaycastParams.new()
-    rp.FilterType = Enum.RaycastFilterType.Exclude
-    rp.FilterDescendantsInstances = {ch}
-    rp.IgnoreWater = true
-    rp.RespectCanCollide = true
-    local op = OverlapParams.new()
-    op.FilterType = Enum.RaycastFilterType.Exclude
-    op.FilterDescendantsInstances = {ch}
-    op.RespectCanCollide = true
-    op.MaxParts = 64
-    local look = saved.pivot.LookVector
-    local flatLook = Vector3.new(look.X, 0, look.Z)
-    if flatLook.Magnitude < 0.01 then flatLook = Vector3.new(0,0,-1) end
-    flatLook = flatLook.Unit
-    local clr = math.max(3.5, hum.HipHeight + root.Size.Y * 0.5 + CONFIG.LandingClearance)
-    for _, off in ipairs(LANDING_OFFSETS) do
-        if off.Magnitude <= CONFIG.LandingRadius then
-            local spot = base + off
-            local res = workspace:Raycast(spot + Vector3.new(0,9,0), Vector3.new(0,-85,0), rp)
-            if res and not FlingFunctions.isBadLandingHit(res)
-                and res.Position.Y <= base.Y + 2.5
-                and res.Position.Y >= base.Y - 23 then
-                local p = Vector3.new(spot.X, res.Position.Y + clr, spot.Z)
-                local sz = Vector3.new(3.2, 4, 3.2)
-                local obs = workspace:GetPartBoundsInBox(CFrame.new(p + Vector3.new(0,0.4,0)), sz, op)
-                local blocked = false
-                for _, part in ipairs(obs) do
-                    if part:IsA("BasePart") and part.CanCollide then blocked = true; break end
-                end
-                if not blocked then return CFrame.lookAt(p, p + flatLook) end
-            end
-        end
-    end
-    return nil
-end
-function FlingFunctions.restoreNoclipForLanding(ch)
-    if not noclipActive then return end
-    noclipActive = false
-    for p, orig in pairs(noclipOriginalCollision) do
-        if p and p.Parent and p:IsDescendantOf(ch) then
-            pcall(function() p.CanCollide = orig end)
-        end
-    end
-    table.clear(noclipOriginalCollision)
-    NoclipButton.Text = "Noclip: OFF"
-    NoclipButton.BackgroundColor3 = ROW
-end
-function FlingFunctions.safeReturn(quick)
-    if returning or selfFlinging then return false end
-    local saved = FlingFunctions.recoveryCheckpoint()
-    if not saved then return false end
-    local ch, root, hum = saved.character, saved.root, saved.humanoid
-    if Me.Character ~= ch or not ch.Parent or not root.Parent
-        or not hum.Parent or hum.Health <= 0 then return false end
-    local landing = FlingFunctions.findSafeLanding(saved)
-    if not landing then
-        landing = saved.pivot + Vector3.new(0, 1, 0)
-    end
-    returning = true
-    local success = false
-    local origAnchor = saved.rootAnchored
-    local ok, err = xpcall(function()
-        FlingFunctions.restoreNoclipForLanding(ch)
-        FlingFunctions.clearOurBodyForce(root)
-        root.Anchored = true
-        FlingFunctions.zeroCharacterMotion(ch)
-        hum.Sit = false
-        hum.PlatformStand = false
-        ch:PivotTo(landing)
-        local holdF = quick and 2 or 4
-        local settleF = quick and 4 or CONFIG.LandingSettleFrames
-        for _ = 1, holdF do
-            if Me.Character ~= ch or not ch.Parent or hum.Health <= 0 then return end
-            FlingFunctions.zeroCharacterMotion(ch)
-            RunService.Heartbeat:Wait()
-        end
-        root.Anchored = origAnchor
-        if not origAnchor then
-            pcall(function() hum:ChangeState(Enum.HumanoidStateType.GettingUp) end)
-        end
-        local stable = 0
-        for _ = 1, settleF do
-            if Me.Character ~= ch or not root.Parent or hum.Health <= 0 then break end
-            local drift = (root.Position - landing.Position).Magnitude
-            local vy = root.AssemblyLinearVelocity.Y
-            if drift <= 6 and vy > -22 then stable = stable + 1
-            else
-                root.Anchored = true
-                FlingFunctions.zeroCharacterMotion(ch)
-                ch:PivotTo(landing)
-                RunService.Heartbeat:Wait()
-                root.Anchored = origAnchor
-                stable = 0
-            end
-            RunService.Heartbeat:Wait()
-        end
-        success = stable >= math.ceil(settleF / 2) and hum.Health > 0
-    end, function(e) return tostring(e) end)
-    if not ok then warn("[SafeReturn] " .. tostring(err)) end
-    pcall(function()
-        if root and root.Parent then
-            root.Anchored = origAnchor
-            FlingFunctions.clearOurBodyForce(root)
-        end
-        if hum and hum.Parent then
-            hum:SetStateEnabled(Enum.HumanoidStateType.Seated, saved.seatedEnabled)
-            hum.PlatformStand = false
-            if hum.Health > 0 and not origAnchor then
-                hum:ChangeState(Enum.HumanoidStateType.GettingUp)
-            end
-        end
-        local cam = workspace.CurrentCamera
-        if cam and Me.Character == ch and hum.Parent then cam.CameraSubject = hum end
-    end)
-    returning = false
-    return success
-end
-
-table.insert(connections, RunService.Heartbeat:Connect(function()
-    if FlingActive or selfFlinging or returning then return end
-    local ch = Me.Character
-    local hum = ch and ch:FindFirstChildOfClass("Humanoid")
-    local root = ch and (ch:FindFirstChild("HumanoidRootPart") or (hum and hum.RootPart))
-    if not (hum and root) or hum.Health <= 0 then return end
-    if hum.FloorMaterial == Enum.Material.Air or hum.Sit then return end
-    if root.AssemblyLinearVelocity.Magnitude > 30 or root.Anchored then return end
-    lastGrounded = {character=ch, pivot=ch:GetPivot(), time=os.clock()}
-end))
-
--- AIMBOT
-function FlingFunctions.isAimHeld() return UIS:IsMouseButtonPressed(Enum.UserInputType.MouseButton2) end
-function FlingFunctions.findNearestInFOV()
-    local cam = workspace.CurrentCamera
-    if not cam then return nil, nil end
-    local vp = cam.ViewportSize
-    local center = Vector2.new(vp.X*0.5, vp.Y*0.5)
-    local best, bd = nil, CONFIG.AimFOV
-    for _, p in ipairs(Players:GetPlayers()) do
-        if p ~= Me then
-            local tc = p.Character
-            if tc and tc.Parent then
-                local hum = tc:FindFirstChildOfClass("Humanoid")
-                local hrp = hum and hum.RootPart
-                if hrp and hum.Health > 0 then
-                    local sp, on = cam:WorldToViewportPoint(hrp.Position)
-                    if on then
-                        local d = (Vector2.new(sp.X, sp.Y) - center).Magnitude
-                        if d < bd then bd = d; best = hrp end
-                    end
-                end
-            end
-        end
-    end
-    return best, bd
-end
-function FlingFunctions.aimTick()
-    if not aimActive or not FlingFunctions.isAimHeld() then currentCameraAimTarget = nil return end
-    local cam = workspace.CurrentCamera
-    if not cam then return end
-    local target = FlingFunctions.findNearestInFOV()
-    currentCameraAimTarget = target
-    if not target then return end
-    local desired = CFrame.new(cam.CFrame.Position, target.Position)
-    if CONFIG.AimSmooth <= 1 then cam.CFrame = desired
-    else cam.CFrame = cam.CFrame:Lerp(desired, 1 / CONFIG.AimSmooth) end
-end
-table.insert(connections, RunService.RenderStepped:Connect(FlingFunctions.aimTick))
-local FovCircle = FlingFunctions.make("Frame", {AnchorPoint=Vector2.new(0.5,0.5),
-    Position=UDim2.new(0.5,0,0.5,0), Size=UDim2.fromOffset(4,4),
-    BackgroundColor3=Color3.fromRGB(0,255,100), BorderSizePixel=0, Visible=false,
-    ZIndex=100}, Gui)
-FlingFunctions.round(FovCircle, 999)
-function FlingFunctions.setAimbot(state)
-    aimActive = state
-    AimbotButton.Text = "Aimbot: " .. (state and "ON" or "OFF")
-    AimbotButton.BackgroundColor3 = state and GREEN or ROW
-    FovCircle.Visible = state
-    if state then FlingFunctions.setStatus("Aimbot ON", GREEN, "Hold RIGHT MOUSE")
-    else FlingFunctions.setStatus("Aimbot OFF", MUTED); currentCameraAimTarget = nil end
-end
-
--- HELPERS
-function FlingFunctions.getTargetHRP(player)
-    local tc = player and player.Character
-    if not tc then return nil, nil, nil end
-    local tHum = tc:FindFirstChildOfClass("Humanoid")
-    return tc, tHum, tHum and tHum.RootPart
-end
-
-function FlingFunctions.getHitLockPosition(aimPart)
-    if not aimPart or not aimPart.Parent then return nil end
-    local isHRP = (aimPart.Name == "HumanoidRootPart")
-    local frac  = isHRP and CONFIG.AimUpFractionHRP or CONFIG.AimUpFraction
-    local localOffset = CFrame.new(0, aimPart.Size.Y * frac, 0)
-    local baseWorld = (aimPart.CFrame * localOffset).Position
-
-    if PREDICTION_TIME > 0 then
-        local data = PartTracker[aimPart]
-        if data then
-            local dt = math.clamp(
-                (os.clock() - (data.time or os.clock())) + PREDICTION_TIME,
-                0, CONFIG.PredictionMaxSeconds)
-            local v = data.vel or Vector3.zero
-            if v.Magnitude > CONFIG.PredictionMaxSpeed then
-                v = v.Unit * CONFIG.PredictionMaxSpeed
-            end
-            local displacement = v * dt
-            if displacement.Magnitude > CONFIG.PredictionMaxStuds then
-                displacement = displacement.Unit * CONFIG.PredictionMaxStuds
-            end
-            baseWorld = baseWorld + displacement
-        end
-    end
-    return baseWorld
-end
-
-function FlingFunctions.getAimWorldPosition(tCharacter, aimPart)
-    if not aimPart or not aimPart.Parent then return nil end
-    if PREDICTION_TIME <= 0 then
-        return aimPart.Position
-    end
-    return FlingFunctions.predictPart(aimPart, PREDICTION_TIME) or aimPart.Position
-end
-function FlingFunctions.findPlayerByName(name)
-    if not name or name == "" then return nil end
-    local ln = name:lower()
-    for _, p in ipairs(Players:GetPlayers()) do
-        if p ~= Me and (p.Name:lower() == ln
-            or p.Name:lower():sub(1,#ln) == ln
-            or p.DisplayName:lower():sub(1,#ln) == ln) then
-            return p
-        end
-    end
-    return nil
-end
-function FlingFunctions.getActiveTarget()
-    if currentTarget and currentTarget.Parent == Players and currentTarget.Character then
-        return currentTarget
-    end
-    for _, p in pairs(SelectedTargets) do
-        if p and p.Parent == Players then return p end
-    end
-    return nil
-end
-
--- SCANNERS
-function FlingFunctions.getOwnerString(inst)
-    if not inst or not inst.Parent then return "?" end
-    local s = "?"
-    pcall(function() local o = inst:GetNetworkOwner(); s = o and o.Name or "Server" end)
-    return s
-end
-function FlingFunctions.scanTargetRig(player)
-    local tc, tHum, tRoot = FlingFunctions.getTargetHRP(player)
-    if not tc then return "No character for " .. player.Name end
-    local lines = {"RIG SCAN · @" .. player.Name, "Character: " .. tc.Name}
-    if tHum then
-        local rt = "?" pcall(function() rt = tHum.RigType.Name end)
-        lines[#lines+1] = "RigType: " .. rt
-        lines[#lines+1] = "Health: " .. tostring(tHum.Health) .. " / " .. tostring(tHum.MaxHealth)
-        lines[#lines+1] = "State: " .. tostring(tHum:GetState())
-    end
-    if tRoot then
-        lines[#lines+1] = "HRP vel: " .. string.format("%.1f", tRoot.AssemblyLinearVelocity.Magnitude)
-        lines[#lines+1] = "HRP anchored: " .. tostring(tRoot.Anchored)
-        lines[#lines+1] = "HRP collidable: " .. tostring(tRoot.CanCollide)
-        lines[#lines+1] = "HRP queryable: " .. tostring(tRoot.CanQuery)
-        lines[#lines+1] = "HRP touchable: " .. tostring(tRoot.CanTouch)
-        lines[#lines+1] = "HRP own (client guess): " .. FlingFunctions.getOwnerString(tRoot)
-        lines[#lines+1] = "Note: local overlap is not server-confirmed motion."
-    end
-    return table.concat(lines, "\n")
-end
-function FlingFunctions.scanEnvironment(radius)
-    radius = radius or 30
-    local ch = Me.Character
-    local myRoot = ch and ch:FindFirstChild("HumanoidRootPart")
-    if not myRoot then return "No local character" end
-    local parts = workspace:GetPartBoundsInRadius(myRoot.Position, radius)
-    return "ENV SCAN r=" .. radius .. " parts=" .. #parts
-end
-function FlingFunctions.scanAll()
-    local target = FlingFunctions.getActiveTarget()
-    local lines = {}
-    if target then lines[#lines+1] = FlingFunctions.scanTargetRig(target)
-    else lines[#lines+1] = "No target selected" end
-    lines[#lines+1] = FlingFunctions.scanEnvironment(50)
-    return table.concat(lines, "\n")
-end
-
--- MANUAL COMMANDS
-function FlingFunctions.cmdGoto(player)
-    local ch = Me.Character
-    local hum = ch and ch:FindFirstChildOfClass("Humanoid")
-    local myRoot = hum and hum.RootPart
-    local _, _, tRoot = FlingFunctions.getTargetHRP(player)
-    if not (ch and myRoot and tRoot) then return false, "Missing parts" end
-    local target = tRoot.Position - tRoot.CFrame.LookVector * 3 + Vector3.new(0,3,0)
-    pcall(function()
-        ch:PivotTo(CFrame.new(target, tRoot.Position))
-        myRoot.AssemblyLinearVelocity = Vector3.zero
-        myRoot.AssemblyAngularVelocity = Vector3.zero
-    end)
-    return true, "TP'd to " .. player.Name
-end
-function FlingFunctions.cmdFreeze(player)
-    local _, _, tRoot = FlingFunctions.getTargetHRP(player)
-    if not tRoot then return false, "No HRP" end
-    if originalAnchored[player.Name] == nil then originalAnchored[player.Name] = tRoot.Anchored end
-    tRoot.Anchored = true
-    return true, "Froze " .. player.Name
-end
-function FlingFunctions.cmdUnfreeze(player)
-    local _, _, tRoot = FlingFunctions.getTargetHRP(player)
-    if not tRoot then return false, "No HRP" end
-    tRoot.Anchored = originalAnchored[player.Name] or false
-    originalAnchored[player.Name] = nil
-    local _, tHum = FlingFunctions.getTargetHRP(player)
-    if tHum then pcall(function()
-        tHum.WalkSpeed=16; tHum.JumpPower=50; tHum.JumpHeight=7.2; tHum.UseJumpPower=true
-    end) end
-    return true, "Unfroze " .. player.Name
-end
-function FlingFunctions.cmdAnchor(player)
-    local _, _, tRoot = FlingFunctions.getTargetHRP(player)
-    if not tRoot then return false, "No HRP" end
-    if not originalAnchored[player.Name] then originalAnchored[player.Name] = tRoot.Anchored end
-    tRoot.Anchored = true
-    return true, "Anchored " .. player.Name
-end
-function FlingFunctions.cmdUnanchor(player)
-    local _, _, tRoot = FlingFunctions.getTargetHRP(player)
-    if not tRoot then return false, "No HRP" end
-    tRoot.Anchored = originalAnchored[player.Name] or false
-    originalAnchored[player.Name] = nil
-    return true, "Unanchored " .. player.Name
-end
-function FlingFunctions.cmdBring(player)
-    local ch = Me.Character
-    local hum = ch and ch:FindFirstChildOfClass("Humanoid")
-    local myRoot = hum and hum.RootPart
-    local _, _, tRoot = FlingFunctions.getTargetHRP(player)
-    if not (ch and myRoot and tRoot) then return false, "Missing parts" end
-    local target = myRoot.Position + myRoot.CFrame.LookVector * 4 + Vector3.new(0,3,0)
-    pcall(function()
-        tRoot.CFrame = CFrame.new(target)
-        tRoot.AssemblyLinearVelocity = Vector3.zero
-        tRoot.AssemblyAngularVelocity = Vector3.zero
-    end)
-    return true, "Brought " .. player.Name
-end
-function FlingFunctions.cmdGrab(player) return FlingFunctions.cmdBring(player) end
-local CMD = {["goto"]=FlingFunctions.cmdGoto, freeze=FlingFunctions.cmdFreeze, unfreeze=FlingFunctions.cmdUnfreeze,
-    thaw=FlingFunctions.cmdUnfreeze, anchor=FlingFunctions.cmdAnchor, unanchor=FlingFunctions.cmdUnanchor,
-    bring=FlingFunctions.cmdBring, grab=FlingFunctions.cmdGrab}
-function FlingFunctions.runCmd(action, player)
-    if not player then FlingFunctions.setStatus("No target selected", AMBER); return false end
-    local fn = CMD[action]
-    if not fn then return false end
-    local ok, msg = fn(player)
-    if ok then FlingFunctions.setStatus(action .. "  ·  " .. player.Name, GREEN)
-    else FlingFunctions.setStatus(action .. " failed", RED, msg) end
-    return ok
-end
-
--- GRAB OBJECTS
-local mouse = Me:GetMouse()
-function FlingFunctions.releaseGrab()
-    if grabbedPart and grabbedPart.Parent then
-        pcall(function() grabbedPart.Anchored = grabbedAnchor or false end)
-    end
-    grabbedPart, grabbedAnchor = nil, nil
-end
-function FlingFunctions.tryGrabUnderMouse()
-    if not grabActive then return end
-    if grabbedPart then FlingFunctions.releaseGrab(); FlingFunctions.setStatus("Released grab", MUTED); return end
-    local target = mouse.Target
-    if not target or not target:IsA("BasePart") then FlingFunctions.setStatus("Nothing under cursor", AMBER); return end
-    local ch = Me.Character
-    if ch and target:IsDescendantOf(ch) then FlingFunctions.setStatus("Can't grab own", AMBER); return end
-    if target.Anchored then FlingFunctions.setStatus("Anchored", AMBER); return end
-    pcall(function() target:SetNetworkOwner(Me) end)
-    grabbedPart = target
-    grabbedAnchor = false
-    pcall(function() target.Anchored = true end)
-    FlingFunctions.setStatus("Grabbed: " .. target.Name, GREEN)
-end
-table.insert(connections, RunService.RenderStepped:Connect(function()
-    if not grabActive or not grabbedPart then return end
-    if not grabbedPart.Parent then grabbedPart = nil return end
-    local cam = workspace.CurrentCamera
-    if not cam then return end
-    local ray = cam:ScreenPointToRay(mouse.X, mouse.Y)
-    local tp = ray.Origin + ray.Direction * 15
-    pcall(function() grabbedPart.CFrame = CFrame.new(tp) end)
-end))
-table.insert(connections, UIS.InputBegan:Connect(function(input, gpe)
-    if gpe or not grabActive then return end
-    if input.UserInputType == Enum.UserInputType.MouseButton1
-    or input.UserInputType == Enum.UserInputType.Touch then
-        FlingFunctions.tryGrabUnderMouse()
-    end
-end))
-table.insert(connections, UIS.InputBegan:Connect(function(input, gpe)
-    if gpe then return end
-    if input.KeyCode == Enum.KeyCode.Q then
-        grabActive = not grabActive
-        if not grabActive then FlingFunctions.releaseGrab() end
-        GrabObjectButton.Text = "Grab Obj: " .. (grabActive and "ON" or "OFF")
-        GrabObjectButton.BackgroundColor3 = grabActive and GREEN or ROW
-    end
-end))
-
--- FOLLOW
-function FlingFunctions.stopFollowThread() followActive = false; followTarget = nil end
-function FlingFunctions.startFollowThread(target)
-    if not followEnabled then return end
-    followActive = true
-    followTarget = target
-    task.spawn(function()
-        while followActive and selfFlinging and followTarget == target do
-            local ch = Me.Character
-            local hum = ch and ch:FindFirstChildOfClass("Humanoid")
-            local myRoot = hum and hum.RootPart
-            local _, _, tRoot = FlingFunctions.getTargetHRP(target)
-            if myRoot and tRoot and myRoot.Parent and tRoot.Parent then
-                local delta = tRoot.Position - myRoot.Position
-                local dist = delta.Magnitude
-                if dist > CONFIG.ApproachDist then
-                    local step = math.min(8, dist - (CONFIG.ApproachDist - 2))
-                    if step > 0 then
-                        local newPos = myRoot.Position + delta.Unit * step
-                        pcall(function() ch:PivotTo(CFrame.new(newPos, tRoot.Position)) end)
-                    end
-                end
-            else break end
-            task.wait(1 / CONFIG.FollowHz)
-        end
-        followActive = false
-        followTarget = nil
-    end)
-end
-
--- NOCLIP / SPEED
-function FlingFunctions.setNoclip(state)
-    if noclipActive == state then return end
-    noclipActive = state
-    NoclipButton.Text = "Noclip: " .. (state and "ON" or "OFF")
-    NoclipButton.BackgroundColor3 = state and GREEN or ROW
-    local ch = Me.Character
-    if not ch then return end
-    if state then
-        table.clear(noclipOriginalCollision)
-        for _, part in ipairs(ch:GetDescendants()) do
-            if part:IsA("BasePart") then
-                noclipOriginalCollision[part] = part.CanCollide
-                part.CanCollide = false
-            end
-        end
-    else
-        for p, orig in pairs(noclipOriginalCollision) do
-            if p and p.Parent then pcall(function() p.CanCollide = orig end) end
-        end
-        table.clear(noclipOriginalCollision)
-    end
-end
-table.insert(connections, RunService.Stepped:Connect(function()
-    if not noclipActive then return end
-    local ch = Me.Character
-    if not ch then return end
-    for _, part in ipairs(ch:GetChildren()) do
-        if part:IsA("BasePart") and part.CanCollide then part.CanCollide = false end
-    end
-end))
-function FlingFunctions.setSpeed(state)
-    speedActive = state
-    SpeedButton.Text = "Speed: " .. (state and "ON" or "OFF")
-    SpeedButton.BackgroundColor3 = state and GREEN or ROW
-    local ch = Me.Character
-    local hum = ch and ch:FindFirstChildOfClass("Humanoid")
-    if not hum then return end
-    if state then
-        savedWalkSpeed = hum.WalkSpeed
-        hum.WalkSpeed = (savedWalkSpeed or 16) * CONFIG.SpeedBoost
-    else
-        hum.WalkSpeed = savedWalkSpeed or 16
-        savedWalkSpeed = nil
-    end
-end
-
--- COMMAND BAR
-function FlingFunctions.runCommand(text)
-    text = text:gsub("^%s+", ""):gsub("%s+$", "")
-    if text == "" then return end
-    local cmd, arg = text:match("^(%S+)%s*(.*)$")
-    if not cmd then return end
-    cmd = cmd:lower()
-    if cmd == "/help" or cmd == "/?" then
-        FlingFunctions.setStatus("Commands", MUTED,
-            "/hits /testreturn /scan /scanenv /scanall /fling /freeze /unfreeze /anchor /unanchor /bring /grab /goto /aim /noclip /speed /type /target")
-    elseif cmd == "/type" then
-        currentFlingType = (currentFlingType == "original") and "alt" or "original"
-        FlingTypeButton.Text = "Type: " .. FlingFunctions.getCurrentFlingLabel() .. "  ▼"
-        for id, btn in pairs(ftButtons) do
-            btn.BackgroundColor3 = (id == currentFlingType) and ACCENTD or ROW
-        end
-        FlingFunctions.setStatus("Fling type: " .. FlingFunctions.getCurrentFlingLabel(), CYAN)
-    elseif cmd == "/target" then
-        currentAimTarget = (currentAimTarget == "arm") and "hrp" or "arm"
-        TargetButton.Text = "Target: " .. FlingFunctions.getCurrentTargetLabel() .. "  ▼"
-        for id, btn in pairs(tgButtons) do
-            btn.BackgroundColor3 = (id == currentAimTarget) and ACCENTD or ROW
-        end
-        FlingFunctions.setStatus("Target: " .. FlingFunctions.getCurrentTargetLabel(), CYAN)
-    elseif cmd == "/hits" then
-        if HitDebug.showHits then HitDebug.showHits() end
-        FlingFunctions.setStatus("Hit observations", CYAN)
-    elseif cmd == "/clearhits" then HitDebug.clear(); FlingFunctions.setStatus("Cleared", MUTED)
-    elseif cmd == "/testreturn" then
-        if FlingActive or selfFlinging or returning then FlingFunctions.setStatus("Busy", AMBER); return end
-        local ch = Me.Character
-        local hum = ch and ch:FindFirstChildOfClass("Humanoid")
-        local root = hum and hum.RootPart
-        if not (ch and root and hum and hum.Health > 0)
-            or hum.FloorMaterial == Enum.Material.Air then
-            FlingFunctions.setStatus("Stand on solid ground", AMBER); return
-        end
-        returnSnapshot = nil
-        FlingFunctions.captureReturn(ch, root, hum)
-        local landing = FlingFunctions.findSafeLanding(returnSnapshot)
-        if not landing then FlingFunctions.setStatus("Return test FAILED", AMBER); return end
-        local origA = root.Anchored
-        root.Anchored = true
-        ch:PivotTo(ch:GetPivot() + Vector3.new(0,5,0))
-        FlingFunctions.zeroCharacterMotion(ch)
-        root.Anchored = origA
-        task.defer(function()
-            if FlingFunctions.safeReturn() then
-                returnSnapshot = nil
-                FlingFunctions.setStatus("Return PASSED", GREEN)
-            else FlingFunctions.setStatus("Return FAILED", AMBER) end
-        end)
-    elseif cmd == "/scan" then
-        local p = FlingFunctions.findPlayerByName(arg) or FlingFunctions.getActiveTarget()
-        if p then
-            InspectText.Text = FlingFunctions.scanTargetRig(p)
-            InspectOverlay.Visible = true
-            FlingFunctions.setStatus("Rig scan: " .. p.Name, GREEN)
-        else FlingFunctions.setStatus("Scan: no target", AMBER) end
-    elseif cmd == "/scanenv" then
-        InspectText.Text = FlingFunctions.scanEnvironment(tonumber(arg) or 30)
-        InspectOverlay.Visible = true
-        FlingFunctions.setStatus("Env scan", GREEN)
-    elseif cmd == "/scanall" then
-        InspectText.Text = FlingFunctions.scanAll()
-        InspectOverlay.Visible = true
-        FlingFunctions.setStatus("Full scan", GREEN)
-    elseif cmd == "/fling" then
-        local p = FlingFunctions.findPlayerByName(arg)
-        if p then SelectedTargets[p.Name] = p; currentTarget = p; startFling()
-        else FlingFunctions.setStatus("Target not found", AMBER) end
-    elseif cmd == "/aim" then FlingFunctions.setAimbot(not aimActive)
-    elseif cmd == "/freeze" then FlingFunctions.runCmd("freeze", FlingFunctions.findPlayerByName(arg))
-    elseif cmd == "/unfreeze" or cmd == "/thaw" then FlingFunctions.runCmd("unfreeze", FlingFunctions.findPlayerByName(arg))
-    elseif cmd == "/anchor" then FlingFunctions.runCmd("anchor", FlingFunctions.findPlayerByName(arg))
-    elseif cmd == "/unanchor" then FlingFunctions.runCmd("unanchor", FlingFunctions.findPlayerByName(arg))
-    elseif cmd == "/bring" then FlingFunctions.runCmd("bring", FlingFunctions.findPlayerByName(arg))
-    elseif cmd == "/grab" then FlingFunctions.runCmd("grab", FlingFunctions.findPlayerByName(arg))
-    elseif cmd == "/goto" then FlingFunctions.runCmd("goto", FlingFunctions.findPlayerByName(arg))
-    elseif cmd == "/noclip" then FlingFunctions.setNoclip(not noclipActive)
-    elseif cmd == "/speed" then
-        local n = tonumber(arg) or 50
-        local ch = Me.Character
-        local hum = ch and ch:FindFirstChildOfClass("Humanoid")
-        if hum then hum.WalkSpeed = n end
-    else FlingFunctions.setStatus("Unknown: " .. cmd, AMBER) end
-end
-CmdBar.FocusLost:Connect(function(enterPressed)
-    if enterPressed then FlingFunctions.runCommand(CmdBar.Text); CmdBar.Text = "" end
-end)
-
--- FLING CORE
-function FlingFunctions.isTargetReady(player)
-    if not player or not player.Parent then return false end
-    local ch = player.Character
-    if not ch or not ch.Parent then return false end
-    local hum = ch:FindFirstChildOfClass("Humanoid")
-    if not hum then return false end
-    if not hum.RootPart or not hum.RootPart.Parent then return false end
-    if hum.Health <= 0 or hum.Sit then return false end
-    return true
-end
-
-function FlingFunctions.findAnyTargetPart(tChar, tHum)
-    if currentAimTarget == "hrp" then
-        local hrp = tHum and tHum.RootPart
-        if hrp and hrp.Parent then return hrp, hrp.Name end
-    end
-    for _, name in ipairs(KICK_PART_ORDER) do
-        local p = tChar:FindFirstChild(name)
-        if p and p:IsA("BasePart") and not p.Anchored then
-            return p, p.Name
-        end
-    end
-    local tRoot = tHum and tHum.RootPart
-    if tRoot then return tRoot, tRoot.Name end
-    return nil, nil
-end
-
-function FlingFunctions.hardTeleportToTarget(player, requestedLockPart)
-    local ch = Me.Character
-    local hum = ch and ch:FindFirstChildOfClass("Humanoid")
-    local myRoot = hum and hum.RootPart
-    local tChar, tHum, tRoot = FlingFunctions.getTargetHRP(player)
-    if not (ch and myRoot and tRoot) then return false end
-
-    local lockPart = requestedLockPart
-    if not (lockPart and lockPart:IsA("BasePart")
-        and lockPart.Parent == tChar and not lockPart.Anchored) then
-        lockPart = nil
-    end
-    if not lockPart and currentAimTarget == "hrp" then
-        lockPart = tHum and tHum.RootPart
-    elseif not lockPart then
-        for _, name in ipairs(KICK_PART_ORDER) do
-            local p = tChar and tChar:FindFirstChild(name)
-            if p and p:IsA("BasePart") and not p.Anchored then
-                lockPart = p
-                break
-            end
-        end
-    end
-    if not lockPart then lockPart = tRoot end
-
-    local aimWorld = FlingFunctions.getHitLockPosition(lockPart) or lockPart.Position
-    pcall(function()
-        local pivotOffset = myRoot.CFrame:ToObjectSpace(ch:GetPivot())
-        ch:PivotTo(CFrame.new(aimWorld) * myRoot.CFrame.Rotation * pivotOffset)
-        myRoot.AssemblyLinearVelocity  = Vector3.zero
-        myRoot.AssemblyAngularVelocity = Vector3.zero
-    end)
-    return true
-end
-
-function FlingFunctions.preFreezeTarget(player)
-    if freezeActive[player.Name] then return end
-    freezeActive[player.Name] = true
-    freezeThreads[player.Name] = task.spawn(function()
-        while freezeActive[player.Name] do
-            local _, tHum = FlingFunctions.getTargetHRP(player)
-            if not tHum or not tHum.Parent then freezeActive[player.Name] = false; break end
-            pcall(function()
-                if tHum.WalkSpeed ~= 0 then tHum.WalkSpeed = 0 end
-                if tHum.JumpPower ~= 0 then tHum.JumpPower = 0 end
-                if tHum.JumpHeight ~= 0 then tHum.JumpHeight = 0 end
-            end)
-            task.wait()
-        end
-    end)
-end
-function FlingFunctions.postUnfreezeTarget(player)
-    freezeActive[player.Name] = false
-    freezeThreads[player.Name] = nil
-    task.wait(0.05)
-    local _, tHum = FlingFunctions.getTargetHRP(player)
-    if not tHum then return end
-    pcall(function()
-        tHum.WalkSpeed=16; tHum.JumpPower=50; tHum.JumpHeight=7.2; tHum.UseJumpPower=true
-    end)
-end
-function FlingFunctions.makeTargetOverlapParams(character)
-    local p = OverlapParams.new()
-    p.FilterType = Enum.RaycastFilterType.Include
-    p.FilterDescendantsInstances = {character}
-    p.MaxParts = 40
-    p.RespectCanCollide = false
-    return p
-end
-function FlingFunctions.boxIntersects(a, b)
-    if not (a and b and a.Parent and b.Parent) then return false end
-    local av = {a.CFrame.RightVector, a.CFrame.UpVector, a.CFrame.LookVector}
-    local bv = {b.CFrame.RightVector, b.CFrame.UpVector, b.CFrame.LookVector}
-    local ae = {a.Size.X / 2, a.Size.Y / 2, a.Size.Z / 2}
-    local be = {b.Size.X / 2, b.Size.Y / 2, b.Size.Z / 2}
-    local r, absR, t = {}, {}, {}
-    local difference = b.Position - a.Position
-    for i = 1, 3 do
-        r[i], absR[i] = {}, {}
-        t[i] = difference:Dot(av[i])
-        for j = 1, 3 do
-            r[i][j] = av[i]:Dot(bv[j])
-            absR[i][j] = math.abs(r[i][j]) + 1e-6
-        end
-    end
-    for i = 1, 3 do
-        local radius = ae[i]
-        for j = 1, 3 do radius = radius + be[j] * absR[i][j] end
-        if math.abs(t[i]) > radius then return false end
-    end
-    for j = 1, 3 do
-        local radius = be[j]
-        for i = 1, 3 do radius = radius + ae[i] * absR[i][j] end
-        local projection = math.abs(t[1] * r[1][j] + t[2] * r[2][j] + t[3] * r[3][j])
-        if projection > radius then return false end
-    end
-    for i = 1, 3 do
-        local i2, i3 = (i % 3) + 1, ((i + 1) % 3) + 1
-        for j = 1, 3 do
-            local j2, j3 = (j % 3) + 1, ((j + 1) % 3) + 1
-            local projection = math.abs(t[i3] * r[i2][j] - t[i2] * r[i3][j])
-            local radiusA = ae[i2] * absR[i3][j] + ae[i3] * absR[i2][j]
-            local radiusB = be[j2] * absR[i][j3] + be[j3] * absR[i][j2]
-            if projection > radiusA + radiusB then return false end
-        end
-    end
-    return true
-end
-function FlingFunctions.sampleContact(myRoot, targetCharacter, targetRoot, params, monitor)
-    if not monitor or not myRoot.Parent or not targetRoot.Parent then return end
-    local now = os.clock()
-    if not monitor.lastOverlapQuery
-        or now - monitor.lastOverlapQuery >= CONFIG.OverlapCheckInterval then
-        monitor.lastOverlapQuery = now
-        local ok, hits = pcall(function() return workspace:GetPartsInPart(myRoot, params) end)
-        if ok then
-            for _, part in ipairs(hits) do
-                if HitDebug.acceptsPart(part, targetCharacter, monitor.aimMode) then
-                    monitor.overlap = true
-                    monitor.lastOverlapAt = now
-                    monitor.overlapSamples = (monitor.overlapSamples or 0) + 1
-                    pcall(HitDebug.record, monitor, part, myRoot, "Overlap")
-                end
-            end
-        end
-        if monitor.aimMode == "hrp" and targetRoot.Name == "HumanoidRootPart"
-            and FlingFunctions.boxIntersects(myRoot, targetRoot) then
-            monitor.overlap = true
-            monitor.lastOverlapAt = now
-            monitor.overlapSamples = (monitor.overlapSamples or 0) + 1
-            pcall(HitDebug.record, monitor, targetRoot, myRoot, "Geometry")
-        end
-    end
-    local velocity = targetRoot.AssemblyLinearVelocity
-    local magnitude = velocity.Magnitude
-    if magnitude > (monitor.peak or 0) then monitor.peak = magnitude end
-    local baseline = monitor.startVelocity or Vector3.zero
-    local responseDelta = (velocity - baseline).Magnitude
-    monitor.responseDelta = math.max(monitor.responseDelta or 0, responseDelta)
-    if monitor.lastOverlapAt and now - monitor.lastOverlapAt <= 0.40
-        and magnitude >= HRP_BURST.SuccessPeakVel
-        and responseDelta >= CONFIG.MinimumResponseDelta then
-        if not monitor.hit then
-            monitor.hit = true
-            pcall(HitDebug.flag, monitor)
-        end
-    end
-end
-
-function FlingFunctions.runV234Slice(duration, Character, Humanoid, RootPart,
-                             TCharacter, THumanoid, aimPart,
-                             monitor, overlapParams)
-    local targetRoot = THumanoid and THumanoid.RootPart
-    local angle = 0
-
-    local function FPos(worldAim, localOffset, ang)
-        if not RootPart.Parent or not aimPart.Parent then return end
-        local kickCF = CFrame.new(worldAim) * CFrame.new(localOffset) * ang
-        local pivotOffset = RootPart.CFrame:ToObjectSpace(Character:GetPivot())
-        Character:PivotTo(kickCF * pivotOffset)
-        RootPart.CanCollide = true
-        RootPart.Massless = false
-        if RootPart.Anchored then RootPart.Anchored = false end
-        RootPart.AssemblyLinearVelocity = Vector3.new(
-            CONFIG.KickSpeed, CONFIG.KickYSpeed, CONFIG.KickSpeed)
-        RootPart.AssemblyAngularVelocity = Vector3.new(
-            CONFIG.KickRot, CONFIG.KickRot, CONFIG.KickRot)
-    end
-
-    local offsets = {
-        Vector3.new(0,  0.55, 0),
-        Vector3.new(0, -0.55, 0),
-        Vector3.new(0.55, 0, 0),
-        Vector3.new(-0.55, 0, 0),
-        Vector3.new(0, 0, 0.55),
-        Vector3.new(0, 0, -0.55),
-    }
-
-    local started = os.clock()
-    repeat
-        if not FlingActive or not RootPart.Parent
-            or not THumanoid or THumanoid.Health <= 0 then break end
-        if not aimPart.Parent then break end
-        if targetRoot and not targetRoot.Parent then break end
-
-        for offsetIndex, offset in ipairs(offsets) do
-            if not FlingActive or not RootPart.Parent or not aimPart.Parent then break end
-
-            local aim = FlingFunctions.getHitLockPosition(aimPart)
-            if not aim then
-                local predictionRoot = targetRoot and targetRoot.Parent and targetRoot or aimPart
-                aim = FlingFunctions.predictPart(predictionRoot, PREDICTION_TIME)
-            end
-
-            angle = (angle + CONFIG.AngleStep) % 360
-            FPos(aim, offset, CFrame.Angles(math.rad(angle), 0, 0))
-
-            FlingFunctions.sampleContact(RootPart, TCharacter, targetRoot or aimPart,
-                overlapParams, monitor)
-            if monitor and monitor.hit then return true end
-
-            if offsetIndex % 2 == 0 then
-                task.wait()
-                FlingFunctions.sampleContact(RootPart, TCharacter, targetRoot or aimPart,
-                    overlapParams, monitor)
-                if monitor and monitor.hit then return true end
-            end
-        end
-        task.wait()
-    until os.clock() - started >= duration or not FlingActive
-    return false
-end
-
-function FlingFunctions.SkidFling_KILASIK(TargetPlayer, forcedPart, monitor)
-    local Character  = Me.Character
-    local Humanoid   = Character and Character:FindFirstChildOfClass("Humanoid")
-    local RootPart   = Humanoid and Humanoid.RootPart
-    local TCharacter = TargetPlayer.Character
-    if not TCharacter then return false, false end
-    local THumanoid  = TCharacter:FindFirstChildOfClass("Humanoid")
-    if not (Character and Humanoid and RootPart) then
-        FlingFunctions.setStatus("Character not ready", AMBER); return false, false
-    end
-    FlingFunctions.captureReturn(Character, RootPart, Humanoid)
-    if THumanoid and THumanoid.Sit then
-        FlingFunctions.setStatus(TargetPlayer.Name .. " is sitting", AMBER)
-        returnSnapshot = nil; return false, false
-    end
-    if not TCharacter:FindFirstChildWhichIsA("BasePart") then
-        returnSnapshot = nil; return false, false
-    end
-
-    local aimPart = forcedPart
-    if not (aimPart and aimPart:IsA("BasePart") and aimPart.Parent and not aimPart.Anchored) then
-        aimPart = FlingFunctions.findAnyTargetPart(TCharacter, THumanoid)
-    end
-    if not aimPart then
-        FlingFunctions.setStatus(TargetPlayer.Name .. " no tracking part", AMBER)
-        returnSnapshot = nil; return false, false
-    end
-    if monitor then
-        local suffix = (currentAimTarget == "hrp") and "[HRP]" or "[Arm]"
-        monitor.aimedPartName = aimPart.Name .. suffix
-    end
-
-    local savedFPDH         = workspace.FallenPartsDestroyHeight
-    local savedRootCollide  = RootPart.CanCollide
-    local savedRootMassless = RootPart.Massless
-
-    local overlapParams = FlingFunctions.makeTargetOverlapParams(TCharacter)
-    local touchConnection
-    if RootPart.CanTouch then
-        pcall(function()
-            touchConnection = RootPart.Touched:Connect(function(part)
-                if monitor and HitDebug.acceptsPart(part, TCharacter, monitor and monitor.aimMode) then
-                    monitor.overlap = true
-                    monitor.lastOverlapAt = os.clock()
-                    monitor.touchedPartName = FlingFunctions.hitPartLabel(part, TCharacter)
-                    pcall(HitDebug.record, monitor, part, RootPart, "Touched")
-                end
-            end)
-        end)
-    end
-
-    selfFlinging = true
-    local oldSeated = returnSnapshot and returnSnapshot.seatedEnabled
-    FlingFunctions.hardTeleportToTarget(TargetPlayer, aimPart)
-
-    local ran, result = xpcall(function()
-        Humanoid:SetStateEnabled(Enum.HumanoidStateType.Seated, false)
-        return FlingFunctions.runV234Slice(CONFIG.TimeToWait, Character, Humanoid, RootPart,
-            TCharacter, THumanoid, aimPart, monitor, overlapParams)
-    end, function(err) return tostring(err) end)
-
-    if not ran then
-        warn("[Fling Original] Movement failed:", result)
-        FlingFunctions.setStatus("Movement error", RED, tostring(result):sub(1, 110))
-    end
-    if touchConnection then touchConnection:Disconnect() end
-    pcall(function()
-        RootPart.CanCollide = savedRootCollide
-        RootPart.Massless = savedRootMassless
-    end)
-    FlingFunctions.zeroCharacterMotion(Character)
-    pcall(function()
-        if Humanoid.Parent then
-            Humanoid:SetStateEnabled(Enum.HumanoidStateType.Seated,
-                oldSeated ~= nil and oldSeated or true)
-        end
-    end)
-    selfFlinging = false
-
-    do
-        local rootNow = Character:FindFirstChild("HumanoidRootPart")
-        local saved = returnSnapshot
-        if rootNow and saved and saved.pivot then
-            local myVel = rootNow.AssemblyLinearVelocity.Magnitude
-            if myVel > 200 then
-                for _ = 1, 20 do
-                    if Me.Character ~= Character or not Character.Parent
-                        or not rootNow.Parent or Humanoid.Health <= 0 then break end
-                    if (rootNow.Position - saved.pivot.Position).Magnitude < 25 then break end
-                    pcall(function()
-                        rootNow.Anchored = true
-                        Character:PivotTo(saved.pivot)
-                        rootNow.AssemblyLinearVelocity  = Vector3.zero
-                        rootNow.AssemblyAngularVelocity = Vector3.zero
-                        rootNow.Anchored = false
-                    end)
-                    RunService.Heartbeat:Wait()
-                end
-            end
-        end
-    end
-    FlingFunctions.safeReturn(true)
-    pcall(function() workspace.FallenPartsDestroyHeight = savedFPDH end)
-    return true, (monitor and monitor.hit) or false
-end
-
-function FlingFunctions.SkidFling_Alt(TargetPlayer, forcedPart, monitor)
-    local Character  = Me.Character
-    local Humanoid   = Character and Character:FindFirstChildOfClass("Humanoid")
-    local RootPart   = Humanoid and Humanoid.RootPart
-    local TCharacter = TargetPlayer.Character
-    if not TCharacter then return false, false end
-    local THumanoid  = TCharacter:FindFirstChildOfClass("Humanoid")
-    if not (Character and Humanoid and RootPart) then
-        FlingFunctions.setStatus("Character not ready", AMBER); return false, false
-    end
-    FlingFunctions.captureReturn(Character, RootPart, Humanoid)
-    if THumanoid and THumanoid.Sit then
-        FlingFunctions.setStatus(TargetPlayer.Name .. " is sitting", AMBER)
-        returnSnapshot = nil; return false, false
-    end
-    if not TCharacter:FindFirstChildWhichIsA("BasePart") then
-        returnSnapshot = nil; return false, false
-    end
-
-    local aimPart = forcedPart
-    if not (aimPart and aimPart:IsA("BasePart") and aimPart.Parent and not aimPart.Anchored) then
-        aimPart = FlingFunctions.findAnyTargetPart(TCharacter, THumanoid)
-    end
-    if not aimPart then
-        FlingFunctions.setStatus(TargetPlayer.Name .. " no tracking part", AMBER)
-        returnSnapshot = nil; return false, false
-    end
-    if monitor then
-        local suffix = (currentAimTarget == "hrp") and "[HRP]" or "[Arm]"
-        monitor.aimedPartName = aimPart.Name .. suffix
-    end
-
-    local checkpoint = (returnSnapshot and returnSnapshot.pivot) or Character:GetPivot()
-
-    local savedFPDH         = workspace.FallenPartsDestroyHeight
-    local savedRootCollide  = RootPart.CanCollide
-    local savedRootMassless = RootPart.Massless
-
-    local overlapParams = FlingFunctions.makeTargetOverlapParams(TCharacter)
-    local touchConnection
-    if RootPart.CanTouch then
-        pcall(function()
-            touchConnection = RootPart.Touched:Connect(function(part)
-                if monitor and HitDebug.acceptsPart(part, TCharacter, monitor and monitor.aimMode) then
-                    monitor.overlap = true
-                    monitor.lastOverlapAt = os.clock()
-                    monitor.touchedPartName = FlingFunctions.hitPartLabel(part, TCharacter)
-                    pcall(HitDebug.record, monitor, part, RootPart, "Touched")
-                end
-            end)
-        end)
-    end
-
-    selfFlinging = true
-    local oldSeated = returnSnapshot and returnSnapshot.seatedEnabled
-
-    local ran, result = xpcall(function()
-        Humanoid:SetStateEnabled(Enum.HumanoidStateType.Seated, false)
-
-        local sliceTime  = CONFIG.AltSliceTime  or 1.2
-        local maxCycles  = CONFIG.AltMaxCycles  or 6
-        local returnWait = CONFIG.AltReturnWait or 0.15
-
-        local gotHit = false
-        for cycle = 1, maxCycles do
-            if not FlingActive then break end
-            if monitor and monitor.hit then gotHit = true; break end
-
-            FlingFunctions.hardTeleportToTarget(TargetPlayer, aimPart)
-            task.wait()
-
-            local sliceHit = FlingFunctions.runV234Slice(sliceTime, Character, Humanoid, RootPart,
-                TCharacter, THumanoid, aimPart, monitor, overlapParams)
-            if sliceHit or (monitor and monitor.hit) then gotHit = true; break end
-            if not FlingActive then break end
-
-            pcall(function()
-                RootPart.Anchored = true
-                Character:PivotTo(checkpoint)
-                RootPart.AssemblyLinearVelocity  = Vector3.zero
-                RootPart.AssemblyAngularVelocity = Vector3.zero
-                RootPart.Anchored = false
-            end)
-
-            task.wait(returnWait)
-        end
-
-        return gotHit
-    end, function(err) return tostring(err) end)
-
-    if not ran then
-        warn("[Fling Alt] error:", result)
-        FlingFunctions.setStatus("Alt error", RED, tostring(result):sub(1, 110))
-    end
-
-    if touchConnection then touchConnection:Disconnect() end
-    pcall(function()
-        RootPart.CanCollide = savedRootCollide
-        RootPart.Massless = savedRootMassless
-    end)
-    FlingFunctions.zeroCharacterMotion(Character)
-    pcall(function()
-        if Humanoid.Parent then
-            Humanoid:SetStateEnabled(Enum.HumanoidStateType.Seated,
-                oldSeated ~= nil and oldSeated or true)
-        end
-    end)
-    selfFlinging = false
-
-    pcall(function()
-        if RootPart and RootPart.Parent and Humanoid and Humanoid.Health > 0 then
-            RootPart.Anchored = true
-            Character:PivotTo(checkpoint)
-            RootPart.AssemblyLinearVelocity  = Vector3.zero
-            RootPart.AssemblyAngularVelocity = Vector3.zero
-            RootPart.Anchored = false
-        end
-    end)
-    FlingFunctions.safeReturn(true)
-    pcall(function() workspace.FallenPartsDestroyHeight = savedFPDH end)
-    return true, (monitor and monitor.hit) or false
-end
-
-function FlingFunctions.SkidFling(TargetPlayer, forcedPart, monitor)
-    if currentFlingType == "alt" then
-        return FlingFunctions.SkidFling_Alt(TargetPlayer, forcedPart, monitor)
-    else
-        return FlingFunctions.SkidFling_KILASIK(TargetPlayer, forcedPart, monitor)
-    end
-end
-
-function FlingFunctions.burstFlingTarget(player)
-    if not FlingFunctions.isTargetReady(player) then return false, 0, 0, nil end
-    local tc = player.Character
-    if not tc then return false, 0, 0, nil end
-    if CONFIG.AutoFreezeTarget then FlingFunctions.preFreezeTarget(player) end
-    local bestPeak, attempts = 0, 0
-    local anyOverlap, bestResponseDelta = false, 0
-    local lastPartName = nil
-    local tHum = tc:FindFirstChildOfClass("Humanoid")
-    for i = 1, HRP_BURST.MaxAttempts do
-        if not FlingActive then break end
-        if not FlingFunctions.isTargetReady(player) then break end
-        if attempts > 0 and flungTargets[player] then
-            FlingFunctions.setStatus(player.Name .. " already flung — stop chase", CYAN,
-                "Skipping remaining attempts (won't follow airborne target)")
-            break
-        end
-        local candidate, candidateName = FlingFunctions.findAnyTargetPart(tc, tHum)
-        if not candidate then
-            FlingFunctions.setStatus("Target part unavailable", AMBER)
-            break
-        end
-        local _, _, tRoot = FlingFunctions.getTargetHRP(player)
-        if CONFIG.AutoFreezeTarget and tRoot then
-            local wasA = tRoot.Anchored
-            pcall(function() tRoot.Anchored = true end)
-            task.wait(CONFIG.AnchorHold)
-            pcall(function() tRoot.Anchored = wasA end)
-        end
-        if currentFlingType ~= "alt" then
-            FlingFunctions.hardTeleportToTarget(player, candidate)
-        end
-        if not FlingActive then break end
-        attempts = attempts + 1
-        local tRV = tRoot and tRoot.AssemblyLinearVelocity or Vector3.zero
-        local monitor = {peak=0, hit=false, overlap=false,
-            targetName=player.Name, targetCharacter=tc, attempt=attempts,
-            aimMode=currentAimTarget, aimedPartName=candidateName, overlapSamples=0,
-            startVelocity=tRV, responseDelta=0}
-        FlingFunctions.SkidFling(player, candidate, monitor)
-        if monitor.contactPartName or monitor.overlapPart then
-            lastPartName = monitor.contactPartName or monitor.overlapPart
-        end
-        if monitor.peak > bestPeak then bestPeak = monitor.peak end
-        anyOverlap = anyOverlap or monitor.overlap
-        bestResponseDelta = math.max(bestResponseDelta, monitor.responseDelta)
-        if monitor.hit then
-            flungTargets[player] = true
-            local ch = Me.Character
-            local myRoot = ch and ch:FindFirstChild("HumanoidRootPart")
-            local holdA = myRoot and myRoot.Anchored or false
-            if myRoot then
-                pcall(function()
-                    myRoot.Anchored = true
-                    myRoot.AssemblyLinearVelocity = Vector3.zero
-                    myRoot.AssemblyAngularVelocity = Vector3.zero
-                end)
-            end
-            FlingFunctions.setStatus(string.format("@%s contact (%s) · %s · %s", player.Name,
-                tostring(monitor.contactPartName or monitor.overlapPart or "?"),
-                FlingFunctions.getCurrentFlingLabel(), FlingFunctions.getCurrentTargetLabel()), GREEN)
-            local hs = tick()
-            while tick() - hs < CONFIG.HoldAfterHit do
-                if not FlingActive then break end
-                if myRoot and myRoot.Parent then
-                    pcall(function()
-                        myRoot.AssemblyLinearVelocity = Vector3.zero
-                        myRoot.AssemblyAngularVelocity = Vector3.zero
-                    end)
-                end
-                task.wait(0.05)
-            end
-            if myRoot and myRoot.Parent then
-                pcall(function() myRoot.Anchored = holdA end)
-            end
-            if CONFIG.AutoFreezeTarget then FlingFunctions.postUnfreezeTarget(player) end
-            return true, bestPeak, attempts, lastPartName, anyOverlap, bestResponseDelta
-        end
-        if CONFIG.AutoFreezeTarget then FlingFunctions.preFreezeTarget(player) end
-        task.wait(HRP_BURST.DelayBetween)
-    end
-    if CONFIG.AutoFreezeTarget then FlingFunctions.postUnfreezeTarget(player) end
-    return false, bestPeak, attempts, lastPartName, anyOverlap, bestResponseDelta
-end
-
-function FlingFunctions.activeTargets()
-    local list = {}
-    for _, p in pairs(SelectedTargets) do
-        if p and p.Parent == Players then table.insert(list, p)
-        else SelectedTargets[p.Name] = nil end
-    end
-    return list
-end
-function FlingFunctions.startFlingInternal(todo)
-    FlingActive = true
-    task.spawn(function()
-        local ch = Me.Character
-        local hum = ch and ch:FindFirstChildOfClass("Humanoid")
-        local root = hum and hum.RootPart
-        if ch and root and hum then FlingFunctions.captureReturn(ch, root, hum) end
-        for i, player in ipairs(todo) do
-            if not FlingActive then break end
-            currentTarget = player
-            FlingFunctions.setStatus(string.format("Flinging @%s (%d/%d) · %s · %s",
-                player.Name, i, #todo, FlingFunctions.getCurrentFlingLabel(), FlingFunctions.getCurrentTargetLabel()), WHITE,
-                currentFlingType == "alt" and "v23.4 slice → TP back → repeat"
-                or "KILASIK 4s rotation on lock point")
-            FlingFunctions.stopFollowThread()
-            local skip = flungTargets[player] == true
-            if skip then
-                task.wait(CONFIG.Cooldown)
-                FlingFunctions.safeReturn()
-            else
-                local ok, peak, tries, pn, observedOverlap, responseDelta = FlingFunctions.burstFlingTarget(player)
-                if ok then
-                    FlingFunctions.setStatus(string.format("@%s contact (%s)", player.Name, tostring(pn or "?")),
-                        GREEN, string.format("Peak %.0f | %d tries", peak, tries))
-                else
-                    if observedOverlap then
-                        FlingFunctions.setStatus(string.format("@%s local overlap only", player.Name), AMBER,
-                            string.format("No confirmed motion | peak %.0f, delta %.0f | %d tries",
-                                peak, responseDelta or 0, tries))
-                    else
-                        FlingFunctions.setStatus(string.format("@%s no local overlap", player.Name), AMBER,
-                            string.format("No matching target-part intersection | %d tries", tries))
-                    end
-                end
-                task.wait(CONFIG.Cooldown)
-                FlingFunctions.safeReturn()
-            end
-        end
-        FlingActive = false
-        currentTarget = nil
-        if FlingFunctions.safeReturn() then
-            returnSnapshot = nil
-            FlingFunctions.setStatus("Done — locally returned", GREEN)
-        else
-            FlingFunctions.setStatus("Completed — landing unverified", AMBER)
-        end
-    end)
-end
-startFling = function()
-    if FlingActive then return end
-    local todo = FlingFunctions.activeTargets()
-    if #todo == 0 then FlingFunctions.setStatus("No targets selected", AMBER); return end
-    for _, p in ipairs(todo) do flungTargets[p] = nil end
-    FlingFunctions.startFlingInternal(todo)
-end
-function FlingFunctions.stopFling()
-    FlingActive = false
-    FlingFunctions.stopFollowThread()
-    if not selfFlinging then FlingFunctions.safeReturn() end
-    FlingFunctions.setStatus("Stopped", MUTED)
-end
-
--- PLAYER LIST
-function FlingFunctions.refreshPlayers()
-    for _, r in pairs(rows) do r:Destroy() end
-    table.clear(rows)
-    local all = Players:GetPlayers()
-    table.sort(all, function(a, b) return a.Name:lower() < b.Name:lower() end)
-    local q = Search.Text:lower()
-    local shown = 0
-    for _, player in ipairs(all) do
-        if player ~= Me
-           and (player.Name:lower():find(q, 1, true)
-                or player.DisplayName:lower():find(q, 1, true)) then
-            shown = shown + 1
-            local Row = FlingFunctions.make("TextButton", {Size=UDim2.new(1,-18,0,56),
-                LayoutOrder=shown, BackgroundColor3=SelectedTargets[player.Name]
-                and Color3.fromRGB(58,78,110) or ROW,
-                BorderSizePixel=0, AutoButtonColor=false, Text=""}, List)
-            FlingFunctions.round(Row, 10)
-            Row.MouseEnter:Connect(function()
-                if not SelectedTargets[player.Name] then Row.BackgroundColor3 = ROWHI end
-            end)
-            Row.MouseLeave:Connect(function()
-                if not SelectedTargets[player.Name] then Row.BackgroundColor3 = ROW end
-            end)
-            local pic = FlingFunctions.make("ImageLabel", {Position=UDim2.fromOffset(36,6),
-                Size=UDim2.fromOffset(40,40), BackgroundColor3=PANEL, Image=""}, Row)
-            FlingFunctions.round(pic, 20)
-            local check = FlingFunctions.make("Frame", {Position=UDim2.fromOffset(8,15),
-                Size=UDim2.fromOffset(22,22), BackgroundColor3=Color3.fromRGB(60,70,95),
-                BorderSizePixel=0}, Row)
-            FlingFunctions.round(check, 6)
-            FlingFunctions.make("UIStroke", {Color=Color3.fromRGB(80,92,118), Thickness=1}, check)
-            local mark = FlingFunctions.make("TextLabel", {Size=UDim2.fromScale(1,1),
-                BackgroundTransparency=1, Text="✓", TextColor3=Color3.fromRGB(60,230,130),
-                Font=Enum.Font.GothamBold, TextSize=16,
-                Visible=SelectedTargets[player.Name] ~= nil}, check)
-            local dl = FlingFunctions.label(player.DisplayName, 14,
-                UDim2.fromOffset(84,6), UDim2.new(1,-92,0,22), Row)
-            dl.Font = Enum.Font.GothamBold
-            local ul = FlingFunctions.label("@"..player.Name, 11,
-                UDim2.fromOffset(84,28), UDim2.new(1,-92,0,18), Row)
-            ul.TextColor3 = MUTED
-            FlingFunctions.loadAvatar(player, pic, Enum.ThumbnailSize.Size100x100)
-            Row.MouseButton1Click:Connect(function()
-                if SelectedTargets[player.Name] then
-                    SelectedTargets[player.Name] = nil
-                    mark.Visible = false
-                    Row.BackgroundColor3 = ROW
-                    if currentTarget == player then currentTarget = nil end
-                else
-                    SelectedTargets[player.Name] = player
-                    mark.Visible = true
-                    Row.BackgroundColor3 = Color3.fromRGB(58,78,110)
-                    currentTarget = player
-                end
-                local cnt = #FlingFunctions.activeTargets()
-                Count.Text = string.format("%d online · %d shown · %d selected",
-                    #Players:GetPlayers(), shown, cnt)
-                FlingFunctions.setStatus(string.format("%d selected · target: %s",
-                    cnt, currentTarget and currentTarget.Name or "none"), MUTED)
-            end)
-            rows[player] = Row
-        end
-    end
-    Count.Text = string.format("%d online · %d shown · %d selected",
-        #all, shown, #FlingFunctions.activeTargets())
-end
-
--- BUTTONS
-TPButton.MouseButton1Click:Connect(function() FlingFunctions.runCmd("goto", FlingFunctions.getActiveTarget()) end)
-BringButton.MouseButton1Click:Connect(function() FlingFunctions.runCmd("bring", FlingFunctions.getActiveTarget()) end)
-FreezeButton.MouseButton1Click:Connect(function() FlingFunctions.runCmd("freeze", FlingFunctions.getActiveTarget()) end)
-UnfreezeButton.MouseButton1Click:Connect(function() FlingFunctions.runCmd("unfreeze", FlingFunctions.getActiveTarget()) end)
-AnchorButton.MouseButton1Click:Connect(function() FlingFunctions.runCmd("anchor", FlingFunctions.getActiveTarget()) end)
-UnanchorButton.MouseButton1Click:Connect(function() FlingFunctions.runCmd("unanchor", FlingFunctions.getActiveTarget()) end)
-AimbotButton.MouseButton1Click:Connect(function() FlingFunctions.setAimbot(not aimActive) end)
-FollowButton.MouseButton1Click:Connect(function()
-    followEnabled = not followEnabled
-    FollowButton.Text = "Follow: " .. (followEnabled and "ON" or "OFF")
-    FollowButton.BackgroundColor3 = followEnabled and GREEN or ROW
-    FlingFunctions.setStatus("Follow: " .. (followEnabled and "ON" or "OFF"), MUTED)
-end)
-NoclipButton.MouseButton1Click:Connect(function() FlingFunctions.setNoclip(not noclipActive) end)
-SpeedButton.MouseButton1Click:Connect(function() FlingFunctions.setSpeed(not speedActive) end)
-GrabObjectButton.MouseButton1Click:Connect(function()
-    grabActive = not grabActive
-    if not grabActive then FlingFunctions.releaseGrab() end
-    GrabObjectButton.Text = "Grab Obj: " .. (grabActive and "ON" or "OFF")
-    GrabObjectButton.BackgroundColor3 = grabActive and GREEN or ROW
-end)
-RescueButton.MouseButton1Click:Connect(function()
-    FlingActive = false
-    FlingFunctions.stopFollowThread()
-    if selfFlinging then FlingFunctions.setStatus("Cancelling...", AMBER); return end
-    if FlingFunctions.safeReturn() then
-        returnSnapshot = nil
-        FlingFunctions.setStatus("Recovered", GREEN)
-    else FlingFunctions.setStatus("Recovery unavailable", AMBER) end
-end)
-SelectAll.MouseButton1Click:Connect(function()
-    for _, p in ipairs(Players:GetPlayers()) do
-        if p ~= Me and rows[p] then SelectedTargets[p.Name] = p end
-    end
-    FlingFunctions.refreshPlayers()
-end)
-DeselectAll.MouseButton1Click:Connect(function()
-    table.clear(SelectedTargets)
-    currentTarget = nil
-    FlingFunctions.refreshPlayers()
-end)
-InspectButton.MouseButton1Click:Connect(function()
-    local t = FlingFunctions.getActiveTarget()
-    if t then InspectText.Text = FlingFunctions.scanTargetRig(t)
-    else
-        local lines = {"No target selected — full scan:", ""}
-        lines[#lines+1] = FlingFunctions.scanAll()
-        InspectText.Text = table.concat(lines, "\n")
-    end
-    InspectOverlay.Visible = true
-    FlingFunctions.setStatus("Scan complete", GREEN)
-end)
-FlingButton.MouseButton1Click:Connect(startFling)
-Stop.MouseButton1Click:Connect(FlingFunctions.stopFling)
-
-table.insert(connections, Search:GetPropertyChangedSignal("Text"):Connect(function()
-    List.CanvasPosition = Vector2.zero
-    PlayerPage.CanvasPosition = Vector2.zero
-    FlingFunctions.refreshPlayers()
-end))
-table.insert(connections, Players.PlayerAdded:Connect(function(p)
-    FlingFunctions.refreshPlayers()
-    p.CharacterAdded:Connect(function()
-        originalAnchored[p.Name] = nil
-        freezeActive[p.Name] = false
-        FlingFunctions.startDamageGuard()
-    end)
-end))
-table.insert(connections, Players.PlayerRemoving:Connect(function(player)
-    SelectedTargets[player.Name] = nil
-    originalAnchored[player.Name] = nil
-    freezeActive[player.Name] = false
-    flungTargets[player] = nil
-    if currentTarget == player then currentTarget = nil end
-    task.defer(function() if Gui.Parent then FlingFunctions.refreshPlayers() end end)
-end))
-table.insert(connections, Me.CharacterAdded:Connect(function()
-    task.wait(0.5)
-    FlingFunctions.startDamageGuard()
-end))
-
--- DRAG
 local dragging, dragInput, dragStart, startPos = false
 Header.InputBegan:Connect(function(input)
     if input.UserInputType == Enum.UserInputType.MouseButton1
-       or input.UserInputType == Enum.UserInputType.Touch then
+    or input.UserInputType == Enum.UserInputType.Touch then
         dragging = true; dragInput = input
         dragStart = input.Position; startPos = Main.Position
     end
 end)
-table.insert(connections, UIS.InputChanged:Connect(function(input)
+UIS.InputChanged:Connect(function(input)
     if not dragging then return end
-    if input.UserInputType ~= Enum.UserInputType.MouseMovement
-       and input ~= dragInput then return end
+    if input.UserInputType ~= Enum.UserInputType.MouseMovement and input ~= dragInput then return end
     local delta = (input.Position - dragStart) / Scale.Scale
     local vpY = workspace.CurrentCamera and workspace.CurrentCamera.ViewportSize.Y or 768
     Main.Position = UDim2.new(startPos.X.Scale,
         startPos.X.Offset + delta.X, 0,
         math.clamp(startPos.Y.Offset + delta.Y, 2, math.max(2, vpY - Main.Size.Y.Offset - 2)))
-end))
-table.insert(connections, UIS.InputEnded:Connect(function(input)
+end)
+UIS.InputEnded:Connect(function(input)
     if input == dragInput then dragging = false; dragInput = nil end
-end))
-
-local cam = workspace.CurrentCamera
-if cam then
-    table.insert(connections,
-        cam:GetPropertyChangedSignal("ViewportSize"):Connect(updateWindow))
-end
-CloseButton.MouseButton1Click:Connect(function() Gui:Destroy() end)
-Gui.Destroying:Connect(function()
-    FlingActive = false
-    FlingFunctions.stopFollowThread()
-    FlingFunctions.releaseGrab()
-    aimActive = false
-    ringPartsEnabled = false
-    FlingFunctions.stopDamageGuard()
-    for _, c in ipairs(connections) do c:Disconnect() end
 end)
 
+local cam = workspace.CurrentCamera
+if cam then cam:GetPropertyChangedSignal("ViewportSize"):Connect(updateWindow) end
+CloseButton.MouseButton1Click:Connect(function() Gui:Destroy() end)
+
+-- ============================================================
+-- RING CORE
+-- ============================================================
+pcall(function() Me.ReplicationFocus = workspace end)
+pcall(function() sethiddenproperty(Me, "SimulationRadius", config.simRadius) end)
+Me.CharacterAdded:Connect(function()
+    task.wait(0.5)
+    pcall(function() Me.ReplicationFocus = workspace end)
+    pcall(function() sethiddenproperty(Me, "SimulationRadius", config.simRadius) end)
+end)
+
+local ringFF
+local function ringProtectChar(char)
+    if not char then return end
+    if ringFF and ringFF.Parent then ringFF:Destroy() end
+    ringFF = Instance.new("ForceField")
+    ringFF.Visible = false
+    ringFF.Parent = char
+end
+if Me.Character then ringProtectChar(Me.Character) end
+Me.CharacterAdded:Connect(function(ch) task.wait(0.5); ringProtectChar(ch) end)
+
+task.spawn(function()
+    while true do
+        if OrbitState ~= 0 then
+            local char = Me.Character
+            local root = char and char:FindFirstChild("HumanoidRootPart")
+            if root then
+                pcall(function() sethiddenproperty(Me, "SimulationRadius", config.simRadius) end)
+                local parts = workspace:GetPartBoundsInRadius(root.Position, config.scanRadius)
+                local processed = 0
+                for _, item in ipairs(parts) do
+                    if processed >= config.maxItemsPerLoop then break end
+                    if item:IsA("BasePart") and not item.Anchored
+                       and not item:IsDescendantOf(char) then
+                        if not itemsInRingLookup[item] then
+                            table.insert(itemsInRing, item)
+                            itemsInRingLookup[item] = true
+                            processed = processed + 1
+                        end
+                    end
+                end
+                local cleaned = 0
+                for i = #itemsInRing, 1, -1 do
+                    if cleaned > 15 then break end
+                    local item = itemsInRing[i]
+                    if not item or not item.Parent then
+                        itemsInRingLookup[item] = nil
+                        table.remove(itemsInRing, i)
+                        cleaned = cleaned + 1
+                    end
+                end
+            end
+        end
+        task.wait(0.7)
+    end
+end)
+
+RunService.Stepped:Connect(function()
+    if OrbitState == 0 then return end
+    local char = Me.Character
+    local root = char and char:FindFirstChild("HumanoidRootPart")
+    if not root then return end
+
+    for _, v in ipairs(char:GetChildren()) do
+        if v:IsA("BasePart") then v.CanCollide = false end
+    end
+
+    local targetPart = root
+    if OrbitState == 2 and LockedPosition then
+        targetPart = {Position = LockedPosition}
+    elseif targetPlayerName ~= "" then
+        local p = Players:FindFirstChild(targetPlayerName)
+        if p and p.Character then
+            local hrp = p.Character:FindFirstChild("HumanoidRootPart")
+            if hrp then targetPart = hrp end
+        end
+    else
+        local closestDist = config.targetRadius
+        for _, p in ipairs(Players:GetPlayers()) do
+            if p ~= Me and p.Character then
+                local hrp = p.Character:FindFirstChild("HumanoidRootPart")
+                if hrp then
+                    local dist = (root.Position - hrp.Position).Magnitude
+                    if dist < closestDist then
+                        closestDist = dist
+                        targetPart = hrp
+                    end
+                end
+            end
+        end
+    end
+
+    local isEven = (math.floor(tick()) % 2 == 0)
+    local curRadius = isEven and config.radiusA or config.radiusB
+    local curHeight = isEven and config.heightA or config.heightB
+    local baseSpeed = config.baseSpeedMultiplier
+    local totalItems = math.max(#itemsInRing, 1)
+
+    for i = #itemsInRing, 1, -1 do
+        local item = itemsInRing[i]
+        if item and item.Parent and not item.Anchored then
+            local bp = item:FindFirstChild("OrbitBP")
+            if not bp then
+                bp = Instance.new("BodyPosition", item)
+                bp.Name = "OrbitBP"
+                bp.MaxForce = Vector3.new(math.huge, math.huge, math.huge)
+                bp.P = 1e10
+                bp.D = 500
+            end
+            item.CanCollide = false
+            item.Velocity = Vector3.zero
+            item.RotVelocity = Vector3.zero
+            local itemSpeed = baseSpeed + ((i % 10) * 0.5)
+            local angle = (tick() * itemSpeed) + (i * (math.pi * 2 / totalItems))
+            bp.Position = targetPart.Position + Vector3.new(
+                math.cos(angle) * curRadius,
+                curHeight,
+                math.sin(angle) * curRadius
+            )
+        else
+            if itemsInRingLookup[item] then itemsInRingLookup[item] = nil end
+            table.remove(itemsInRing, i)
+        end
+    end
+end)
+
+UIS.InputBegan:Connect(function(input, gpe)
+    if gpe then return end
+    if input.KeyCode == Enum.KeyCode.RightShift then
+        OrbitState = 0
+        LockedPosition = nil
+        RingToggle.Text = "Ring: OFF"
+        RingToggle.BackgroundColor3 = RED
+        for _, v in pairs(itemsInRing) do
+            if v and v.Parent then
+                local bp = v:FindFirstChild("OrbitBP")
+                if bp then bp:Destroy() end
+            end
+        end
+        itemsInRing = {}
+        itemsInRingLookup = {}
+        setStatus("Emergency ring off", AMBER)
+    end
+end)
+
+-- ============================================================
 -- BOOT
-FlingFunctions.startDamageGuard()
+-- ============================================================
+refreshPlayers()
+showTab("Players")
 updateWindow()
-FlingFunctions.refreshPlayers()
-FlingFunctions.setStatus("Ready · " .. FlingFunctions.getCurrentFlingLabel() .. " · " .. FlingFunctions.getCurrentTargetLabel(), MUTED,
-    string.format("Predict: %.0f ms  ·  Press FLING", PREDICTION_TIME * 1000))
-print("Fling v23.7 + Super Ring (ownership mode) loaded")
+setStatus("Ready · press Ring to start", MUTED,
+    "Right Shift = emergency off · player list = ring target")
+print("[GR33D EXPLOIT] loaded")
