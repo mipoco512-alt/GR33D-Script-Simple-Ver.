@@ -1,12 +1,9 @@
 --[[
-    PLAYER FLING v23.4m — LEFT ARM LOCK + MOBILE HUD SAFE ZONE
-    HUD changes in this build (logic otherwise identical to v23.4):
-      • PANEL_W 510 → 420 (portrait-first default)
-      • updateWindow: fixed-band HUD reservations instead of 0.17/0.16 of
-        viewport height; width capped by height so the panel stays portrait
-        when the screen is short.
-      • compact threshold 480 → 500.
-      • Drag bounds matched to new reserves.
+    PLAYER FLING v23.4k
+    • Original v23.4 tabbed UI retained
+    • Fling rotation = KILASIK's FPos/SFBasePart pattern
+    • Target Part selector: Original (HRP→Head→Handle) or LeftUpperArm
+    • Landscape mobile: reduced HUD reserves so panel fills height
 ]]
 
 local Players    = game:GetService("Players")
@@ -26,7 +23,7 @@ local CONFIG = {
     LandingSettleFrames = 10,
     AngleStep     = 100,
     KickSpeed     = 9e7,
-    KickYSpeed    = 6e8,
+    KickYSpeed    = 9e7 * 10,
     KickRot       = 9e8,
     Cooldown      = 0.15,
     FlingDetectSpeed  = 400,
@@ -64,10 +61,19 @@ local HRP_BURST = {
     SampleAfter      = 0.30,
 }
 
-local KICK_PART_ORDER = {
-    "LeftLowerArm", "LeftUpperArm", "LeftHand", "Left Arm",
+-- Only two target options
+local TARGET_PART_OPTIONS = {
+    {id = "original",      label = "Original (HRP→Head→Handle)"},
+    {id = "LeftUpperArm",  label = "LeftUpperArm"},
 }
-local BURST_PART_ROTATION = KICK_PART_ORDER
+local currentTargetPartId = "original"
+
+local function getCurrentTargetLabel()
+    for _, o in ipairs(TARGET_PART_OPTIONS) do
+        if o.id == currentTargetPartId then return o.label end
+    end
+    return "Original"
+end
 
 do
     local ok, ping = pcall(function()
@@ -88,41 +94,25 @@ if type(getgenv) == "function" then
 end
 globalEnv.FPDH = workspace.FallenPartsDestroyHeight
 
-local returnSnapshot  = nil
-local lastGrounded    = nil
-local lastSafeReturn  = nil
-local returning       = false
-local FlingActive     = false
-local selfFlinging    = false
-local followActive    = false
-local followTarget    = nil
+local returnSnapshot, lastGrounded, lastSafeReturn = nil, nil, nil
+local returning, FlingActive, selfFlinging = false, false, false
+local followActive, followTarget = false, nil
 local connections, rows = {}, {}
 local SelectedTargets = {}
 local minimized, maximized = false, false
-local currentTarget   = nil
+local currentTarget = nil
 local startFling
 
-local noclipActive     = false
-local speedActive      = false
-local savedWalkSpeed   = nil
+local noclipActive, speedActive, savedWalkSpeed = false, false, nil
 local originalAnchored = {}
 local noclipOriginalCollision = {}
 
-local grabActive     = false
-local grabbedPart    = nil
-local grabbedAnchor  = nil
+local grabActive, grabbedPart, grabbedAnchor = false, nil, nil
+local aimActive, currentAimTarget, followEnabled = false, nil, false
 
-local aimActive      = false
-local currentAimTarget = nil
-local followEnabled  = false
-
-local guardFF          = nil
-local guardVelConn     = nil
-local guardHealthConn  = nil
+local guardFF, guardVelConn, guardHealthConn = nil, nil, nil
 local guardAnchoredSelf = false
-
-local freezeActive  = {}
-local freezeThreads = {}
+local freezeActive, freezeThreads = {}, {}
 
 local BG      = Color3.fromRGB(19, 23, 35)
 local PANEL   = Color3.fromRGB(30, 37, 53)
@@ -157,7 +147,7 @@ local function label(t, s, pos, dim, parent)
 end
 
 --====================================
--- PASSIVE CONTACT DIAGNOSTICS
+-- HIT DEBUG
 --====================================
 local HitDebug = {}
 do
@@ -190,39 +180,35 @@ end
 local function hitVec(v) return string.format("(%.1f, %.1f, %.1f)", v.X, v.Y, v.Z) end
 local function hitEvidence(record)
     local e = {}
-    if record.touched then table.insert(e, "Touched event") end
-    if record.overlap then table.insert(e, "spatial overlap") end
-    if record.response then table.insert(e, "HRP motion response") end
+    if record.touched then table.insert(e, "Touched") end
+    if record.overlap then table.insert(e, "overlap") end
+    if record.response then table.insert(e, "motion") end
     return #e > 0 and table.concat(e, " + ") or "unverified"
 end
 local function hitStatus(record)
     if not record then return "No observations yet" end
-    if record.response then return "Overlap/touch + correlated motion (LOCAL)" end
-    if record.touched then return "Touched event (LOCAL, not server-verified)" end
-    return "Spatial overlap only (NOT a confirmed hit)"
+    if record.response then return "Overlap/touch + motion (LOCAL)" end
+    if record.touched then return "Touched event (LOCAL)" end
+    return "Spatial overlap only"
 end
 local function renderHitInfo()
     if not HitDebug.summary or not HitDebug.summary.Parent then return end
     local newest = hitObservations[1]
     if not newest then
-        HitDebug.summary.Text = "No " .. (HitDebug.focus == "Both" and "arm/leg" or (HitDebug.focus == "LeftArm" and "left-arm" or HitDebug.focus:lower())) .. " contact observed."
-        HitDebug.details.Text = "Head and accessories are ignored.\nTracking: LEFT ARM locked; filter controls display only."
-        HitDebug.log.Text = "The most recent 32 observations appear here."
+        HitDebug.summary.Text = "No contact observed"
+        HitDebug.details.Text = "Tracking filter: " .. HitDebug.focus
+        HitDebug.log.Text = "Recent 32 observations appear here."
         return
     end
-    HitDebug.summary.Text = string.format("@%s  •  %s  •  %s", newest.target,
-        newest.partName, newest.zone)
-    HitDebug.details.Text = string.format(
-        "Aimed at: %s\nApprox. point: %s\nEvidence: %s\nCollision eligible: %s  |  Try %s",
-        newest.aimedPart or "unknown", hitVec(newest.point), hitStatus(newest),
-        newest.collidable and "Yes" or "No/unknown", tostring(newest.attempt))
+    HitDebug.summary.Text = string.format("@%s  •  %s  •  %s", newest.target, newest.partName, newest.zone)
+    HitDebug.details.Text = string.format("Aimed: %s\nPoint: %s\nEvidence: %s\nCollidable: %s | Try %s",
+        newest.aimedPart or "?", hitVec(newest.point), hitStatus(newest),
+        newest.collidable and "Yes" or "No", tostring(newest.attempt))
     local lines = {}
     for i, event in ipairs(hitObservations) do
-        lines[#lines + 1] = string.format(
-            "%02d  @%s  [try %s]\n       Aim: %s\n       Observed: %s | %s\n       %s  •  %s\n       %s",
-            i, event.target, tostring(event.attempt), event.aimedPart or "unknown",
-            event.partName, event.zone, hitEvidence(event), hitVec(event.point),
-            event.collidable and "Collidable locally" or "Overlap / collision unverified")
+        lines[#lines + 1] = string.format("%02d @%s [try %s] Aim=%s Observed=%s | %s | %s",
+            i, event.target, tostring(event.attempt), event.aimedPart or "?",
+            event.partName, event.zone, hitEvidence(event))
     end
     HitDebug.log.Text = table.concat(lines, "\n\n")
 end
@@ -230,15 +216,9 @@ local hitRenderQueued = false
 local function queueHitRender()
     if hitRenderQueued then return end
     hitRenderQueued = true
-    task.defer(function()
-        hitRenderQueued = false
-        renderHitInfo()
-    end)
+    task.defer(function() hitRenderQueued = false; renderHitInfo() end)
 end
-local function clearHitInfo()
-    table.clear(hitObservations)
-    renderHitInfo()
-end
+local function clearHitInfo() table.clear(hitObservations); renderHitInfo() end
 local function approximateHitZone(part, myRoot)
     local approx = part.Position
     pcall(function() approx = part:GetClosestPointOnSurface(myRoot.Position) end)
@@ -272,9 +252,7 @@ local function hitPartLabel(part, character)
     return part.Name
 end
 local function recordHitObservation(monitor, part, myRoot, observationKind)
-    if not monitor or not myRoot or not HitDebug.acceptsPart(part, monitor.targetCharacter) then
-        return nil
-    end
+    if not monitor or not myRoot or not HitDebug.acceptsPart(part, monitor.targetCharacter) then return nil end
     local now = os.clock()
     monitor.hitRecords = monitor.hitRecords or {}
     local record = monitor.hitRecords[part]
@@ -287,8 +265,7 @@ local function recordHitObservation(monitor, part, myRoot, observationKind)
             aimedPart = monitor.aimedPartName or "unknown",
             zone = zone, point = point, attempt = monitor.attempt or "?",
             collidable = arePartsCollisionEligible(myRoot, part),
-            overlap = false, touched = false, response = false,
-            timestamp = now,
+            overlap = false, touched = false, response = false, timestamp = now,
         }
         monitor.hitRecords[part] = record
         table.insert(hitObservations, 1, record)
@@ -317,12 +294,10 @@ local function flagMotionResponse(monitor)
     if monitor.lastTouchedAt and now - monitor.lastTouchedAt <= 0.4 then
         preferred = monitor.lastTouchedRecord
     end
-    if not preferred and monitor.lastEligibleRecord
-        and now - monitor.lastEligibleRecord.timestamp <= 0.4 then
+    if not preferred and monitor.lastEligibleRecord and now - monitor.lastEligibleRecord.timestamp <= 0.4 then
         preferred = monitor.lastEligibleRecord
     end
-    if not preferred and monitor.lastObservedRecord
-        and now - monitor.lastObservedRecord.timestamp <= 0.4 then
+    if not preferred and monitor.lastObservedRecord and now - monitor.lastObservedRecord.timestamp <= 0.4 then
         preferred = monitor.lastObservedRecord
     end
     if preferred and not preferred.response then
@@ -353,8 +328,7 @@ local Gui = make("ScreenGui", {
     IgnoreGuiInset = true, ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
 }, PlayerGui)
 
--- HUD CHANGE: narrower default width (was 510). Portrait-first.
-local PANEL_W = 420
+local PANEL_W = 510
 local PANEL_H = 760
 
 local Main = make("Frame", {
@@ -377,10 +351,10 @@ make("Frame", {
     BackgroundColor3 = ACCENT, BorderSizePixel = 0,
 }, Header)
 
-local Title = label("FLING  ·  v23.4m", 15,
+local Title = label("FLING  ·  v23.4k", 15,
     UDim2.fromOffset(20, 10), UDim2.new(1, -180, 0, 20), Header)
 Title.Font = Enum.Font.GothamBold
-local SubTitle = label("Mobile HUD-safe panel  ·  Contact diagnostics", 10,
+local SubTitle = label("KILASIK rotation  ·  Target part selector", 10,
     UDim2.fromOffset(20, 30), UDim2.new(1, -180, 0, 14), Header)
 SubTitle.TextColor3 = MUTED
 
@@ -421,8 +395,7 @@ local function sectionLabel(text, yAnchor, yOffset)
         Size = UDim2.fromOffset(3, 8),
         BackgroundColor3 = ACCENT, BorderSizePixel = 0,
     }, s)
-    local t = label(text, 10,
-        UDim2.fromOffset(10, 0), UDim2.new(1, -10, 1, 0), s)
+    local t = label(text, 10, UDim2.fromOffset(10, 0), UDim2.new(1, -10, 1, 0), s)
     t.Font = Enum.Font.GothamBold
     t.TextColor3 = MUTED
     table.insert(sectionFrames, s)
@@ -430,7 +403,6 @@ local function sectionLabel(text, yAnchor, yOffset)
 end
 
 sectionLabel("COMMAND", 0, 8)
-
 local CmdBar = make("TextBox", {
     Position = UDim2.fromOffset(14, 26),
     Size = UDim2.new(1, -28, 0, 38),
@@ -445,7 +417,6 @@ round(CmdBar, 10)
 make("UIPadding", { PaddingLeft = UDim.new(0, 10) }, CmdBar)
 
 sectionLabel("PLAYERS", 0, 78)
-
 local Search = make("TextBox", {
     Position = UDim2.fromOffset(14, 96),
     Size = UDim2.new(1, -28, 0, 36),
@@ -469,8 +440,7 @@ local List = make("ScrollingFrame", {
     CanvasSize = UDim2.fromOffset(0, 0),
     AutomaticCanvasSize = Enum.AutomaticSize.None,
     ScrollingDirection = Enum.ScrollingDirection.Y,
-    ScrollingEnabled = true,
-    ClipsDescendants = true,
+    ScrollingEnabled = true, ClipsDescendants = true,
 }, Content)
 round(List, 10)
 make("UIPadding", {
@@ -491,16 +461,11 @@ local StatusPanel = make("Frame", {
 }, Content)
 round(StatusPanel, 10)
 make("UIStroke", { Color = Color3.fromRGB(48, 56, 76), Thickness = 1 }, StatusPanel)
-
-local Status = label("Ready", 12,
-    UDim2.fromOffset(12, 8), UDim2.new(1, -24, 0, 18), StatusPanel)
+local Status = label("Ready", 12, UDim2.fromOffset(12, 8), UDim2.new(1, -24, 0, 18), StatusPanel)
 Status.TextColor3 = WHITE
 Status.Font = Enum.Font.GothamMedium
-
-local StatusSub = label("Select a target, then press FLING", 10,
-    UDim2.fromOffset(12, 26), UDim2.new(1, -24, 0, 14), StatusPanel)
+local StatusSub = label("Select a target, then press FLING", 10, UDim2.fromOffset(12, 26), UDim2.new(1, -24, 0, 14), StatusPanel)
 StatusSub.TextColor3 = MUTED
-
 local function setStatus(main, color, sub)
     Status.Text = main
     Status.TextColor3 = color or WHITE
@@ -514,111 +479,159 @@ local function makeActionBtn(text, xOffset, yOffset, w, h, color)
         Text = text, Font = Enum.Font.GothamBold, TextSize = 11,
         TextColor3 = WHITE, BackgroundColor3 = color,
         Position = UDim2.new(0, xOffset, 1, yOffset),
-        Size = UDim2.fromOffset(w, h),
-        AutoButtonColor = false,
+        Size = UDim2.fromOffset(w, h), AutoButtonColor = false,
     }, Content)
     round(b, 8)
-    b.MouseEnter:Connect(function()
-        b.BackgroundColor3 = color:Lerp(Color3.new(1,1,1), 0.15)
-    end)
-    b.MouseLeave:Connect(function()
-        b.BackgroundColor3 = color
-    end)
+    b.MouseEnter:Connect(function() b.BackgroundColor3 = color:Lerp(Color3.new(1,1,1), 0.15) end)
+    b.MouseLeave:Connect(function() b.BackgroundColor3 = color end)
     return b
 end
 
-local row1_y = -344
-local row1_h = 36
-local row1_w = 62
-local row1_gap = 6
-local row1_start = 14
+local row1_y, row1_h, row1_w, row1_gap, row1_start = -344, 36, 62, 6, 14
+local TPButton       = makeActionBtn("TP",       row1_start,                       row1_y, row1_w, row1_h, PURPLE)
+local BringButton    = makeActionBtn("Bring",    row1_start + (row1_w+row1_gap)*1,  row1_y, row1_w, row1_h, PURPLE)
+local FreezeButton   = makeActionBtn("Freeze",   row1_start + (row1_w+row1_gap)*2,  row1_y, row1_w, row1_h, PURPLE)
+local UnfreezeButton = makeActionBtn("Unfreeze", row1_start + (row1_w+row1_gap)*3,  row1_y, row1_w, row1_h, CYAN)
+local AnchorButton   = makeActionBtn("Anchor",   row1_start + (row1_w+row1_gap)*4,  row1_y, row1_w, row1_h, PURPLE)
+local UnanchorButton = makeActionBtn("Unanchor", row1_start + (row1_w+row1_gap)*5,  row1_y, row1_w, row1_h, PURPLE)
 
-local TPButton       = makeActionBtn("TP",       row1_start,                            row1_y, row1_w, row1_h, PURPLE)
-local BringButton    = makeActionBtn("Bring",    row1_start + (row1_w+row1_gap)*1,       row1_y, row1_w, row1_h, PURPLE)
-local FreezeButton   = makeActionBtn("Freeze",   row1_start + (row1_w+row1_gap)*2,       row1_y, row1_w, row1_h, PURPLE)
-local UnfreezeButton = makeActionBtn("Unfreeze", row1_start + (row1_w+row1_gap)*3,       row1_y, row1_w, row1_h, CYAN)
-local AnchorButton   = makeActionBtn("Anchor",   row1_start + (row1_w+row1_gap)*4,       row1_y, row1_w, row1_h, PURPLE)
-local UnanchorButton = makeActionBtn("Unanchor", row1_start + (row1_w+row1_gap)*5,       row1_y, row1_w, row1_h, PURPLE)
+local row2_y, row2_h, row2_w, row2_gap = -300, 36, 124, 8
+local AimbotButton = makeActionBtn("Aimbot: OFF", 14,                        row2_y, row2_w, row2_h, ROW)
+local FollowButton = makeActionBtn("Follow: OFF", 14 + (row2_w+row2_gap)*1,  row2_y, row2_w, row2_h, ROW)
+local NoclipButton = makeActionBtn("Noclip: OFF", 14 + (row2_w+row2_gap)*2,  row2_y, row2_w, row2_h, ROW)
 
-local row2_y = -300
-local row2_h = 36
-local row2_w = 124
-local row2_gap = 8
-
-local AimbotButton   = makeActionBtn("Aimbot: OFF",  14,                            row2_y, row2_w, row2_h, ROW)
-local FollowButton   = makeActionBtn("Follow: OFF",  14 + (row2_w+row2_gap)*1,      row2_y, row2_w, row2_h, ROW)
-local NoclipButton   = makeActionBtn("Noclip: OFF",  14 + (row2_w+row2_gap)*2,      row2_y, row2_w, row2_h, ROW)
-
-local row3_y = -256
-local row3_h = 36
-local row3_w = 124
-local row3_gap = 8
-
-local SpeedButton      = makeActionBtn("Speed: OFF",    14,                            row3_y, row3_w, row3_h, ROW)
-local GrabObjectButton = makeActionBtn("Grab Obj: OFF", 14 + (row3_w+row3_gap)*1,      row3_y, row3_w, row3_h, ROW)
-local RescueButton     = makeActionBtn("RESCUE ME",     14 + (row3_w+row3_gap)*2,      row3_y, row3_w, row3_h, AMBER)
+local row3_y, row3_h, row3_w, row3_gap = -256, 36, 124, 8
+local SpeedButton      = makeActionBtn("Speed: OFF",    14,                       row3_y, row3_w, row3_h, ROW)
+local GrabObjectButton = makeActionBtn("Grab Obj: OFF", 14 + (row3_w+row3_gap)*1, row3_y, row3_w, row3_h, ROW)
+local RescueButton     = makeActionBtn("RESCUE ME",     14 + (row3_w+row3_gap)*2, row3_y, row3_w, row3_h, AMBER)
 
 local row4_y = -212
-local fovLabel = label("Aim FOV", 11,
-    UDim2.new(0, 14, 1, row4_y), UDim2.fromOffset(60, 36), Content)
+local fovLabel = label("Aim FOV", 11, UDim2.new(0, 14, 1, row4_y), UDim2.fromOffset(60, 36), Content)
 fovLabel.TextColor3 = MUTED
 fovLabel.TextYAlignment = Enum.TextYAlignment.Center
-
 local FovBox = make("TextBox", {
-    Position = UDim2.new(0, 78, 1, row4_y),
-    Size = UDim2.fromOffset(80, 36),
+    Position = UDim2.new(0, 78, 1, row4_y), Size = UDim2.fromOffset(80, 36),
     Text = tostring(CONFIG.AimFOV),
     ClearTextOnFocus = false, TextColor3 = WHITE,
     TextSize = 13, Font = Enum.Font.GothamBold,
-    BackgroundColor3 = PANEL,
-    TextXAlignment = Enum.TextXAlignment.Center,
+    BackgroundColor3 = PANEL, TextXAlignment = Enum.TextXAlignment.Center,
 }, Content)
 round(FovBox, 8)
-
-local smoothLabel = label("Smooth", 11,
-    UDim2.new(0, 168, 1, row4_y), UDim2.fromOffset(60, 36), Content)
+local smoothLabel = label("Smooth", 11, UDim2.new(0, 168, 1, row4_y), UDim2.fromOffset(60, 36), Content)
 smoothLabel.TextColor3 = MUTED
 smoothLabel.TextYAlignment = Enum.TextYAlignment.Center
-
 local SmoothBox = make("TextBox", {
-    Position = UDim2.new(0, 232, 1, row4_y),
-    Size = UDim2.fromOffset(80, 36),
+    Position = UDim2.new(0, 232, 1, row4_y), Size = UDim2.fromOffset(80, 36),
     Text = tostring(CONFIG.AimSmooth),
     ClearTextOnFocus = false, TextColor3 = WHITE,
     TextSize = 13, Font = Enum.Font.GothamBold,
-    BackgroundColor3 = PANEL,
-    TextXAlignment = Enum.TextXAlignment.Center,
+    BackgroundColor3 = PANEL, TextXAlignment = Enum.TextXAlignment.Center,
 }, Content)
 round(SmoothBox, 8)
-
 FovBox.FocusLost:Connect(function()
     local n = tonumber(FovBox.Text)
-    if n and n > 0 then CONFIG.AimFOV = n
-    else FovBox.Text = tostring(CONFIG.AimFOV) end
+    if n and n > 0 then CONFIG.AimFOV = n else FovBox.Text = tostring(CONFIG.AimFOV) end
 end)
-
 SmoothBox.FocusLost:Connect(function()
     local n = tonumber(SmoothBox.Text)
-    if n and n >= 1 then CONFIG.AimSmooth = n
-    else SmoothBox.Text = tostring(CONFIG.AimSmooth) end
+    if n and n >= 1 then CONFIG.AimSmooth = n else SmoothBox.Text = tostring(CONFIG.AimSmooth) end
 end)
 
 sectionLabel("SELECTION", 1, -190)
+local sel_y, sel_h, sel_w, sel_gap = -168, 34, 124, 8
+local SelectAll     = makeActionBtn("ALL",  14,                     sel_y, sel_w, sel_h, ROW)
+local DeselectAll   = makeActionBtn("NONE", 14 + (sel_w+sel_gap)*1, sel_y, sel_w, sel_h, ROW)
+local InspectButton = makeActionBtn("SCAN", 14 + (sel_w+sel_gap)*2, sel_y, sel_w, sel_h, ACCENTD)
 
-local sel_y = -168
-local sel_h = 34
-local sel_w = 124
-local sel_gap = 8
+-- Target Part selector block (goes to Actions tab)
+local TargetPartHeading = label("TARGET PART", 11,
+    UDim2.fromOffset(14, 0), UDim2.new(1, -28, 0, 16), Content)
+TargetPartHeading.Font = Enum.Font.GothamBold
+TargetPartHeading.TextColor3 = MUTED
 
-local SelectAll     = makeActionBtn("ALL",        14,                             sel_y, sel_w, sel_h, ROW)
-local DeselectAll   = makeActionBtn("NONE",       14 + (sel_w+sel_gap)*1,         sel_y, sel_w, sel_h, ROW)
-local InspectButton = makeActionBtn("SCAN",       14 + (sel_w+sel_gap)*2,         sel_y, sel_w, sel_h, ACCENTD)
+local TargetPartButton = make("TextButton", {
+    Text = "Target: " .. getCurrentTargetLabel() .. "  ▼",
+    Font = Enum.Font.GothamBold, TextSize = 12,
+    TextColor3 = WHITE,
+    BackgroundColor3 = Color3.fromRGB(45, 55, 75),
+    TextXAlignment = Enum.TextXAlignment.Left,
+    AutoButtonColor = false,
+    Size = UDim2.new(1, -28, 0, 36),
+    Position = UDim2.fromOffset(14, 22),
+}, Content)
+round(TargetPartButton, 8)
+make("UIPadding", { PaddingLeft = UDim.new(0, 10) }, TargetPartButton)
+TargetPartButton.MouseEnter:Connect(function()
+    TargetPartButton.BackgroundColor3 = Color3.fromRGB(58, 70, 95)
+end)
+TargetPartButton.MouseLeave:Connect(function()
+    TargetPartButton.BackgroundColor3 = Color3.fromRGB(45, 55, 75)
+end)
+
+local TargetPartDropdown = make("ScrollingFrame", {
+    Position = UDim2.fromOffset(14, 62),
+    Size = UDim2.new(1, -28, 0, 100),
+    BackgroundColor3 = Color3.fromRGB(26, 32, 46),
+    BorderSizePixel = 0,
+    Visible = false,
+    ScrollBarThickness = 4,
+    ScrollBarImageColor3 = ACCENT,
+    CanvasSize = UDim2.fromOffset(0, 0),
+    AutomaticCanvasSize = Enum.AutomaticSize.Y,
+    ZIndex = 6,
+}, Content)
+round(TargetPartDropdown, 8)
+make("UIPadding", {
+    PaddingTop = UDim.new(0, 4), PaddingBottom = UDim.new(0, 4),
+    PaddingLeft = UDim.new(0, 4), PaddingRight = UDim.new(0, 4),
+}, TargetPartDropdown)
+make("UIStroke", { Color = ACCENT, Thickness = 1 }, TargetPartDropdown)
+make("UIListLayout", {
+    SortOrder = Enum.SortOrder.LayoutOrder, Padding = UDim.new(0, 3),
+}, TargetPartDropdown)
+
+local tpButtons = {}
+for i, opt in ipairs(TARGET_PART_OPTIONS) do
+    local selected = (opt.id == currentTargetPartId)
+    local b = make("TextButton", {
+        Text = opt.label, Font = Enum.Font.Gotham, TextSize = 12,
+        TextColor3 = WHITE,
+        BackgroundColor3 = selected and ACCENTD or ROW,
+        TextXAlignment = Enum.TextXAlignment.Left,
+        AutoButtonColor = false,
+        LayoutOrder = i,
+        Size = UDim2.new(1, 0, 0, 28),
+        ZIndex = 7,
+    }, TargetPartDropdown)
+    round(b, 6)
+    make("UIPadding", { PaddingLeft = UDim.new(0, 10) }, b)
+    tpButtons[opt.id] = b
+
+    b.MouseEnter:Connect(function()
+        if opt.id ~= currentTargetPartId then b.BackgroundColor3 = ROWHI end
+    end)
+    b.MouseLeave:Connect(function()
+        if opt.id ~= currentTargetPartId then b.BackgroundColor3 = ROW end
+    end)
+    b.MouseButton1Click:Connect(function()
+        currentTargetPartId = opt.id
+        TargetPartButton.Text = "Target: " .. opt.label .. "  ▼"
+        TargetPartDropdown.Visible = false
+        for id, btn in pairs(tpButtons) do
+            btn.BackgroundColor3 = (id == opt.id) and ACCENTD or ROW
+        end
+        setStatus("Target part: " .. opt.label, CYAN, "Applies on next fling attempt")
+    end)
+end
+
+TargetPartButton.MouseButton1Click:Connect(function()
+    TargetPartDropdown.Visible = not TargetPartDropdown.Visible
+end)
 
 local FlingButton = make("TextButton", {
     Text = "▶  FLING", Font = Enum.Font.GothamBold, TextSize = 15,
     TextColor3 = WHITE, BackgroundColor3 = GREEN,
-    Position = UDim2.new(0, 14, 1, -84),
-    Size = UDim2.new(0.5, -18, 0, 48),
+    Position = UDim2.new(0, 14, 1, -84), Size = UDim2.new(0.5, -18, 0, 48),
     AutoButtonColor = false,
 }, Content)
 round(FlingButton, 12)
@@ -628,8 +641,7 @@ FlingButton.MouseLeave:Connect(function() FlingButton.BackgroundColor3 = GREEN e
 local Stop = make("TextButton", {
     Text = "■  STOP", Font = Enum.Font.GothamBold, TextSize = 15,
     TextColor3 = WHITE, BackgroundColor3 = RED,
-    Position = UDim2.new(0.5, 4, 1, -84),
-    Size = UDim2.new(0.5, -18, 0, 48),
+    Position = UDim2.new(0.5, 4, 1, -84), Size = UDim2.new(0.5, -18, 0, 48),
     AutoButtonColor = false,
 }, Content)
 round(Stop, 12)
@@ -643,15 +655,13 @@ local InspectOverlay = make("Frame", {
 }, Main)
 round(InspectOverlay, 12)
 make("UIStroke", {Color = ACCENT, Thickness = 1.5}, InspectOverlay)
-local InspectTitle = label("SCAN RESULTS", 13,
-    UDim2.fromOffset(16, 12), UDim2.new(1, -70, 0, 24), InspectOverlay)
+local InspectTitle = label("SCAN RESULTS", 13, UDim2.fromOffset(16, 12), UDim2.new(1, -70, 0, 24), InspectOverlay)
 InspectTitle.Font = Enum.Font.GothamBold
 InspectTitle.ZIndex = 22
 local InspectClose = make("TextButton", {
     Text = "✕", Font = Enum.Font.GothamBold, TextSize = 14,
     BackgroundColor3 = RED, TextColor3 = WHITE,
-    Position = UDim2.new(1, -44, 0, 12), Size = UDim2.fromOffset(32, 30),
-    ZIndex = 22,
+    Position = UDim2.new(1, -44, 0, 12), Size = UDim2.fromOffset(32, 30), ZIndex = 22,
 }, InspectOverlay)
 round(InspectClose, 8)
 local InspectScroll = make("ScrollingFrame", {
@@ -668,8 +678,7 @@ local InspectText = make("TextLabel", {
     TextColor3 = WHITE, TextXAlignment = Enum.TextXAlignment.Left,
     TextYAlignment = Enum.TextYAlignment.Top, TextWrapped = true,
     Font = Enum.Font.Code, TextSize = 11,
-    Text = "Type /scan, /scanenv, or /scanall to view.",
-    ZIndex = 22,
+    Text = "Type /scan, /scanenv, or /scanall to view.", ZIndex = 22,
 }, InspectScroll)
 InspectClose.MouseButton1Click:Connect(function() InspectOverlay.Visible = false end)
 
@@ -679,7 +688,6 @@ local Navigation = make("Frame", {
     Name = "Tabs", Position = UDim2.fromOffset(12, 8),
     Size = UDim2.new(1, -24, 0, 44), BackgroundTransparency = 1,
 }, Content)
-
 local PageHost = make("Frame", {
     Name = "Pages", Position = UDim2.fromOffset(12, 60),
     Size = UDim2.new(1, -24, 1, -200),
@@ -712,7 +720,8 @@ for _, obj in ipairs({sectionFrames[1], CmdBar, sectionFrames[2], Search,
     obj.Parent = PlayerPage
 end
 for _, obj in ipairs({sectionFrames[3], TPButton, BringButton,
-    FreezeButton, UnfreezeButton, AnchorButton, UnanchorButton}) do
+    FreezeButton, UnfreezeButton, AnchorButton, UnanchorButton,
+    TargetPartHeading, TargetPartButton, TargetPartDropdown}) do
     obj.Parent = ActionPage
 end
 for _, obj in ipairs({AimbotButton, FollowButton, NoclipButton,
@@ -724,31 +733,25 @@ for _, obj in ipairs({StatusPanel, FlingButton, Stop}) do
     obj.Parent = Footer
 end
 
-local UtilityTitle = label("MOVEMENT & UTILITIES", 12,
-    UDim2.fromOffset(10, 16), UDim2.fromOffset(300, 20), UtilityPage)
+local UtilityTitle = label("MOVEMENT & UTILITIES", 12, UDim2.fromOffset(10, 16), UDim2.fromOffset(300, 20), UtilityPage)
 UtilityTitle.Font = Enum.Font.GothamBold
 UtilityTitle.TextColor3 = MUTED
-local ActionsHint = label("Actions use the selected player on the Players tab.", 11,
-    UDim2.fromOffset(10, 245), UDim2.new(1, -20, 0, 34), ActionPage)
+local ActionsHint = label("Actions use the selected player on the Players tab.", 11, UDim2.fromOffset(10, 245), UDim2.new(1, -20, 0, 34), ActionPage)
 ActionsHint.TextWrapped = true
 ActionsHint.TextColor3 = MUTED
-local ToolsHint = label("Use the Players tab for /help, /scan, and /testreturn.", 11,
-    UDim2.fromOffset(10, 295), UDim2.new(1, -20, 0, 35), UtilityPage)
+local ToolsHint = label("Use the Players tab for /help, /scan, and /testreturn.", 11, UDim2.fromOffset(10, 295), UDim2.new(1, -20, 0, 35), UtilityPage)
 ToolsHint.TextWrapped = true
 ToolsHint.TextColor3 = MUTED
 
-local HitHeading = label("CONTACT OBSERVATIONS", 12,
-    UDim2.fromOffset(10, 14), UDim2.fromOffset(300, 22), HitPage)
+local HitHeading = label("CONTACT OBSERVATIONS", 12, UDim2.fromOffset(10, 14), UDim2.fromOffset(300, 22), HitPage)
 HitHeading.Font = Enum.Font.GothamBold
 HitHeading.TextColor3 = CYAN
-HitDebug.summary = label("No contact observations yet", 13,
-    UDim2.fromOffset(10, 46), UDim2.new(1, -20, 0, 54), HitPage)
+HitDebug.summary = label("No contact observations yet", 13, UDim2.fromOffset(10, 46), UDim2.new(1, -20, 0, 54), HitPage)
 HitDebug.summary.Font = Enum.Font.GothamBold
 HitDebug.summary.TextWrapped = true
 HitDebug.summary.TextTruncate = Enum.TextTruncate.None
 HitDebug.summary.TextYAlignment = Enum.TextYAlignment.Center
-HitDebug.details = label("Shows body part, local zone, and evidence", 11,
-    UDim2.fromOffset(10, 108), UDim2.new(1, -20, 0, 92), HitPage)
+HitDebug.details = label("Shows body part, local zone, and evidence", 11, UDim2.fromOffset(10, 108), UDim2.new(1, -20, 0, 92), HitPage)
 HitDebug.details.TextWrapped = true
 HitDebug.details.TextTruncate = Enum.TextTruncate.None
 HitDebug.details.TextYAlignment = Enum.TextYAlignment.Top
@@ -770,11 +773,9 @@ round(LimbFocusButton, 8)
 LimbFocusButton.MouseButton1Click:Connect(function()
     local nextMode = {LeftArm = "Arms", Arms = "Legs", Legs = "Both", Both = "LeftArm"}
     HitDebug.focus = nextMode[HitDebug.focus] or "LeftArm"
-    LimbFocusButton.Text = "SHOW: " .. string.upper(
-        HitDebug.focus == "LeftArm" and "LEFT ARM" or HitDebug.focus)
+    LimbFocusButton.Text = "SHOW: " .. string.upper(HitDebug.focus == "LeftArm" and "LEFT ARM" or HitDebug.focus)
     HitDebug.clear()
-    setStatus("Display filter: " .. HitDebug.focus, CYAN,
-        "Tracking is locked to the left arm; this changes the hit log only")
+    setStatus("Display filter: " .. HitDebug.focus, CYAN, "Applies to hit log only")
 end)
 local HitHistory = make("ScrollingFrame", {
     Position = UDim2.fromOffset(10, 252),
@@ -787,8 +788,7 @@ local HitHistory = make("ScrollingFrame", {
 }, HitPage)
 round(HitHistory, 8)
 HitDebug.log = make("TextLabel", {
-    Position = UDim2.fromOffset(10, 10),
-    Size = UDim2.new(1, -25, 0, 0),
+    Position = UDim2.fromOffset(10, 10), Size = UDim2.new(1, -25, 0, 0),
     AutomaticSize = Enum.AutomaticSize.Y,
     BackgroundTransparency = 1, TextColor3 = WHITE,
     TextWrapped = true, TextXAlignment = Enum.TextXAlignment.Left,
@@ -815,14 +815,12 @@ for _, tab in ipairs({"Players", "Actions", "Tools", "Hits"}) do
     local btn = make("TextButton", {
         Name = "Tab" .. tab, Text = tab, TextSize = 13,
         Font = Enum.Font.GothamBold,
-        TextColor3 = WHITE, BackgroundColor3 = ROW,
-        AutoButtonColor = true,
+        TextColor3 = WHITE, BackgroundColor3 = ROW, AutoButtonColor = true,
     }, Navigation)
     round(btn, 8)
     btn.MouseButton1Click:Connect(function() showTab(tab) end)
     tabButtons[tab] = btn
 end
-
 HitDebug.showHits = function() showTab("Hits") end
 
 local function place(obj, x, y, w, h)
@@ -835,7 +833,7 @@ local function reflowContents(panelWidth, panelHeight)
     local innerWidth = panelWidth - 44
     local innerHeight = math.max(1, PageHost.Size.Y.Offset)
     local compact = innerHeight < 350
-    ActionPage.CanvasSize = UDim2.fromOffset(0, 310)
+    ActionPage.CanvasSize = UDim2.fromOffset(0, 510)
     UtilityPage.CanvasSize = UDim2.fromOffset(0, innerWidth < 335 and 365 or 340)
     HitPage.ScrollingEnabled = compact
     HitPage.ScrollBarThickness = compact and 6 or 0
@@ -860,11 +858,8 @@ local function reflowContents(panelWidth, panelHeight)
     local narrow = innerWidth < 335
     local listY = 175
     local listHeight
-    if compact then
-        listHeight = math.max(64, getPlayerListContentHeight())
-    else
-        listHeight = math.max(60, innerHeight - listY - (narrow and 123 or 82))
-    end
+    if compact then listHeight = math.max(64, getPlayerListContentHeight())
+    else listHeight = math.max(60, innerHeight - listY - (narrow and 123 or 82)) end
     local selectionY = listY + listHeight + 10
     place(List, 10, listY, innerWidth, listHeight)
     List.CanvasSize = UDim2.fromOffset(0, getPlayerListContentHeight())
@@ -895,6 +890,9 @@ local function reflowContents(panelWidth, panelHeight)
         btn.TextSize = 13
     end
     place(ActionsHint, 10, 228, innerWidth, 44)
+    place(TargetPartHeading, 10, 280, innerWidth, 18)
+    place(TargetPartButton, 10, 300, innerWidth, 38)
+    place(TargetPartDropdown, 10, 344, innerWidth, 120)
 
     place(UtilityTitle, 10, 14, innerWidth, 22)
     local utilityButtons = {AimbotButton, FollowButton, NoclipButton,
@@ -961,43 +959,31 @@ PlayerRowLayout:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(function
     end)
 end)
 
--- ================================================================
--- HUD CHANGE: mobile-friendly sizing
---   • Fixed-band HUD reservation instead of % of viewport height.
---   • Width capped by height so the panel stays portrait when short.
---   • Portrait vs landscape bands differ.
--- ================================================================
 updateWindow = function()
     local cam = workspace.CurrentCamera
     local vp = cam and cam.ViewportSize or Vector2.new(1024, 768)
     local insetY = 0
     pcall(function()
-        local topLeft = game:GetService("GuiService"):GetGuiInset()
-        insetY = topLeft.Y
+        insetY = game:GetService("GuiService"):GetGuiInset().Y
     end)
     local touch = UIS.TouchEnabled
     local isLandscape = vp.X > vp.Y
 
-    -- Reserve space for the Roblox HUD. Portrait reserves more at bottom
-    -- (jump / joystick), landscape reserves more at the sides.
     local hudTop, hudBottom
-    if touch then
-        if isLandscape then
-            hudTop    = math.max(insetY + 6, math.floor(vp.Y * 0.08))
-            hudBottom = math.max(30,        math.floor(vp.Y * 0.10))
-        else
-            hudTop    = math.max(insetY + 8, math.floor(vp.Y * 0.10))
-            hudBottom = math.max(72,        math.floor(vp.Y * 0.14))
-        end
-        hudTop    = math.min(hudTop,    110)
-        hudBottom = math.min(hudBottom, 170)
-    else
-        hudTop    = math.max(insetY + 8, 14)
+    if not touch then
+        hudTop = math.max(insetY + 8, 14)
         hudBottom = 10
+    elseif isLandscape then
+        hudTop    = math.max(insetY + 4, math.floor(vp.Y * 0.06))
+        hudBottom = math.max(20,        math.floor(vp.Y * 0.06))
+    else
+        hudTop    = math.max(insetY + 8, math.floor(vp.Y * 0.10))
+        hudBottom = math.max(72,        math.floor(vp.Y * 0.14))
     end
+    hudTop    = math.min(hudTop,    110)
+    hudBottom = math.min(hudBottom, 170)
 
     if vp.Y - hudTop - hudBottom < 185 then
-        -- Extra-short: fall back to minimum reserve.
         hudTop    = math.max(insetY + 4, math.floor(vp.Y * 0.06))
         hudBottom = math.max(22,         math.floor(vp.Y * 0.06))
     end
@@ -1007,31 +993,30 @@ updateWindow = function()
     local usableH   = math.max(150, vp.Y - hudTop - hudBottom)
     local h         = minimized and 44 or math.min(maxHeight, usableH)
 
-    -- Portrait aspect cap: keep the panel taller than wide even when the
-    -- viewport is short. This is the key line that prevents wide-and-low.
-    local aspectCap     = maximized and 1.15 or 0.85
+    local aspectCap
+    if maximized then aspectCap = 1.15
+    elseif touch and isLandscape then aspectCap = 1.4
+    else aspectCap = 0.85 end
     local aspectWidth   = math.floor(h * aspectCap)
     local viewportWidth = math.max(250, vp.X - 28)
     local w = math.min(maxWidth, aspectWidth, viewportWidth)
     w = math.max(280, w)
 
-    local compact  = h < 500
-    local headerH  = compact and 38 or 64
-    local tabsH    = compact and 36 or 44
-    local footerH  = compact and 77 or 122
-    local navY     = compact and 4 or 8
-    local hostY    = navY + tabsH + 8
+    local compact = h < 480
+    local headerH = compact and 38 or 64
+    local tabsH   = compact and 36 or 44
+    local footerH = compact and 77 or 122
+    local navY    = compact and 4 or 8
+    local hostY   = navY + tabsH + 8
     local contentH = h - headerH
 
     Main.Position = UDim2.new(0.5, 0, 0, hudTop)
     Main.Size = UDim2.fromOffset(w, h)
     Scale.Scale = 1
-
     Header.Size = UDim2.new(1, 0, 0, headerH)
     Title.Position = UDim2.fromOffset(14, compact and 8 or 10)
     Title.TextSize = compact and 13 or 15
     SubTitle.Visible = not compact
-
     local closeY   = compact and 3 or 12
     local controlH = compact and 30 or 34
     for _, b in ipairs({MinButton, MaxButton, CloseButton}) do
@@ -1040,26 +1025,21 @@ updateWindow = function()
     MinButton.Position   = UDim2.new(1, -(controlH * 3 + 28), 0, closeY)
     MaxButton.Position   = UDim2.new(1, -(controlH * 2 + 20), 0, closeY)
     CloseButton.Position = UDim2.new(1, -(controlH + 12), 0, closeY)
-
     Content.Position = UDim2.fromOffset(0, headerH)
     Content.Size     = UDim2.new(1, 0, 1, -headerH)
     Content.Visible  = not minimized
     if minimized then InspectOverlay.Visible = false end
     MinButton.Text = minimized and "+" or "−"
     MaxButton.Text = maximized and "❐" or "▢"
-
     Navigation.Position = UDim2.fromOffset(12, navY)
     Navigation.Size     = UDim2.new(1, -24, 0, tabsH)
     PageHost.Position   = UDim2.fromOffset(12, hostY)
-    PageHost.Size       = UDim2.new(1, -24, 0,
-        math.max(34, contentH - hostY - footerH - 7))
+    PageHost.Size       = UDim2.new(1, -24, 0, math.max(34, contentH - hostY - footerH - 7))
     Footer.Position     = UDim2.new(0, 12, 1, -(footerH + 4))
     Footer.Size         = UDim2.new(1, -24, 0, footerH)
     InspectOverlay.Position = UDim2.fromOffset(10, headerH + 6)
     InspectOverlay.Size     = UDim2.new(1, -20, 1, -(headerH + 16))
-
     reflowContents(w, h)
-
     if compact then
         for _, btn in pairs(tabButtons) do btn.TextSize = 11 end
         for _, name in ipairs({"Players", "Actions", "Tools", "Hits"}) do
@@ -1079,11 +1059,9 @@ local function loadAvatar(player, image, size)
     image.Image = ""
     task.spawn(function()
         local ok, url = pcall(function()
-            return Players:GetUserThumbnailAsync(
-                player.UserId, Enum.ThumbnailType.HeadShot, size)
+            return Players:GetUserThumbnailAsync(player.UserId, Enum.ThumbnailType.HeadShot, size)
         end)
-        if ok and image.Parent
-           and image:GetAttribute("AvatarUserId") == player.UserId then
+        if ok and image.Parent and image:GetAttribute("AvatarUserId") == player.UserId then
             image.Image = url
         end
     end)
@@ -1092,15 +1070,11 @@ end
 --====================================
 -- DAMAGE GUARD
 --====================================
-local function isGuardActive()
-    return true
-end
-
+local function isGuardActive() return true end
 local function startDamageGuard()
     local ch = Me.Character
     local hum = ch and ch:FindFirstChildOfClass("Humanoid")
     if not ch or not hum then return end
-
     pcall(function()
         if guardFF and guardFF.Parent then guardFF:Destroy() end
         guardFF = Instance.new("ForceField")
@@ -1108,7 +1082,6 @@ local function startDamageGuard()
         guardFF.Visible = false
         guardFF.Parent = ch
     end)
-
     if not guardVelConn then
         guardVelConn = RunService.Stepped:Connect(function()
             local c2 = Me.Character
@@ -1121,10 +1094,8 @@ local function startDamageGuard()
                 end
                 return
             end
-
             local myPos = root.Position
             local underTouchAttack = false
-
             for _, p in ipairs(Players:GetPlayers()) do
                 if p ~= Me and p.Character then
                     local theirRoot = p.Character:FindFirstChild("HumanoidRootPart")
@@ -1138,7 +1109,6 @@ local function startDamageGuard()
                     end
                 end
             end
-
             local weAreBusy = FlingActive or selfFlinging or returning
             if underTouchAttack and not weAreBusy then
                 if not root.Anchored then
@@ -1151,7 +1121,6 @@ local function startDamageGuard()
                     guardAnchoredSelf = false
                 end
             end
-
             if returning or selfFlinging then return end
             pcall(function()
                 local v = root.AssemblyLinearVelocity
@@ -1163,7 +1132,6 @@ local function startDamageGuard()
                     root.RotVelocity = Vector3.zero
                 end
             end)
-
             pcall(function()
                 h2.PlatformStand = false
                 local st = h2:GetState()
@@ -1176,7 +1144,6 @@ local function startDamageGuard()
             end)
         end)
     end
-
     if guardHealthConn then
         pcall(function() guardHealthConn:Disconnect() end)
         guardHealthConn = nil
@@ -1196,7 +1163,6 @@ local function startDamageGuard()
         end
     end)
 end
-
 local function stopDamageGuard()
     if guardVelConn then guardVelConn:Disconnect(); guardVelConn = nil end
     if guardHealthConn then guardHealthConn:Disconnect(); guardHealthConn = nil end
@@ -1207,9 +1173,7 @@ local function stopDamageGuard()
     if guardAnchoredSelf then
         local ch = Me.Character
         local root = ch and ch:FindFirstChild("HumanoidRootPart")
-        if root and root.Parent then
-            pcall(function() root.Anchored = false end)
-        end
+        if root and root.Parent then pcall(function() root.Anchored = false end) end
         guardAnchoredSelf = false
     end
 end
@@ -1230,12 +1194,9 @@ local function zeroCharacterMotion(ch)
         end
     end
 end
-
 local function captureReturn(ch, root, hum)
     if returnSnapshot and returnSnapshot.character == ch
-        and os.clock() - returnSnapshot.time < 180 then
-        return
-    end
+        and os.clock() - returnSnapshot.time < 180 then return end
     local pivot = ch:GetPivot()
     if lastGrounded and lastGrounded.character == ch
         and os.clock() - lastGrounded.time <= 20 then
@@ -1250,13 +1211,11 @@ local function captureReturn(ch, root, hum)
     }
     lastSafeReturn = returnSnapshot
 end
-
 local function recoveryCheckpoint()
     local ch = Me.Character
     if not ch then return nil end
     local root = ch:FindFirstChild("HumanoidRootPart")
-        or (ch:FindFirstChildOfClass("Humanoid")
-            and ch:FindFirstChildOfClass("Humanoid").RootPart)
+        or (ch:FindFirstChildOfClass("Humanoid") and ch:FindFirstChildOfClass("Humanoid").RootPart)
     local hum = ch:FindFirstChildOfClass("Humanoid")
     if not (root and hum and root.Parent and hum.Health > 0) then return nil end
     if returnSnapshot and returnSnapshot.character == ch then return returnSnapshot end
@@ -1272,19 +1231,15 @@ local function recoveryCheckpoint()
     end
     return nil
 end
-
 local function clearOurBodyForce(root)
     if root and root.Parent then
         local f = root:FindFirstChild("PlayerOrbitTemporaryForce")
         if f and f:IsA("BodyVelocity") then f:Destroy() end
     end
 end
-
 local function isBadLandingHit(result)
     if not result or result.Normal.Y < CONFIG.LandingMaxSlope then return true end
-    if result.Material == Enum.Material.Water or result.Material == Enum.Material.CrackedLava then
-        return true
-    end
+    if result.Material == Enum.Material.Water or result.Material == Enum.Material.CrackedLava then return true end
     local part = result.Instance
     if not part then return true end
     local ancestryName = part.Name:lower()
@@ -1294,7 +1249,7 @@ local function isBadLandingHit(result)
         ancestryName = ancestryName .. " " .. ancestor.Name:lower()
         ancestor = ancestor.Parent
     end
-    for _, word in ipairs({"lava", "kill", "damage", "hazard", "acid", "void", "nuke"}) do
+    for _, word in ipairs({"lava","kill","damage","hazard","acid","void","nuke"}) do
         if ancestryName:find(word, 1, true) then return true end
     end
     if part:GetAttribute("Hazard") == true or part:GetAttribute("Kill") == true
@@ -1304,18 +1259,16 @@ local function isBadLandingHit(result)
     end
     return false
 end
-
 local LANDING_OFFSETS = {
-    Vector3.new(0, 0, 0),
-    Vector3.new(3, 0, 0), Vector3.new(-3, 0, 0),
-    Vector3.new(0, 0, 3), Vector3.new(0, 0, -3),
-    Vector3.new(6, 0, 0), Vector3.new(-6, 0, 0),
-    Vector3.new(0, 0, 6), Vector3.new(0, 0, -6),
-    Vector3.new(6, 0, 6), Vector3.new(-6, 0, 6),
-    Vector3.new(6, 0, -6), Vector3.new(-6, 0, -6),
-    Vector3.new(9, 0, 0), Vector3.new(-9, 0, 0),
+    Vector3.new(0,0,0),
+    Vector3.new(3,0,0), Vector3.new(-3,0,0),
+    Vector3.new(0,0,3), Vector3.new(0,0,-3),
+    Vector3.new(6,0,0), Vector3.new(-6,0,0),
+    Vector3.new(0,0,6), Vector3.new(0,0,-6),
+    Vector3.new(6,0,6), Vector3.new(-6,0,6),
+    Vector3.new(6,0,-6), Vector3.new(-6,0,-6),
+    Vector3.new(9,0,0), Vector3.new(-9,0,0),
 }
-
 local function findSafeLanding(saved)
     local ch, root, hum = saved.character, saved.root, saved.humanoid
     local base = saved.pivot.Position
@@ -1324,47 +1277,37 @@ local function findSafeLanding(saved)
     rayParams.FilterDescendantsInstances = {ch}
     rayParams.IgnoreWater = true
     rayParams.RespectCanCollide = true
-
     local overlap = OverlapParams.new()
     overlap.FilterType = Enum.RaycastFilterType.Exclude
     overlap.FilterDescendantsInstances = {ch}
     overlap.RespectCanCollide = true
     overlap.MaxParts = 64
-
     local look = saved.pivot.LookVector
     local flatLook = Vector3.new(look.X, 0, look.Z)
-    if flatLook.Magnitude < 0.01 then flatLook = Vector3.new(0, 0, -1) end
+    if flatLook.Magnitude < 0.01 then flatLook = Vector3.new(0,0,-1) end
     flatLook = flatLook.Unit
-
     local clearance = math.max(3.5, hum.HipHeight + root.Size.Y * 0.5 + CONFIG.LandingClearance)
     for _, offset in ipairs(LANDING_OFFSETS) do
         if offset.Magnitude <= CONFIG.LandingRadius then
             local spot = base + offset
-            local result = workspace:Raycast(
-                spot + Vector3.new(0, 9, 0), Vector3.new(0, -85, 0), rayParams)
+            local result = workspace:Raycast(spot + Vector3.new(0,9,0), Vector3.new(0,-85,0), rayParams)
             if result and not isBadLandingHit(result)
                 and result.Position.Y <= base.Y + 2.5
                 and result.Position.Y >= base.Y - 23 then
                 local p = Vector3.new(spot.X, result.Position.Y + clearance, spot.Z)
                 local size = Vector3.new(3.2, 4, 3.2)
                 local obstructions = workspace:GetPartBoundsInBox(
-                    CFrame.new(p + Vector3.new(0, 0.4, 0)), size, overlap)
+                    CFrame.new(p + Vector3.new(0,0.4,0)), size, overlap)
                 local blocked = false
                 for _, part in ipairs(obstructions) do
-                    if part:IsA("BasePart") and part.CanCollide then
-                        blocked = true
-                        break
-                    end
+                    if part:IsA("BasePart") and part.CanCollide then blocked = true; break end
                 end
-                if not blocked then
-                    return CFrame.lookAt(p, p + flatLook)
-                end
+                if not blocked then return CFrame.lookAt(p, p + flatLook) end
             end
         end
     end
     return nil
 end
-
 local function restoreNoclipForLanding(ch)
     if not noclipActive then return end
     noclipActive = false
@@ -1377,7 +1320,6 @@ local function restoreNoclipForLanding(ch)
     NoclipButton.Text = "Noclip: OFF"
     NoclipButton.BackgroundColor3 = ROW
 end
-
 local function safeReturn(quick)
     if returning or selfFlinging then return false end
     local saved = recoveryCheckpoint()
@@ -1385,13 +1327,11 @@ local function safeReturn(quick)
     local ch, root, hum = saved.character, saved.root, saved.humanoid
     if Me.Character ~= ch or not ch.Parent or not root.Parent
         or not hum.Parent or hum.Health <= 0 then return false end
-
     local landing = findSafeLanding(saved)
     if not landing then
-        warn("[SafeReturn] No verified clear landing near checkpoint; refusing blind teleport")
+        warn("[SafeReturn] No verified clear landing near checkpoint")
         return false
     end
-
     returning = true
     local success = false
     local originalAnchor = saved.rootAnchored
@@ -1403,7 +1343,6 @@ local function safeReturn(quick)
         hum.Sit = false
         hum.PlatformStand = false
         ch:PivotTo(landing)
-
         local holdFrames = quick and 2 or 4
         local settleFrames = quick and 4 or CONFIG.LandingSettleFrames
         for _ = 1, holdFrames do
@@ -1415,7 +1354,6 @@ local function safeReturn(quick)
         if not originalAnchor then
             pcall(function() hum:ChangeState(Enum.HumanoidStateType.GettingUp) end)
         end
-
         local stableFrames = 0
         for _ = 1, settleFrames do
             if Me.Character ~= ch or not root.Parent or hum.Health <= 0 then break end
@@ -1433,11 +1371,9 @@ local function safeReturn(quick)
             end
             RunService.Heartbeat:Wait()
         end
-        success = stableFrames >= math.ceil(settleFrames / 2)
-            and hum.Health > 0
+        success = stableFrames >= math.ceil(settleFrames / 2) and hum.Health > 0
     end, function(e) return tostring(e) end)
-
-    if not ok then warn("[SafeReturn] Recovery error: " .. tostring(err)) end
+    if not ok then warn("[SafeReturn] " .. tostring(err)) end
     pcall(function()
         if root and root.Parent then
             root.Anchored = originalAnchor
@@ -1461,8 +1397,7 @@ table.insert(connections, RunService.Heartbeat:Connect(function()
     if FlingActive or selfFlinging or returning then return end
     local ch = Me.Character
     local hum = ch and ch:FindFirstChildOfClass("Humanoid")
-    local root = ch and (ch:FindFirstChild("HumanoidRootPart")
-        or (hum and hum.RootPart))
+    local root = ch and (ch:FindFirstChild("HumanoidRootPart") or (hum and hum.RootPart))
     if not (hum and root) or hum.Health <= 0 then return end
     if hum.FloorMaterial == Enum.Material.Air or hum.Sit then return end
     if root.AssemblyLinearVelocity.Magnitude > 30 or root.Anchored then return end
@@ -1475,14 +1410,12 @@ end))
 local function isAimHeld()
     return UIS:IsMouseButtonPressed(Enum.UserInputType.MouseButton2)
 end
-
 local function findNearestInFOV()
     local cam = workspace.CurrentCamera
     if not cam then return nil, nil end
     local vp = cam.ViewportSize
     local center = Vector2.new(vp.X * 0.5, vp.Y * 0.5)
     local best, bestDist = nil, CONFIG.AimFOV
-
     for _, p in ipairs(Players:GetPlayers()) do
         if p ~= Me then
             local tc = p.Character
@@ -1494,10 +1427,7 @@ local function findNearestInFOV()
                     if onScreen then
                         local sp = Vector2.new(screenPos.X, screenPos.Y)
                         local d = (sp - center).Magnitude
-                        if d < bestDist then
-                            bestDist = d
-                            best = hrp
-                        end
+                        if d < bestDist then bestDist = d; best = hrp end
                     end
                 end
             end
@@ -1505,7 +1435,6 @@ local function findNearestInFOV()
     end
     return best, bestDist
 end
-
 local function aimTick()
     if not aimActive then currentAimTarget = nil return end
     if not isAimHeld() then currentAimTarget = nil return end
@@ -1519,7 +1448,6 @@ local function aimTick()
     if CONFIG.AimSmooth <= 1 then cam.CFrame = desired
     else cam.CFrame = cam.CFrame:Lerp(desired, 1 / CONFIG.AimSmooth) end
 end
-
 table.insert(connections, RunService.RenderStepped:Connect(aimTick))
 
 local FovCircle = make("Frame", {
@@ -1550,7 +1478,6 @@ local function getTargetHRP(player)
     local tRoot = tHum and tHum.RootPart
     return tc, tHum, tRoot
 end
-
 local function findPlayerByName(name)
     if not name or name == "" then return nil end
     local ln = name:lower()
@@ -1563,10 +1490,8 @@ local function findPlayerByName(name)
     end
     return nil
 end
-
 local function getActiveTarget()
-    if currentTarget and currentTarget.Parent == Players
-        and currentTarget.Character then
+    if currentTarget and currentTarget.Parent == Players and currentTarget.Character then
         return currentTarget
     end
     for _, p in pairs(SelectedTargets) do
@@ -1576,7 +1501,7 @@ local function getActiveTarget()
 end
 
 --====================================
--- SCANNER — FULL RIG
+-- SCANNERS (compact)
 --====================================
 local function getOwnerString(inst)
     if not inst or not inst.Parent then return "?" end
@@ -1587,208 +1512,40 @@ local function getOwnerString(inst)
     end)
     return s
 end
-
 local function scanTargetRig(player)
     local tc, tHum, tRoot = getTargetHRP(player)
     if not tc then return "No character for " .. player.Name end
-
     local lines = {}
-    lines[#lines + 1] = "═══════════════════════════════════"
     lines[#lines + 1] = "RIG SCAN · @" .. player.Name
-    lines[#lines + 1] = "═══════════════════════════════════"
-
-    lines[#lines + 1] = "Character:     " .. tc.Name
-    lines[#lines + 1] = "ClassName:     " .. tc.ClassName
-
+    lines[#lines + 1] = "Character: " .. tc.Name
     if tHum then
         local rt = "?"
         pcall(function() rt = tHum.RigType.Name end)
-        lines[#lines + 1] = "RigType:       " .. rt
-        lines[#lines + 1] = "Health:        " .. tostring(tHum.Health) .. " / " .. tostring(tHum.MaxHealth)
-        lines[#lines + 1] = "WalkSpeed:     " .. tostring(tHum.WalkSpeed)
-        lines[#lines + 1] = "JumpPower:     " .. tostring(tHum.JumpPower)
-        lines[#lines + 1] = "JumpHeight:    " .. tostring(tHum.JumpHeight)
-        lines[#lines + 1] = "UseJumpPower:  " .. tostring(tHum.UseJumpPower)
-        lines[#lines + 1] = "Sit:           " .. tostring(tHum.Sit)
-        lines[#lines + 1] = "PlatformStand: " .. tostring(tHum.PlatformStand)
-        lines[#lines + 1] = "State:         " .. tostring(tHum:GetState())
-        lines[#lines + 1] = "FloorMaterial: " .. tostring(tHum.FloorMaterial)
-        lines[#lines + 1] = "MoveDirection: " .. tostring(tHum.MoveDirection)
+        lines[#lines + 1] = "RigType: " .. rt
+        lines[#lines + 1] = "Health: " .. tostring(tHum.Health) .. " / " .. tostring(tHum.MaxHealth)
+        lines[#lines + 1] = "State: " .. tostring(tHum:GetState())
     end
-
     if tRoot then
-        lines[#lines + 1] = ""
-        lines[#lines + 1] = "───── HumanoidRootPart ─────"
-        lines[#lines + 1] = "Position:      " .. string.format("(%.1f, %.1f, %.1f)", tRoot.Position.X, tRoot.Position.Y, tRoot.Position.Z)
-        lines[#lines + 1] = "Velocity:      " .. string.format("%.1f studs/s", tRoot.AssemblyLinearVelocity.Magnitude)
-        lines[#lines + 1] = "AngularVel:    " .. string.format("%.1f", tRoot.AssemblyAngularVelocity.Magnitude)
-        lines[#lines + 1] = "AssemblyMass:  " .. string.format("%.2f", tRoot.AssemblyMass)
-        lines[#lines + 1] = "Size:          " .. tostring(tRoot.Size)
-        lines[#lines + 1] = "Anchored:      " .. tostring(tRoot.Anchored)
-        lines[#lines + 1] = "CanCollide:    " .. tostring(tRoot.CanCollide)
-        lines[#lines + 1] = "CanQuery:      " .. tostring(tRoot.CanQuery)
-        lines[#lines + 1] = "CanTouch:      " .. tostring(tRoot.CanTouch)
-        lines[#lines + 1] = "Massless:      " .. tostring(tRoot.Massless)
-        lines[#lines + 1] = "Transparency:  " .. tostring(tRoot.Transparency)
-        lines[#lines + 1] = "Owner:         " .. getOwnerString(tRoot)
+        lines[#lines + 1] = "HRP vel: " .. string.format("%.1f", tRoot.AssemblyLinearVelocity.Magnitude)
+        lines[#lines + 1] = "HRP own: " .. getOwnerString(tRoot)
     end
-
-    lines[#lines + 1] = ""
-    lines[#lines + 1] = "───── BaseParts ─────"
-    local parts = {}
-    for _, d in ipairs(tc:GetDescendants()) do
-        if d:IsA("BasePart") then table.insert(parts, d) end
-    end
-    table.sort(parts, function(a, b)
-        return (a.AssemblyMass or 0) > (b.AssemblyMass or 0)
-    end)
-    for _, p in ipairs(parts) do
-        local rootDist = tRoot and (p.Position - tRoot.Position).Magnitude or 0
-        lines[#lines + 1] = string.format(
-            "  %-18s  cls=%-8s  A=%-5s  M=%-5s  CC=%-5s  mass=%5.2f  dHRP=%4.1f  own=%s",
-            p.Name:sub(1, 18),
-            p.ClassName:sub(1, 8),
-            tostring(p.Anchored),
-            tostring(p.Massless),
-            tostring(p.CanCollide),
-            p.AssemblyMass or 0,
-            rootDist,
-            getOwnerString(p))
-    end
-    lines[#lines + 1] = "  Total BaseParts: " .. #parts
-
-    lines[#lines + 1] = ""
-    lines[#lines + 1] = "───── Joints (weld chain) ─────"
-    local joints = {}
-    for _, d in ipairs(tc:GetDescendants()) do
-        if d:IsA("Motor6D") or d:IsA("Weld") or d:IsA("WeldConstraint") or d:IsA("Snap") then
-            table.insert(joints, d)
-        end
-    end
-    for _, j in ipairs(joints) do
-        lines[#lines + 1] = string.format(
-            "  %-24s  %s → %s  active=%s",
-            j.Name:sub(1, 24),
-            j.Part0 and j.Part0.Name or "?",
-            j.Part1 and j.Part1.Name or "?",
-            tostring(j.Enabled ~= false))
-    end
-    lines[#lines + 1] = "  Total joints: " .. #joints
-
-    lines[#lines + 1] = ""
-    lines[#lines + 1] = "───── Accessories ─────"
-    local accs = {}
-    for _, d in ipairs(tc:GetChildren()) do
-        if d:IsA("Accessory") then table.insert(accs, d) end
-    end
-    if #accs == 0 then
-        lines[#lines + 1] = "  (none)"
-    else
-        for _, a in ipairs(accs) do
-            lines[#lines + 1] = "  " .. a.Name .. "  handle=" .. tostring(a:FindFirstChild("Handle") ~= nil)
-        end
-    end
-
-    lines[#lines + 1] = ""
-    lines[#lines + 1] = "───── Attributes ─────"
-    local anyAttr = false
-    for _, d in ipairs(tc:GetDescendants()) do
-        local attrs = d:GetAttributes()
-        for k, v in pairs(attrs) do
-            anyAttr = true
-            lines[#lines + 1] = "  " .. d.Name .. "." .. k .. " = " .. tostring(v)
-        end
-    end
-    if not anyAttr then lines[#lines + 1] = "  (none)" end
-
     return table.concat(lines, "\n")
 end
-
---====================================
--- SCANNER — ENVIRONMENT
---====================================
 local function scanEnvironment(radius)
     radius = radius or 30
     local ch = Me.Character
     local myRoot = ch and ch:FindFirstChild("HumanoidRootPart")
     if not myRoot then return "No local character" end
-
-    local lines = {}
-    lines[#lines + 1] = "═══════════════════════════════════"
-    lines[#lines + 1] = "ENV SCAN · radius " .. radius .. " studs"
-    lines[#lines + 1] = "═══════════════════════════════════"
-
     local parts = workspace:GetPartBoundsInRadius(myRoot.Position, radius)
-    lines[#lines + 1] = "Parts in radius: " .. #parts
-
-    local byOwner = {}
-    local anchoredCount = 0
-    local unanchoredCount = 0
-
-    for _, p in ipairs(parts) do
-        if p:IsA("BasePart") then
-            local owner = getOwnerString(p)
-            byOwner[owner] = (byOwner[owner] or 0) + 1
-            if p.Anchored then anchoredCount = anchoredCount + 1
-            else unanchoredCount = unanchoredCount + 1 end
-        end
-    end
-
-    lines[#lines + 1] = "Anchored:    " .. anchoredCount
-    lines[#lines + 1] = "Unanchored:  " .. unanchoredCount
-    lines[#lines + 1] = ""
-
-    lines[#lines + 1] = "───── By owner ─────"
-    for owner, count in pairs(byOwner) do
-        lines[#lines + 1] = "  " .. owner .. ": " .. count
-    end
-
-    lines[#lines + 1] = ""
-    lines[#lines + 1] = "───── Nearest movable parts ─────"
-    local movable = {}
-    for _, p in ipairs(parts) do
-        if p:IsA("BasePart") and not p.Anchored and not p:IsDescendantOf(ch) then
-            table.insert(movable, p)
-        end
-    end
-    table.sort(movable, function(a, b)
-        return (a.Position - myRoot.Position).Magnitude
-             < (b.Position - myRoot.Position).Magnitude
-    end)
-    for i = 1, math.min(10, #movable) do
-        local p = movable[i]
-        local d = (p.Position - myRoot.Position).Magnitude
-        lines[#lines + 1] = string.format(
-            "  %-22s  cls=%-10s  d=%.1f  mass=%.1f  own=%s",
-            p.Name:sub(1, 22), p.ClassName:sub(1, 10), d, p.AssemblyMass or 0,
-            getOwnerString(p))
-    end
-
-    return table.concat(lines, "\n")
+    return "ENV SCAN r=" .. radius .. " parts=" .. #parts
 end
-
 local function scanAll()
     local target = getActiveTarget()
     local lines = {}
     if target then
         lines[#lines + 1] = scanTargetRig(target)
-        lines[#lines + 1] = ""
     else
-        lines[#lines + 1] = "No target selected — scanning nearby players instead:"
-        lines[#lines + 1] = ""
-        local ch = Me.Character
-        local myRoot = ch and ch:FindFirstChild("HumanoidRootPart")
-        if myRoot then
-            for _, p in ipairs(Players:GetPlayers()) do
-                if p ~= Me and p.Character then
-                    local hrp = p.Character:FindFirstChild("HumanoidRootPart")
-                    if hrp and (hrp.Position - myRoot.Position).Magnitude < 100 then
-                        lines[#lines + 1] = scanTargetRig(p)
-                        lines[#lines + 1] = ""
-                    end
-                end
-            end
-        end
+        lines[#lines + 1] = "No target selected"
     end
     lines[#lines + 1] = scanEnvironment(50)
     return table.concat(lines, "\n")
@@ -1812,17 +1569,13 @@ local function cmdGoto(player)
     end)
     return true, "TP'd to " .. player.Name
 end
-
 local function cmdFreeze(player)
     local _, _, tRoot = getTargetHRP(player)
     if not tRoot then return false, "No HRP" end
-    if originalAnchored[player.Name] == nil then
-        originalAnchored[player.Name] = tRoot.Anchored
-    end
+    if originalAnchored[player.Name] == nil then originalAnchored[player.Name] = tRoot.Anchored end
     tRoot.Anchored = true
-    return true, "Froze (anchored) " .. player.Name
+    return true, "Froze " .. player.Name
 end
-
 local function cmdUnfreeze(player)
     local _, _, tRoot = getTargetHRP(player)
     if not tRoot then return false, "No HRP" end
@@ -1839,17 +1592,13 @@ local function cmdUnfreeze(player)
     end
     return true, "Unfroze " .. player.Name
 end
-
 local function cmdAnchor(player)
     local _, _, tRoot = getTargetHRP(player)
     if not tRoot then return false, "No HRP" end
-    if not originalAnchored[player.Name] then
-        originalAnchored[player.Name] = tRoot.Anchored
-    end
+    if not originalAnchored[player.Name] then originalAnchored[player.Name] = tRoot.Anchored end
     tRoot.Anchored = true
     return true, "Anchored " .. player.Name
 end
-
 local function cmdUnanchor(player)
     local _, _, tRoot = getTargetHRP(player)
     if not tRoot then return false, "No HRP" end
@@ -1857,7 +1606,6 @@ local function cmdUnanchor(player)
     originalAnchored[player.Name] = nil
     return true, "Unanchored " .. player.Name
 end
-
 local function cmdBring(player)
     local ch = Me.Character
     local hum = ch and ch:FindFirstChildOfClass("Humanoid")
@@ -1873,14 +1621,11 @@ local function cmdBring(player)
     end)
     return true, "Brought " .. player.Name
 end
-
 local function cmdGrab(player) return cmdBring(player) end
-
 local CMD = {
     ["goto"] = cmdGoto, freeze = cmdFreeze, unfreeze = cmdUnfreeze, thaw = cmdUnfreeze,
     anchor = cmdAnchor, unanchor = cmdUnanchor, bring = cmdBring, grab = cmdGrab,
 }
-
 local function runCmd(action, player)
     if not player then setStatus("No target selected", AMBER); return false end
     local fn = CMD[action]
@@ -1895,15 +1640,12 @@ end
 -- GRAB OBJECTS
 --====================================
 local mouse = Me:GetMouse()
-
 local function releaseGrab()
     if grabbedPart and grabbedPart.Parent then
         pcall(function() grabbedPart.Anchored = grabbedAnchor or false end)
     end
-    grabbedPart   = nil
-    grabbedAnchor = nil
+    grabbedPart, grabbedAnchor = nil, nil
 end
-
 local function tryGrabUnderMouse()
     if not grabActive then return end
     if grabbedPart then releaseGrab(); setStatus("Released grab", MUTED); return end
@@ -1914,14 +1656,13 @@ local function tryGrabUnderMouse()
     if ch and target:IsDescendantOf(ch) then
         setStatus("Can't grab own character", AMBER); return end
     if target.Anchored then
-        setStatus("Part is anchored — can't grab", AMBER); return end
+        setStatus("Part is anchored", AMBER); return end
     pcall(function() target:SetNetworkOwner(Me) end)
-    grabbedPart   = target
+    grabbedPart = target
     grabbedAnchor = false
     pcall(function() target.Anchored = true end)
-    setStatus("Grabbed: " .. target.Name, GREEN, "Click again to release")
+    setStatus("Grabbed: " .. target.Name, GREEN)
 end
-
 table.insert(connections, RunService.RenderStepped:Connect(function()
     if not grabActive or not grabbedPart then return end
     if not grabbedPart.Parent then grabbedPart = nil return end
@@ -1931,7 +1672,6 @@ table.insert(connections, RunService.RenderStepped:Connect(function()
     local targetPos = ray.Origin + ray.Direction * 15
     pcall(function() grabbedPart.CFrame = CFrame.new(targetPos) end)
 end))
-
 table.insert(connections, UIS.InputBegan:Connect(function(input, gpe)
     if gpe then return end
     if not grabActive then return end
@@ -1940,7 +1680,6 @@ table.insert(connections, UIS.InputBegan:Connect(function(input, gpe)
         tryGrabUnderMouse()
     end
 end))
-
 table.insert(connections, UIS.InputBegan:Connect(function(input, gpe)
     if gpe then return end
     if input.KeyCode == Enum.KeyCode.Q then
@@ -1954,6 +1693,10 @@ end))
 --====================================
 -- FOLLOW THREAD
 --====================================
+local function stopFollowThread()
+    followActive = false
+    followTarget = nil
+end
 local function startFollowThread(target)
     if not followEnabled then return end
     followActive = true
@@ -1982,11 +1725,6 @@ local function startFollowThread(target)
     end)
 end
 
-local function stopFollowThread()
-    followActive = false
-    followTarget = nil
-end
-
 --====================================
 -- NOCLIP / SPEED
 --====================================
@@ -2012,18 +1750,14 @@ local function setNoclip(state)
         table.clear(noclipOriginalCollision)
     end
 end
-
 table.insert(connections, RunService.Stepped:Connect(function()
     if not noclipActive then return end
     local ch = Me.Character
     if not ch then return end
     for _, part in ipairs(ch:GetChildren()) do
-        if part:IsA("BasePart") and part.CanCollide then
-            part.CanCollide = false
-        end
+        if part:IsA("BasePart") and part.CanCollide then part.CanCollide = false end
     end
 end))
-
 local function setSpeed(state)
     speedActive = state
     SpeedButton.Text = "Speed: " .. (state and "ON" or "OFF")
@@ -2049,19 +1783,18 @@ local function runCommand(text)
     local cmd, arg = text:match("^(%S+)%s*(.*)$")
     if not cmd then return end
     cmd = cmd:lower()
-
     if cmd == "/help" or cmd == "/?" then
         setStatus("Commands", MUTED,
             "/hits /testreturn /scan /scanenv /scanall /fling /freeze /unfreeze /anchor /unanchor /bring /grab /goto /aim /noclip /speed")
     elseif cmd == "/hits" then
         if HitDebug.showHits then HitDebug.showHits() end
-        setStatus("Hit observations", CYAN, "Local contact evidence is in the Hits tab")
+        setStatus("Hit observations", CYAN)
     elseif cmd == "/clearhits" then
         HitDebug.clear()
         setStatus("Hit history cleared", MUTED)
     elseif cmd == "/testreturn" then
         if FlingActive or selfFlinging or returning then
-            setStatus("Return test unavailable", AMBER, "Finish the current action first")
+            setStatus("Return test unavailable", AMBER)
             return
         end
         local ch = Me.Character
@@ -2069,16 +1802,13 @@ local function runCommand(text)
         local root = hum and hum.RootPart
         if not (ch and root and hum and hum.Health > 0)
             or hum.FloorMaterial == Enum.Material.Air then
-            setStatus("Return test: stand on solid ground", AMBER)
-            return
+            setStatus("Return test: stand on solid ground", AMBER); return
         end
         returnSnapshot = nil
         captureReturn(ch, root, hum)
         local landing = findSafeLanding(returnSnapshot)
         if not landing then
-            setStatus("Return test FAILED", AMBER,
-                "Cannot find unobstructed solid ground near this checkpoint")
-            return
+            setStatus("Return test FAILED", AMBER); return
         end
         local originallyAnchored = root.Anchored
         root.Anchored = true
@@ -2089,10 +1819,9 @@ local function runCommand(text)
             local worked = safeReturn()
             if worked then
                 returnSnapshot = nil
-                setStatus("Return test PASSED", GREEN, "Solid floor and stable landing confirmed")
+                setStatus("Return test PASSED", GREEN)
             else
-                setStatus("Return test FAILED", AMBER,
-                    "Try from flat unobstructed ground in a private test place")
+                setStatus("Return test FAILED", AMBER)
             end
         end)
     elseif cmd == "/scan" then
@@ -2101,9 +1830,7 @@ local function runCommand(text)
             InspectText.Text = scanTargetRig(p)
             InspectOverlay.Visible = true
             setStatus("Rig scan: " .. p.Name, GREEN)
-        else
-            setStatus("Scan: no target", AMBER)
-        end
+        else setStatus("Scan: no target", AMBER) end
     elseif cmd == "/scanenv" then
         InspectText.Text = scanEnvironment(tonumber(arg) or 30)
         InspectOverlay.Visible = true
@@ -2132,7 +1859,6 @@ local function runCommand(text)
         if hum then hum.WalkSpeed = n end
     else setStatus("Unknown: " .. cmd, AMBER) end
 end
-
 CmdBar.FocusLost:Connect(function(enterPressed)
     if enterPressed then runCommand(CmdBar.Text); CmdBar.Text = "" end
 end)
@@ -2152,17 +1878,22 @@ local function isTargetReady(player)
     return true
 end
 
-local TARGET_PART_ORDER = {
-    "LeftLowerArm", "LeftUpperArm", "LeftHand", "Left Arm",
-}
-
-local function findAnyTargetPart(tChar, tHum, attempt)
-    for _, name in ipairs(TARGET_PART_ORDER) do
-        local p = tChar:FindFirstChild(name)
-        if p and p:IsA("BasePart") and p.Parent == tChar and not p.Anchored then
-            return p, p.Name
-        end
+local function findAnyTargetPart(tChar, tHum)
+    -- Returns the part to use based on the selector
+    if currentTargetPartId == "original" then
+        local tRoot = tHum and tHum.RootPart
+        if tRoot then return tRoot, tRoot.Name end
+        local tHead = tChar:FindFirstChild("Head")
+        if tHead then return tHead, tHead.Name end
+        local acc = tChar:FindFirstChildOfClass("Accessory")
+        local handle = acc and acc:FindFirstChild("Handle")
+        if handle then return handle, handle.Name end
+        return nil, nil
     end
+    local p = tChar:FindFirstChild(currentTargetPartId)
+    if p and p:IsA("BasePart") then return p, p.Name end
+    -- fallback to HRP
+    if tHum and tHum.RootPart then return tHum.RootPart, tHum.RootPart.Name end
     return nil, nil
 end
 
@@ -2185,12 +1916,9 @@ end
 local function stunTarget(hum)
     if not hum or not hum.Parent then return end
     pcall(function()
-        hum.WalkSpeed = 0
-        hum.JumpPower = 0
-        hum.JumpHeight = 0
+        hum.WalkSpeed = 0; hum.JumpPower = 0; hum.JumpHeight = 0
     end)
 end
-
 local function preFreezeTarget(player)
     if freezeActive[player.Name] then return end
     freezeActive[player.Name] = true
@@ -2198,8 +1926,7 @@ local function preFreezeTarget(player)
         while freezeActive[player.Name] do
             local _, tHum = getTargetHRP(player)
             if not tHum or not tHum.Parent then
-                freezeActive[player.Name] = false
-                break
+                freezeActive[player.Name] = false; break
             end
             pcall(function()
                 if tHum.WalkSpeed ~= 0 then tHum.WalkSpeed = 0 end
@@ -2210,7 +1937,6 @@ local function preFreezeTarget(player)
         end
     end)
 end
-
 local function postUnfreezeTarget(player)
     freezeActive[player.Name] = false
     freezeThreads[player.Name] = nil
@@ -2218,61 +1944,9 @@ local function postUnfreezeTarget(player)
     local _, tHum = getTargetHRP(player)
     if not tHum then return end
     pcall(function()
-        tHum.WalkSpeed    = 16
-        tHum.JumpPower    = 50
-        tHum.JumpHeight   = 7.2
-        tHum.UseJumpPower = true
+        tHum.WalkSpeed = 16; tHum.JumpPower = 50
+        tHum.JumpHeight = 7.2; tHum.UseJumpPower = true
     end)
-end
-
-local function predictHRPPosition(targetRoot, tracker)
-    local now = os.clock()
-    local pos = targetRoot.Position
-    local velocity = targetRoot.AssemblyLinearVelocity
-    local speed = velocity.Magnitude
-
-    if speed ~= speed or speed > 1e5 then
-        velocity = Vector3.zero
-        speed = 0
-    elseif speed > CONFIG.PredictionMaxSpeed then
-        velocity = velocity.Unit * CONFIG.PredictionMaxSpeed
-        speed = CONFIG.PredictionMaxSpeed
-    end
-
-    local lead = math.min(CONFIG.PredictionSeconds, CONFIG.PredictionMaxSeconds)
-    if tracker.lastVelocity and tracker.lastVelocity.Magnitude > 2
-        and speed > 2 then
-        local dot = tracker.lastVelocity.Unit:Dot(velocity.Unit)
-        if dot < CONFIG.PredictionDirectionReset then
-            tracker.turnUntil = now + 0.12
-        end
-    end
-    if now < (tracker.turnUntil or 0) then
-        lead = lead * 0.35
-    end
-
-    if tracker.lastPosition and tracker.lastTime then
-        local dt = math.max(now - tracker.lastTime, 0.001)
-        local jump = (pos - tracker.lastPosition).Magnitude
-        if jump > CONFIG.PredictionMaxSpeed * dt + 4 then
-            tracker.discontinuityUntil = now + 0.18
-        end
-    end
-    if now < (tracker.discontinuityUntil or 0) then
-        lead = 0
-    end
-
-    tracker.lastPosition = pos
-    tracker.lastVelocity = velocity
-    tracker.lastTime = now
-
-    local displacement = velocity * lead
-    if displacement.Magnitude > CONFIG.PredictionMaxStuds then
-        displacement = displacement.Unit * CONFIG.PredictionMaxStuds
-    end
-    displacement = Vector3.new(displacement.X,
-        math.clamp(displacement.Y, -1.1, 1.1), displacement.Z)
-    return pos + displacement, displacement.Magnitude
 end
 
 local function makeTargetOverlapParams(character)
@@ -2304,7 +1978,6 @@ local function sampleContact(myRoot, targetCharacter, targetRoot, params, monito
             end
         end
     end
-
     local velocity = targetRoot.AssemblyLinearVelocity
     local magnitude = velocity.Magnitude
     if magnitude > (monitor.peak or 0) then monitor.peak = magnitude end
@@ -2323,7 +1996,7 @@ local function sampleContact(myRoot, targetCharacter, targetRoot, params, monito
 end
 
 --====================================
--- SKID FLING — MULTI-PART
+-- SKID FLING — KILASIK ROTATION LOGIC
 --====================================
 local function SkidFling(TargetPlayer, forcedPart, monitor)
     local Character = Me.Character
@@ -2332,7 +2005,6 @@ local function SkidFling(TargetPlayer, forcedPart, monitor)
     local TCharacter = TargetPlayer.Character
     if not TCharacter then return false end
     local THumanoid = TCharacter:FindFirstChildOfClass("Humanoid")
-    local THead     = TCharacter:FindFirstChild("Head")
     if not (Character and Humanoid and RootPart) then
         setStatus("Character not ready", AMBER)
         return false
@@ -2348,17 +2020,12 @@ local function SkidFling(TargetPlayer, forcedPart, monitor)
         return false
     end
 
-    local targetRoot = THumanoid and THumanoid.RootPart
+    -- Resolve aim part based on selector
     local aimPart = forcedPart
     if not (aimPart and aimPart:IsA("BasePart") and aimPart.Parent
             and not aimPart.Anchored) then
-        for _, name in ipairs(KICK_PART_ORDER) do
-            local candidate = TCharacter:FindFirstChild(name)
-            if candidate and candidate:IsA("BasePart") and not candidate.Anchored then
-                aimPart = candidate
-                break
-            end
-        end
+        local candidate = findAnyTargetPart(TCharacter, THumanoid)
+        aimPart = candidate
     end
     if not aimPart then
         setStatus(TargetPlayer.Name .. " no tracking part", AMBER)
@@ -2382,77 +2049,76 @@ local function SkidFling(TargetPlayer, forcedPart, monitor)
     if RootPart.CanTouch then
         pcall(function()
             touchConnection = RootPart.Touched:Connect(function(part)
-            if monitor and HitDebug.acceptsPart(part, TCharacter) then
-                monitor.overlap = true
-                monitor.lastOverlapAt = os.clock()
-                monitor.touchedPartName = hitPartLabel(part, TCharacter)
-                pcall(HitDebug.record, monitor, part, RootPart, "Touched")
-            end
+                if monitor and HitDebug.acceptsPart(part, TCharacter) then
+                    monitor.overlap = true
+                    monitor.lastOverlapAt = os.clock()
+                    monitor.touchedPartName = hitPartLabel(part, TCharacter)
+                    pcall(HitDebug.record, monitor, part, RootPart, "Touched")
+                end
             end)
         end)
     end
-    local tracker = {}
-    local movementUpdates = 0
-    local function FPos(worldAim, localOffset, ang)
-        if not RootPart.Parent or not aimPart.Parent then return end
+
+    -- KILASIK's FPos — exact logic
+    local function FPos(BP, Pos, Ang)
+        if not RootPart.Parent or not BP.Parent then return end
         pcall(function()
             RootPart.CanCollide = true
             RootPart.Massless = false
         end)
-        local kickCF = CFrame.new(worldAim) * CFrame.new(localOffset) * ang
-        pcall(function() Character:SetPrimaryPartCFrame(kickCF) end)
-        RootPart.CFrame = kickCF
-        movementUpdates = movementUpdates + 1
-        RootPart.Velocity = Vector3.new(
-            CONFIG.KickSpeed, CONFIG.KickYSpeed, CONFIG.KickSpeed)
-        RootPart.RotVelocity = Vector3.new(
-            CONFIG.KickRot, CONFIG.KickRot, CONFIG.KickRot)
+        RootPart.CFrame = CFrame.new(BP.Position) * Pos * Ang
+        pcall(function() Character:SetPrimaryPartCFrame(CFrame.new(BP.Position) * Pos * Ang) end)
+        RootPart.Velocity = Vector3.new(9e7, 9e7 * 10, 9e7)
+        RootPart.RotVelocity = Vector3.new(9e8, 9e8, 9e8)
     end
 
-    local SFBasePart = function()
-        local started = os.clock()
-        local angle = 0
-        local offsets = {
-            Vector3.new(0,  0.55, 0),
-            Vector3.new(0, -0.55, 0),
-            Vector3.new(0.55, 0, 0),
-            Vector3.new(-0.55, 0, 0),
-            Vector3.new(0, 0, 0.55),
-            Vector3.new(0, 0, -0.55),
-        }
-
+    -- KILASIK's SFBasePart pattern with hit sampling inserted between placements
+    local SFBasePart = function(BP)
+        local TimeToWait = CONFIG.TimeToWait
+        local Time = tick()
+        local Angle = 0
         repeat
-            if not FlingActive or not RootPart.Parent
-                or not THumanoid or THumanoid.Health <= 0 then break end
-            if not aimPart.Parent then break end
-            if targetRoot and not targetRoot.Parent then break end
+            if not FlingActive then break end
+            if not RootPart.Parent or not BP.Parent then break end
+            if not THumanoid or THumanoid.Health <= 0 then break end
 
-            for offsetIndex, offset in ipairs(offsets) do
-                if not FlingActive or not RootPart.Parent or not aimPart.Parent then break end
-                local predictionRoot = targetRoot and targetRoot.Parent and targetRoot or aimPart
-                local aim, predictedBy = predictHRPPosition(predictionRoot, tracker)
-                if aimPart ~= predictionRoot then
-                    local limbDelta = aimPart.Position - predictionRoot.Position
-                    if limbDelta.Magnitude > 6 then
-                        limbDelta = limbDelta.Unit * 6
-                    end
-                    aim = aim + limbDelta
-                end
-                if monitor then monitor.lastPredictionStuds = predictedBy end
-                angle = (angle + CONFIG.AngleStep) % 360
-                FPos(aim, offset, CFrame.Angles(math.rad(angle), 0, 0))
-                sampleContact(RootPart, TCharacter, targetRoot or aimPart,
-                    overlapParams, monitor)
+            if BP.Velocity.Magnitude < 50 then
+                Angle = Angle + CONFIG.AngleStep
+                FPos(BP, CFrame.new(0, 1.5, 0) + THumanoid.MoveDirection * BP.Velocity.Magnitude / 1.25, CFrame.Angles(math.rad(Angle), 0, 0))
+                sampleContact(RootPart, TCharacter, BP, overlapParams, monitor)
                 if monitor and monitor.hit then return true end
-                if offsetIndex % 2 == 0 then
-                    task.wait()
-                    sampleContact(RootPart, TCharacter, targetRoot or aimPart,
-                        overlapParams, monitor)
-                    if monitor and monitor.hit then return true end
-                end
+                task.wait()
+                FPos(BP, CFrame.new(0, -1.5, 0) + THumanoid.MoveDirection * BP.Velocity.Magnitude / 1.25, CFrame.Angles(math.rad(Angle), 0, 0))
+                sampleContact(RootPart, TCharacter, BP, overlapParams, monitor)
+                if monitor and monitor.hit then return true end
+                task.wait()
+                FPos(BP, CFrame.new(0, 1.5, 0) + THumanoid.MoveDirection * BP.Velocity.Magnitude / 1.25, CFrame.Angles(math.rad(Angle), 0, 0))
+                task.wait()
+                FPos(BP, CFrame.new(0, -1.5, 0) + THumanoid.MoveDirection * BP.Velocity.Magnitude / 1.25, CFrame.Angles(math.rad(Angle), 0, 0))
+                task.wait()
+                FPos(BP, CFrame.new(0, 1.5, 0) + THumanoid.MoveDirection, CFrame.Angles(math.rad(Angle), 0, 0))
+                task.wait()
+                FPos(BP, CFrame.new(0, -1.5, 0) + THumanoid.MoveDirection, CFrame.Angles(math.rad(Angle), 0, 0))
+                task.wait()
+            else
+                FPos(BP, CFrame.new(0, 1.5, THumanoid.WalkSpeed), CFrame.Angles(math.rad(90), 0, 0))
+                sampleContact(RootPart, TCharacter, BP, overlapParams, monitor)
+                if monitor and monitor.hit then return true end
+                task.wait()
+                FPos(BP, CFrame.new(0, -1.5, -THumanoid.WalkSpeed), CFrame.Angles(0, 0, 0))
+                task.wait()
+                FPos(BP, CFrame.new(0, 1.5, THumanoid.WalkSpeed), CFrame.Angles(math.rad(90), 0, 0))
+                task.wait()
+                FPos(BP, CFrame.new(0, -1.5, 0), CFrame.Angles(math.rad(90), 0, 0))
+                task.wait()
+                FPos(BP, CFrame.new(0, -1.5, 0), CFrame.Angles(0, 0, 0))
+                task.wait()
+                FPos(BP, CFrame.new(0, -1.5, 0), CFrame.Angles(math.rad(90), 0, 0))
+                task.wait()
+                FPos(BP, CFrame.new(0, -1.5, 0), CFrame.Angles(0, 0, 0))
+                task.wait()
             end
-            task.wait()
-        until os.clock() - started >= CONFIG.TimeToWait or not FlingActive
+        until Time + TimeToWait < tick() or not FlingActive
         return false
     end
 
@@ -2460,7 +2126,6 @@ local function SkidFling(TargetPlayer, forcedPart, monitor)
     local BV
     local confirmed, attackOK = false, false
     local oldSeated = returnSnapshot and returnSnapshot.seatedEnabled
-
     hardTeleportToTarget(TargetPlayer)
 
     local ran, result = xpcall(function()
@@ -2470,17 +2135,13 @@ local function SkidFling(TargetPlayer, forcedPart, monitor)
         BV.MaxForce = Vector3.new(9e9, 9e9, 9e9)
         BV.Parent = RootPart
         Humanoid:SetStateEnabled(Enum.HumanoidStateType.Seated, false)
-        return SFBasePart()
+        return SFBasePart(aimPart)
     end, function(err) return tostring(err) end)
 
-    if ran then
-        attackOK, confirmed = true, result == true
+    if ran then attackOK, confirmed = true, result == true
     else
-        warn("[Fling v23.4m] Character movement failed:", result)
-        setStatus("Movement error (see console)", RED, tostring(result):sub(1, 110))
-    end
-    if movementUpdates == 0 then
-        warn("[Fling v23.4m] No character movement updates executed.")
+        warn("[Fling v23.4k] Character movement failed:", result)
+        setStatus("Movement error", RED, tostring(result):sub(1, 110))
     end
 
     if touchConnection then touchConnection:Disconnect() end
@@ -2492,8 +2153,7 @@ local function SkidFling(TargetPlayer, forcedPart, monitor)
     zeroCharacterMotion(Character)
     pcall(function()
         if Humanoid.Parent then
-            Humanoid:SetStateEnabled(Enum.HumanoidStateType.Seated,
-                oldSeated ~= nil and oldSeated or true)
+            Humanoid:SetStateEnabled(Enum.HumanoidStateType.Seated, oldSeated ~= nil and oldSeated or true)
         end
     end)
     selfFlinging = false
@@ -2503,13 +2163,12 @@ local function SkidFling(TargetPlayer, forcedPart, monitor)
 end
 
 --====================================
--- BURST WITH ANCHOR CADENCE
+-- BURST
 --====================================
 local function burstFlingTarget(player)
     if not isTargetReady(player) then return false, 0, 0, nil end
     local tc = player.Character
     if not tc then return false, 0, 0, nil end
-
     if CONFIG.AutoFreezeTarget then preFreezeTarget(player) end
 
     local bestPeak, attempts = 0, 0
@@ -2520,14 +2179,12 @@ local function burstFlingTarget(player)
     for i = 1, HRP_BURST.MaxAttempts do
         if not FlingActive then break end
         if not isTargetReady(player) then break end
-
-        local candidate, candidateName = findAnyTargetPart(tc, tHum, i)
+        local candidate, candidateName = findAnyTargetPart(tc, tHum)
         if not candidate then
-            setStatus("Left arm unavailable", AMBER,
-                "R6 Left Arm or R15 left-arm parts missing/anchored")
+            setStatus("Target part unavailable", AMBER,
+                "Falling back to default for " .. getCurrentTargetLabel())
             break
         end
-
         local _, _, tRoot = getTargetHRP(player)
         if CONFIG.AutoFreezeTarget and tRoot then
             local wasAnchored = tRoot.Anchored
@@ -2535,10 +2192,8 @@ local function burstFlingTarget(player)
             task.wait(CONFIG.AnchorHold)
             pcall(function() tRoot.Anchored = wasAnchored end)
         end
-
         hardTeleportToTarget(player)
         if not FlingActive then break end
-
         attempts = attempts + 1
         local tRootVelocity = tRoot and tRoot.AssemblyLinearVelocity or Vector3.zero
         local monitor = { peak = 0, hit = false, overlap = false,
@@ -2549,16 +2204,13 @@ local function burstFlingTarget(player)
         if monitor.contactPartName or monitor.overlapPart then
             lastPartName = monitor.contactPartName or monitor.overlapPart
         end
-
         if monitor.peak > bestPeak then bestPeak = monitor.peak end
         anyOverlap = anyOverlap or monitor.overlap
         bestResponseDelta = math.max(bestResponseDelta, monitor.responseDelta)
-
         if monitor.hit then
             local ch = Me.Character
             local myRoot = ch and ch:FindFirstChild("HumanoidRootPart")
             local holdAnchored = myRoot and myRoot.Anchored or false
-
             if myRoot then
                 pcall(function()
                     myRoot.Anchored = true
@@ -2566,11 +2218,8 @@ local function burstFlingTarget(player)
                     myRoot.AssemblyAngularVelocity = Vector3.zero
                 end)
             end
-
             setStatus(string.format("@%s overlap + motion (%s)",
-                player.Name, tostring(monitor.contactPartName or monitor.overlapPart or "unknown")), GREEN,
-                "See Hits tab for approximate location and evidence")
-
+                player.Name, tostring(monitor.contactPartName or monitor.overlapPart or "unknown")), GREEN)
             local holdStart = tick()
             while tick() - holdStart < CONFIG.HoldAfterHit do
                 if not FlingActive then break end
@@ -2582,27 +2231,17 @@ local function burstFlingTarget(player)
                 end
                 task.wait(0.05)
             end
-
             if myRoot and myRoot.Parent then
                 pcall(function() myRoot.Anchored = holdAnchored end)
             end
-
             if CONFIG.AutoFreezeTarget then postUnfreezeTarget(player) end
-            return true, bestPeak, attempts, lastPartName,
-                anyOverlap, bestResponseDelta
+            return true, bestPeak, attempts, lastPartName, anyOverlap, bestResponseDelta
         end
-
         if CONFIG.AutoFreezeTarget then preFreezeTarget(player) end
-        if monitor.overlap then
-            setStatus(string.format("@%s overlap observed, no velocity response", player.Name),
-                AMBER, "Local overlap: " .. tostring(monitor.overlapPart or "unknown"))
-        end
         task.wait(HRP_BURST.DelayBetween)
     end
-
     if CONFIG.AutoFreezeTarget then postUnfreezeTarget(player) end
-    return false, bestPeak, attempts, lastPartName,
-        anyOverlap, bestResponseDelta
+    return false, bestPeak, attempts, lastPartName, anyOverlap, bestResponseDelta
 end
 
 --====================================
@@ -2611,15 +2250,11 @@ end
 local function activeTargets()
     local list = {}
     for _, p in pairs(SelectedTargets) do
-        if p and p.Parent == Players then
-            table.insert(list, p)
-        else
-            SelectedTargets[p.Name] = nil
-        end
+        if p and p.Parent == Players then table.insert(list, p)
+        else SelectedTargets[p.Name] = nil end
     end
     return list
 end
-
 local function startFlingInternal(todo)
     FlingActive = true
     task.spawn(function()
@@ -2627,62 +2262,47 @@ local function startFlingInternal(todo)
         local hum = ch and ch:FindFirstChildOfClass("Humanoid")
         local root = hum and hum.RootPart
         if ch and root and hum then captureReturn(ch, root, hum) end
-
         for i, player in ipairs(todo) do
             if not FlingActive then break end
             currentTarget = player
-            setStatus(string.format("Flinging @%s (%d/%d)", player.Name, i, #todo),
-                      WHITE, "Freeze + anchor + multi-part kick")
-
+            setStatus(string.format("Flinging @%s (%d/%d) · %s",
+                player.Name, i, #todo, getCurrentTargetLabel()),
+                WHITE, "KILASIK rotation engaged")
             stopFollowThread()
-
             local ok, peak, tries, pn, overlap, delta = burstFlingTarget(player)
             if ok then
-                setStatus(string.format("@%s local contact + motion (%s)",
-                    player.Name, tostring(pn or "unidentified")), GREEN,
-                    string.format("HRP peak %.0f | change %.0f | %d attempts (Hits tab)",
-                        peak, delta or 0, tries))
+                setStatus(string.format("@%s contact (%s)", player.Name, tostring(pn or "unidentified")),
+                    GREEN, string.format("Peak %.0f | %d attempts", peak, tries))
             elseif overlap then
-                setStatus(string.format("@%s overlap, no verified response", player.Name),
-                    AMBER, string.format("HRP peak %.0f | change %.0f | %d attempts",
-                        peak, delta or 0, tries))
+                setStatus(string.format("@%s overlap only", player.Name), AMBER,
+                    string.format("Peak %.0f | %d attempts", peak, tries))
             else
-                setStatus(string.format("@%s no overlap (%d attempts)",
-                    player.Name, tries), AMBER,
-                    string.format("Best HRP speed %.0f studs/s", peak))
+                setStatus(string.format("@%s no overlap", player.Name), AMBER,
+                    string.format("Best %.0f studs/s", peak))
             end
             task.wait(CONFIG.Cooldown)
-
             local landed = safeReturn()
             if not landed then
-                setStatus("Return needs attention", AMBER,
-                    "No verified stable landing; use RESCUE at a clear location")
+                setStatus("Return needs attention", AMBER)
             end
         end
-
         FlingActive = false
         currentTarget = nil
         local recovered = safeReturn()
         if recovered then
             returnSnapshot = nil
-            setStatus("Done — safely landed", GREEN, "Landing verified • contact details in Hits tab")
+            setStatus("Done — safely landed", GREEN)
         else
-            setStatus("Completed — landing unverified", AMBER,
-                "Use RESCUE when a safe checkpoint is available")
+            setStatus("Completed — landing unverified", AMBER)
         end
     end)
 end
-
 startFling = function()
     if FlingActive then return end
     local todo = activeTargets()
-    if #todo == 0 then
-        setStatus("No targets selected", AMBER)
-        return
-    end
+    if #todo == 0 then setStatus("No targets selected", AMBER); return end
     startFlingInternal(todo)
 end
-
 local function stopFling()
     FlingActive = false
     stopFollowThread()
@@ -2709,8 +2329,7 @@ local function refreshPlayers()
                 Size = UDim2.new(1, -18, 0, 56), LayoutOrder = shown,
                 BackgroundColor3 = SelectedTargets[player.Name]
                     and Color3.fromRGB(58, 78, 110) or ROW,
-                BorderSizePixel = 0,
-                AutoButtonColor = false, Text = "",
+                BorderSizePixel = 0, AutoButtonColor = false, Text = "",
             }, List)
             round(Row, 10)
             Row.MouseEnter:Connect(function()
@@ -2719,14 +2338,12 @@ local function refreshPlayers()
             Row.MouseLeave:Connect(function()
                 if not SelectedTargets[player.Name] then Row.BackgroundColor3 = ROW end
             end)
-
             local pic = make("ImageLabel", {
                 Position = UDim2.fromOffset(36, 6),
                 Size = UDim2.fromOffset(40, 40),
                 BackgroundColor3 = PANEL, Image = "",
             }, Row)
             round(pic, 20)
-
             local check = make("Frame", {
                 Position = UDim2.fromOffset(8, 15),
                 Size = UDim2.fromOffset(22, 22),
@@ -2735,7 +2352,6 @@ local function refreshPlayers()
             }, Row)
             round(check, 6)
             make("UIStroke", { Color = Color3.fromRGB(80, 92, 118), Thickness = 1 }, check)
-
             local mark = make("TextLabel", {
                 Size = UDim2.fromScale(1, 1),
                 BackgroundTransparency = 1, Text = "✓",
@@ -2743,16 +2359,13 @@ local function refreshPlayers()
                 Font = Enum.Font.GothamBold, TextSize = 16,
                 Visible = SelectedTargets[player.Name] ~= nil,
             }, check)
-
             local dl = label(player.DisplayName, 14,
                 UDim2.fromOffset(84, 6), UDim2.new(1, -92, 0, 22), Row)
             dl.Font = Enum.Font.GothamBold
             local ul = label("@"..player.Name, 11,
                 UDim2.fromOffset(84, 28), UDim2.new(1, -92, 0, 18), Row)
             ul.TextColor3 = MUTED
-
             loadAvatar(player, pic, Enum.ThumbnailSize.Size100x100)
-
             Row.MouseButton1Click:Connect(function()
                 if SelectedTargets[player.Name] then
                     SelectedTargets[player.Name] = nil
@@ -2787,62 +2400,52 @@ FreezeButton.MouseButton1Click:Connect(function()  runCmd("freeze",   getActiveT
 UnfreezeButton.MouseButton1Click:Connect(function()runCmd("unfreeze", getActiveTarget()) end)
 AnchorButton.MouseButton1Click:Connect(function()  runCmd("anchor",   getActiveTarget()) end)
 UnanchorButton.MouseButton1Click:Connect(function()runCmd("unanchor", getActiveTarget()) end)
-
 AimbotButton.MouseButton1Click:Connect(function() setAimbot(not aimActive) end)
-
 FollowButton.MouseButton1Click:Connect(function()
     followEnabled = not followEnabled
     FollowButton.Text = "Follow: " .. (followEnabled and "ON" or "OFF")
     FollowButton.BackgroundColor3 = followEnabled and GREEN or ROW
     setStatus("Follow: " .. (followEnabled and "ON" or "OFF"), MUTED)
 end)
-
 NoclipButton.MouseButton1Click:Connect(function() setNoclip(not noclipActive) end)
 SpeedButton.MouseButton1Click:Connect(function()  setSpeed(not speedActive) end)
-
 GrabObjectButton.MouseButton1Click:Connect(function()
     grabActive = not grabActive
     if not grabActive then releaseGrab() end
     GrabObjectButton.Text = "Grab Obj: " .. (grabActive and "ON" or "OFF")
     GrabObjectButton.BackgroundColor3 = grabActive and GREEN or ROW
 end)
-
 RescueButton.MouseButton1Click:Connect(function()
     FlingActive = false
     stopFollowThread()
     if selfFlinging then setStatus("Cancelling...", AMBER); return end
     if safeReturn() then
         returnSnapshot = nil
-        setStatus("Recovered", GREEN, "Landing verified")
-    else setStatus("Recovery unavailable", AMBER, "No clear solid floor near checkpoint") end
+        setStatus("Recovered", GREEN)
+    else setStatus("Recovery unavailable", AMBER) end
 end)
-
 SelectAll.MouseButton1Click:Connect(function()
     for _, p in ipairs(Players:GetPlayers()) do
         if p ~= Me and rows[p] then SelectedTargets[p.Name] = p end
     end
     refreshPlayers()
 end)
-
 DeselectAll.MouseButton1Click:Connect(function()
     table.clear(SelectedTargets)
     currentTarget = nil
     refreshPlayers()
 end)
-
 InspectButton.MouseButton1Click:Connect(function()
     local t = getActiveTarget()
-    if t then
-        InspectText.Text = scanTargetRig(t)
+    if t then InspectText.Text = scanTargetRig(t)
     else
-        local lines = { "No target selected — running full scan:", "" }
+        local lines = { "No target selected — full scan:", "" }
         lines[#lines + 1] = scanAll()
         InspectText.Text = table.concat(lines, "\n")
     end
     InspectOverlay.Visible = true
     setStatus("Scan complete", GREEN)
 end)
-
 FlingButton.MouseButton1Click:Connect(startFling)
 Stop.MouseButton1Click:Connect(stopFling)
 
@@ -2866,14 +2469,13 @@ table.insert(connections, Players.PlayerRemoving:Connect(function(player)
     if currentTarget == player then currentTarget = nil end
     task.defer(function() if Gui.Parent then refreshPlayers() end end)
 end))
-
 table.insert(connections, Me.CharacterAdded:Connect(function()
     task.wait(0.5)
     startDamageGuard()
 end))
 
 --====================================
--- DRAG (bounds matched to new HUD reserves)
+-- DRAG
 --====================================
 local dragging, dragInput, dragStart, startPos = false
 Header.InputBegan:Connect(function(input)
@@ -2896,7 +2498,7 @@ table.insert(connections, UIS.InputChanged:Connect(function(input)
     local minY = UIS.TouchEnabled and math.max(insetY + 8, vpY * 0.10)
         or math.max(insetY + 8, 12)
     local maxY = math.max(minY, vpY - Main.Size.Y.Offset -
-        (UIS.TouchEnabled and math.max(22, vpY * 0.08) or 8))
+        (UIS.TouchEnabled and math.max(22, vpY * 0.10) or 8))
     Main.Position = UDim2.new(
         startPos.X.Scale, startPos.X.Offset + delta.X,
         0, math.clamp(startPos.Y.Offset + delta.Y, minY, maxY))
@@ -2912,7 +2514,6 @@ if cam then
 end
 
 CloseButton.MouseButton1Click:Connect(function() Gui:Destroy() end)
-
 Gui.Destroying:Connect(function()
     FlingActive = false
     stopFollowThread()
@@ -2926,9 +2527,8 @@ end)
 -- BOOT
 --====================================
 startDamageGuard()
-
 updateWindow()
 refreshPlayers()
-setStatus("Ready · left arm tracking", MUTED,
-    "Select a target. Hits tab shows detected limb contact.")
-print("Fling v23.4m — left-arm default; mobile HUD-safe portrait panel")
+setStatus("Ready · " .. getCurrentTargetLabel(), MUTED,
+    "Target Part selector in the Actions tab.")
+print("Fling v23.4k — KILASIK rotation; Target Part selector (Original / LeftUpperArm)")
