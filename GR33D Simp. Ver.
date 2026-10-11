@@ -1,8 +1,8 @@
 --[[
-    PLAYER FLING v23.4L — Landscape-Full-Height + 2 Target Options
-    • Target Part options: "Original" | "LeftUpperArm"  (only two)
-    • Landscape: hudTop=2, hudBottom=2, PANEL_H=1400 → panel = full screen
-    • Portrait: hudTop=6%, hudBottom=8% → still taller than before
+    PLAYER FLING v23.4M
+    • HRP tracker + prediction (fixes hitting a moving target)
+    • Target Part selector: Original | LeftUpperArm   (only two)
+    • Narrower UI (460 px wide); full-height in landscape
     • KILASIK rotation logic retained
 ]]
 
@@ -34,7 +34,6 @@ local CONFIG = {
 }
 local HRP_BURST = { MaxAttempts = 8, SuccessPeakVel = 250, DelayBetween = 0.15, SampleAfter = 0.30 }
 
--- EXACTLY TWO OPTIONS
 local TARGET_PART_OPTIONS = {
     {id = "original",     label = "Original"},
     {id = "LeftUpperArm", label = "LeftUpperArm"},
@@ -46,6 +45,9 @@ local function getCurrentTargetLabel()
     end
     return "Original"
 end
+
+-- Prediction window (seconds). Tunable from the Actions tab.
+local PREDICTION_TIME = 0.06
 
 do
     local ok, ping = pcall(function()
@@ -82,6 +84,52 @@ local guardFF, guardVelConn, guardHealthConn = nil, nil, nil
 local guardAnchoredSelf = false
 local freezeActive, freezeThreads = {}, {}
 
+-- ============================================================
+-- HRP TRACKER + PREDICTION
+-- Samples every RenderStepped so we always have the freshest
+-- HRP position/velocity for every other player, then extrapolates
+-- forward by PREDICTION_TIME when aiming.
+-- ============================================================
+local HRPs = {}                     -- [player] = {hrp, pos, vel, time}
+do
+    local function bindPlayer(plr)
+        if plr == Me then return end
+        local function bindChar(char)
+            local hrp = char:WaitForChild("HumanoidRootPart", 5)
+            if not hrp then return end
+            HRPs[plr] = {
+                hrp = hrp,
+                pos = hrp.Position,
+                vel = hrp.AssemblyLinearVelocity,
+                time = os.clock(),
+            }
+        end
+        plr.CharacterAdded:Connect(bindChar)
+        if plr.Character then bindChar(plr.Character) end
+    end
+    for _, p in ipairs(Players:GetPlayers()) do bindPlayer(p) end
+    Players.PlayerAdded:Connect(bindPlayer)
+    Players.PlayerRemoving:Connect(function(p) HRPs[p] = nil end)
+end
+table.insert(connections, RunService.RenderStepped:Connect(function()
+    for _, d in pairs(HRPs) do
+        if d.hrp and d.hrp.Parent then
+            d.pos = d.hrp.Position
+            d.vel = d.hrp.AssemblyLinearVelocity
+            d.time = os.clock()
+        end
+    end
+end))
+local function predictedPos(data, extraTime)
+    if not data then return nil end
+    local dt = (os.clock() - (data.time or os.clock())) + (extraTime or 0)
+    if dt > 0.35 then dt = 0.35 end
+    if dt < 0 then dt = 0 end
+    local v = data.vel or Vector3.zero
+    if v.Magnitude > 250 then v = v.Unit * 250 end
+    return data.pos + v * dt
+end
+
 local BG=Color3.fromRGB(19,23,35) local PANEL=Color3.fromRGB(30,37,53)
 local ROW=Color3.fromRGB(41,49,69) local ROWHI=Color3.fromRGB(52,62,86)
 local ACCENT=Color3.fromRGB(83,138,255) local ACCENTD=Color3.fromRGB(60,100,200)
@@ -98,7 +146,7 @@ local function label(t,s,pos,dim,parent)
         BackgroundTransparency=1,Position=pos,Size=dim},parent)
 end
 
--- HIT DEBUG (compact)
+-- HIT DEBUG
 local HitDebug = {}
 do
 local hitObservations = {}
@@ -219,12 +267,14 @@ HitDebug.render = renderHitInfo
 HitDebug.clear = clearHitInfo
 end
 
--- GUI
+-- ============================================================
+-- GUI  — narrower panel (460 wide); height preserved
+-- ============================================================
 local Gui = make("ScreenGui", {Name="PlayerOrbitV3", ResetOnSpawn=false,
     IgnoreGuiInset=true, ZIndexBehavior=Enum.ZIndexBehavior.Sibling}, PlayerGui)
 
-local PANEL_W = 520
-local PANEL_H = 1400   -- virtually uncapped; usableH is the real limit
+local PANEL_W = 460      -- was 520, now narrower
+local PANEL_H = 1400
 
 local Main = make("Frame", {AnchorPoint=Vector2.new(0.5,0),
     Position=UDim2.new(0.5,0,0,0.02),
@@ -237,9 +287,9 @@ local Scale = make("UIScale", {Scale=1}, Main)
 local Header = make("Frame", {Size=UDim2.new(1,0,0,56), BackgroundTransparency=1, Active=true}, Main)
 make("Frame", {Position=UDim2.fromOffset(0,0), Size=UDim2.new(0,4,1,0),
     BackgroundColor3=ACCENT, BorderSizePixel=0}, Header)
-local Title = label("FLING  ·  v23.4L", 15, UDim2.fromOffset(20,10), UDim2.new(1,-180,0,20), Header)
+local Title = label("FLING  ·  v23.4M", 15, UDim2.fromOffset(20,10), UDim2.new(1,-180,0,20), Header)
 Title.Font = Enum.Font.GothamBold
-local SubTitle = label("KILASIK rotation  ·  Original / LeftUpperArm", 10,
+local SubTitle = label("HRP prediction  ·  Original / LeftUpperArm", 10,
     UDim2.fromOffset(20,30), UDim2.new(1,-180,0,14), Header)
 SubTitle.TextColor3 = MUTED
 
@@ -382,7 +432,7 @@ local SelectAll     = makeActionBtn("ALL",  14,                    s_y, s_w, s_h
 local DeselectAll   = makeActionBtn("NONE", 14 + (s_w+s_gap)*1,    s_y, s_w, s_h, ROW)
 local InspectButton = makeActionBtn("SCAN", 14 + (s_w+s_gap)*2,    s_y, s_w, s_h, ACCENTD)
 
--- TARGET PART selector (only 2 options)
+-- TARGET PART (2 options)
 local TargetPartHeading = label("TARGET PART", 11, UDim2.fromOffset(14,0),
     UDim2.new(1,-28,0,16), Content)
 TargetPartHeading.Font = Enum.Font.GothamBold
@@ -442,6 +492,31 @@ for i, opt in ipairs(TARGET_PART_OPTIONS) do
 end
 TargetPartButton.MouseButton1Click:Connect(function()
     TargetPartDropdown.Visible = not TargetPartDropdown.Visible
+end)
+
+-- PREDICTION (ms)
+local PredHeading = label("PREDICTION (ms)", 11, UDim2.fromOffset(14,0),
+    UDim2.new(1,-28,0,16), Content)
+PredHeading.Font = Enum.Font.GothamBold
+PredHeading.TextColor3 = MUTED
+local PredBox = make("TextBox", {
+    Text = tostring(math.floor(PREDICTION_TIME * 1000)),
+    ClearTextOnFocus = false, TextColor3 = WHITE,
+    TextSize = 13, Font = Enum.Font.GothamBold,
+    BackgroundColor3 = PANEL,
+    TextXAlignment = Enum.TextXAlignment.Center,
+    Size = UDim2.new(1,-28,0,34),
+    Position = UDim2.fromOffset(14,22)}, Content)
+round(PredBox, 8)
+PredBox.FocusLost:Connect(function()
+    local n = tonumber(PredBox.Text)
+    if n and n >= 0 and n <= 350 then
+        PREDICTION_TIME = n / 1000
+        setStatus("Prediction: " .. n .. " ms", CYAN,
+            "Higher = more lead. Try 100-150 for high-ping servers.")
+    else
+        PredBox.Text = tostring(math.floor(PREDICTION_TIME * 1000))
+    end
 end)
 
 local FlingButton = make("TextButton", {Text="▶  FLING", Font=Enum.Font.GothamBold,
@@ -514,7 +589,8 @@ for _, obj in ipairs({sectionFrames[1], CmdBar, sectionFrames[2], Search,
 end
 for _, obj in ipairs({sectionFrames[3], TPButton, BringButton,
     FreezeButton, UnfreezeButton, AnchorButton, UnanchorButton,
-    TargetPartHeading, TargetPartButton, TargetPartDropdown}) do
+    TargetPartHeading, TargetPartButton, TargetPartDropdown,
+    PredHeading, PredBox}) do
     obj.Parent = ActionPage
 end
 for _, obj in ipairs({AimbotButton, FollowButton, NoclipButton,
@@ -615,7 +691,7 @@ local function reflowContents(panelWidth, panelHeight)
     local innerWidth = panelWidth - 44
     local innerHeight = math.max(1, PageHost.Size.Y.Offset)
     local compact = innerHeight < 350
-    ActionPage.CanvasSize = UDim2.fromOffset(0, 510)
+    ActionPage.CanvasSize = UDim2.fromOffset(0, 540)
     UtilityPage.CanvasSize = UDim2.fromOffset(0, innerWidth < 335 and 365 or 340)
     HitPage.ScrollingEnabled = compact
     HitPage.ScrollBarThickness = compact and 6 or 0
@@ -661,6 +737,7 @@ local function reflowContents(panelWidth, panelHeight)
         place(InspectButton, 10 + 2 * (third + gap), selectionY + 22,
             innerWidth - 2 * (third + gap), 36)
     end
+    -- Actions tab
     place(sectionFrames[3], 10, 14, innerWidth, 18)
     local targetButtons = {TPButton, BringButton, FreezeButton,
         UnfreezeButton, AnchorButton, UnanchorButton}
@@ -673,6 +750,9 @@ local function reflowContents(panelWidth, panelHeight)
     place(TargetPartHeading, 10, 280, innerWidth, 18)
     place(TargetPartButton, 10, 300, innerWidth, 38)
     place(TargetPartDropdown, 10, 344, innerWidth, 80)
+    place(PredHeading, 10, 430, innerWidth, 18)
+    place(PredBox,     10, 450, innerWidth, 34)
+    -- Tools
     place(UtilityTitle, 10, 14, innerWidth, 22)
     local utilityButtons = {AimbotButton, FollowButton, NoclipButton,
         SpeedButton, GrabObjectButton, RescueButton}
@@ -694,6 +774,7 @@ local function reflowContents(panelWidth, panelHeight)
         place(SmoothBox, 74 + half + gap, 232, half - 64, 34)
         place(ToolsHint, 10, 283, innerWidth, 44)
     end
+    -- Hits
     place(HitHeading, 10, 14, innerWidth, 24)
     place(HitDebug.summary, 10, 43, innerWidth, 55)
     place(HitDebug.details, 10, 106, innerWidth, 89)
@@ -737,9 +818,7 @@ PlayerRowLayout:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(function
     end)
 end)
 
--- ============================================================
--- WINDOW SIZING — FULL HEIGHT IN LANDSCAPE
--- ============================================================
+-- WINDOW SIZING (unchanged height, narrower already set via PANEL_W)
 updateWindow = function()
     local cam = workspace.CurrentCamera
     local vp = cam and cam.ViewportSize or Vector2.new(1024, 768)
@@ -749,8 +828,6 @@ updateWindow = function()
     end)
     local touch = UIS.TouchEnabled
     local isLandscape = vp.X > vp.Y
-
-    -- v23.4L: very small reserves so the panel is genuinely tall.
     local hudTop, hudBottom
     if not touch then
         hudTop = math.max(insetY + 4, 8); hudBottom = 6
@@ -763,22 +840,18 @@ updateWindow = function()
     if vp.Y - hudTop - hudBottom < 200 then
         hudTop = math.max(insetY + 2, 2); hudBottom = 2
     end
-
-    local maxWidth  = maximized and 800 or PANEL_W
+    local maxWidth  = maximized and 720 or PANEL_W
     local maxHeight = maximized and 1400 or PANEL_H
     local usableH = math.max(180, vp.Y - hudTop - hudBottom)
     local h = minimized and 44 or math.min(maxHeight, usableH)
-
-    -- Remove aspect cap in landscape mobile so width cannot shrink panel.
     local aspectCap
     if maximized then aspectCap = 1.6
-    elseif touch and isLandscape then aspectCap = 2.2
+    elseif touch and isLandscape then aspectCap = 2.4
     else aspectCap = 0.9 end
     local aspectWidth = math.floor(h * aspectCap)
     local viewportWidth = math.max(250, vp.X - 16)
     local w = math.min(maxWidth, aspectWidth, viewportWidth)
     w = math.max(300, w)
-
     local compact = h < 480
     local headerH = compact and 36 or 60
     local tabsH   = compact and 34 or 42
@@ -786,7 +859,6 @@ updateWindow = function()
     local navY    = compact and 3 or 6
     local hostY   = navY + tabsH + 6
     local contentH = h - headerH
-
     Main.Position = UDim2.new(0.5, 0, 0, hudTop)
     Main.Size = UDim2.fromOffset(w, h)
     Scale.Scale = 1
@@ -832,10 +904,6 @@ MinButton.MouseButton1Click:Connect(function() minimized = not minimized; update
 MaxButton.MouseButton1Click:Connect(function() maximized = not maximized; minimized = false; updateWindow() end)
 end
 
--- Remaining fling core, scanners, commands, damage guard, safe return,
--- follow thread, noclip/speed, player list, buttons, drag, boot — identical
--- to v23.4 with the two changes above. Only the code that differs is shown.
-
 local function loadAvatar(player, image, size)
     image:SetAttribute("AvatarUserId", player.UserId)
     image.Image = ""
@@ -849,6 +917,7 @@ local function loadAvatar(player, image, size)
     end)
 end
 
+-- DAMAGE GUARD
 local function isGuardActive() return true end
 local function startDamageGuard()
     local ch = Me.Character
@@ -927,6 +996,7 @@ local function stopDamageGuard()
     end
 end
 
+-- SAFE RETURN
 local function zeroCharacterMotion(ch)
     if not ch then return end
     for _, part in ipairs(ch:GetDescendants()) do
@@ -1181,12 +1251,38 @@ local function setAimbot(state)
     else setStatus("Aimbot OFF", MUTED); currentAimTarget = nil end
 end
 
+-- HELPERS
 local function getTargetHRP(player)
     local tc = player and player.Character
     if not tc then return nil, nil, nil end
     local tHum = tc:FindFirstChildOfClass("Humanoid")
     return tc, tHum, tHum and tHum.RootPart
 end
+
+-- AIM POSITION — the crucial change.
+-- Returns the world-space point we should aim at:
+--   • HRP target  → predicted HRP position (velocity lead + sample age)
+--   • arm target  → predicted HRP + the limb's current offset from HRP
+local function getAimWorldPosition(tCharacter, aimPart)
+    if not tCharacter or not aimPart then return nil end
+    local tHum = tCharacter:FindFirstChildOfClass("Humanoid")
+    local tHRP = tHum and tHum.RootPart
+    if not tHRP then return aimPart.Position end
+
+    local plr = Players:GetPlayerFromCharacter(tCharacter)
+    local data = plr and HRPs[plr]
+    local predictedHRP = (data and predictedPos(data, PREDICTION_TIME)) or tHRP.Position
+
+    if aimPart == tHRP then
+        return predictedHRP
+    end
+    local limbOffset = aimPart.Position - tHRP.Position
+    if limbOffset.Magnitude > 6 then
+        limbOffset = limbOffset.Unit * 6
+    end
+    return predictedHRP + limbOffset
+end
+
 local function findPlayerByName(name)
     if not name or name == "" then return nil end
     local ln = name:lower()
@@ -1209,7 +1305,7 @@ local function getActiveTarget()
     return nil
 end
 
--- Scanners (compact)
+-- SCANNERS
 local function getOwnerString(inst)
     if not inst or not inst.Parent then return "?" end
     local s = "?"
@@ -1249,7 +1345,7 @@ local function scanAll()
     return table.concat(lines, "\n")
 end
 
--- Manual commands (compact)
+-- MANUAL COMMANDS
 local function cmdGoto(player)
     local ch = Me.Character
     local hum = ch and ch:FindFirstChildOfClass("Humanoid")
@@ -1324,7 +1420,7 @@ local function runCmd(action, player)
     return ok
 end
 
--- Grab objects
+-- GRAB OBJECTS
 local mouse = Me:GetMouse()
 local function releaseGrab()
     if grabbedPart and grabbedPart.Parent then
@@ -1372,7 +1468,7 @@ table.insert(connections, UIS.InputBegan:Connect(function(input, gpe)
     end
 end))
 
--- Follow
+-- FOLLOW
 local function stopFollowThread() followActive = false; followTarget = nil end
 local function startFollowThread(target)
     if not followEnabled then return end
@@ -1402,7 +1498,7 @@ local function startFollowThread(target)
     end)
 end
 
--- Noclip / Speed
+-- NOCLIP / SPEED
 local function setNoclip(state)
     if noclipActive == state then return end
     noclipActive = state
@@ -1449,7 +1545,7 @@ local function setSpeed(state)
     end
 end
 
--- Command bar
+-- COMMAND BAR
 local function runCommand(text)
     text = text:gsub("^%s+", ""):gsub("%s+$", "")
     if text == "" then return end
@@ -1561,9 +1657,13 @@ local function hardTeleportToTarget(player)
     local myRoot = hum and hum.RootPart
     local _, _, tRoot = getTargetHRP(player)
     if not (ch and myRoot and tRoot) then return false end
-    local target = tRoot.Position + tRoot.CFrame.LookVector * 2.5 + Vector3.new(0,2,0)
+    -- Aim at predicted HRP too so teleport doesn't lag behind a running target.
+    local tChar = player.Character
+    local aimWorld = getAimWorldPosition(tChar, tRoot) or tRoot.Position
+    local look = tRoot.CFrame.LookVector
+    local target = aimWorld + look * 2.5 + Vector3.new(0,2,0)
     pcall(function()
-        ch:PivotTo(CFrame.new(target, tRoot.Position))
+        ch:PivotTo(CFrame.new(target, aimWorld))
         myRoot.AssemblyLinearVelocity = Vector3.zero
         myRoot.AssemblyAngularVelocity = Vector3.zero
     end)
@@ -1638,7 +1738,7 @@ local function sampleContact(myRoot, targetCharacter, targetRoot, params, monito
     end
 end
 
--- SKID FLING — KILASIK rotation
+-- SKID FLING — KILASIK rotation + HRP prediction aim
 local function SkidFling(TargetPlayer, forcedPart, monitor)
     local Character = Me.Character
     local Humanoid  = Character and Character:FindFirstChildOfClass("Humanoid")
@@ -1689,15 +1789,18 @@ local function SkidFling(TargetPlayer, forcedPart, monitor)
         end)
     end
 
+    -- *** KEY CHANGE: aim at the predicted world position of BP ***
     local function FPos(BP, Pos, Ang)
         if not RootPart.Parent or not BP.Parent then return end
         pcall(function()
             RootPart.CanCollide = true
             RootPart.Massless = false
         end)
-        RootPart.CFrame = CFrame.new(BP.Position) * Pos * Ang
-        pcall(function() Character:SetPrimaryPartCFrame(CFrame.new(BP.Position) * Pos * Ang) end)
-        RootPart.Velocity = Vector3.new(9e7, 9e7 * 10, 9e7)
+        local aimWorld = getAimWorldPosition(TCharacter, BP) or BP.Position
+        local baseCF = CFrame.new(aimWorld)
+        RootPart.CFrame = baseCF * Pos * Ang
+        pcall(function() Character:SetPrimaryPartCFrame(baseCF * Pos * Ang) end)
+        RootPart.Velocity    = Vector3.new(9e7, 9e7 * 10, 9e7)
         RootPart.RotVelocity = Vector3.new(9e8, 9e8, 9e8)
     end
 
@@ -1774,7 +1877,7 @@ local function SkidFling(TargetPlayer, forcedPart, monitor)
 
     if ran then attackOK, confirmed = true, result == true
     else
-        warn("[Fling v23.4L] Movement failed:", result)
+        warn("[Fling v23.4M] Movement failed:", result)
         setStatus("Movement error", RED, tostring(result):sub(1, 110))
     end
     if touchConnection then touchConnection:Disconnect() end
@@ -1892,7 +1995,7 @@ local function startFlingInternal(todo)
             currentTarget = player
             setStatus(string.format("Flinging @%s (%d/%d) · %s",
                 player.Name, i, #todo, getCurrentTargetLabel()), WHITE,
-                "KILASIK rotation engaged")
+                string.format("Predict +%.0f ms", PREDICTION_TIME * 1000))
             stopFollowThread()
             local ok, peak, tries, pn = burstFlingTarget(player)
             if ok then
@@ -1928,7 +2031,7 @@ local function stopFling()
     setStatus("Stopped", MUTED)
 end
 
--- Player list
+-- PLAYER LIST
 local function refreshPlayers()
     for _, r in pairs(rows) do r:Destroy() end
     table.clear(rows)
@@ -1996,7 +2099,7 @@ local function refreshPlayers()
         #all, shown, #activeTargets())
 end
 
--- Buttons
+-- BUTTONS
 TPButton.MouseButton1Click:Connect(function() runCmd("goto", getActiveTarget()) end)
 BringButton.MouseButton1Click:Connect(function() runCmd("bring", getActiveTarget()) end)
 FreezeButton.MouseButton1Click:Connect(function() runCmd("freeze", getActiveTarget()) end)
@@ -2077,7 +2180,7 @@ table.insert(connections, Me.CharacterAdded:Connect(function()
     startDamageGuard()
 end))
 
--- Drag
+-- DRAG
 local dragging, dragInput, dragStart, startPos = false
 Header.InputBegan:Connect(function(input)
     if input.UserInputType == Enum.UserInputType.MouseButton1
@@ -2115,10 +2218,10 @@ Gui.Destroying:Connect(function()
     for _, c in ipairs(connections) do c:Disconnect() end
 end)
 
--- Boot
+-- BOOT
 startDamageGuard()
 updateWindow()
 refreshPlayers()
 setStatus("Ready · " .. getCurrentTargetLabel(), MUTED,
-    "Target Part selector in Actions tab.")
-print("Fling v23.4L — full-height landscape panel; 2 target options")
+    string.format("Prediction: %.0f ms", PREDICTION_TIME * 1000))
+print("Fling v23.4M — HRP prediction; narrower panel; 2 target options")
