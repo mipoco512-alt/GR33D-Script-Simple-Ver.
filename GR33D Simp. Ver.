@@ -1,15 +1,12 @@
 --[[
-    PLAYER FLING v23.4N
-    • Universal PartTracker — tracks EVERY BasePart of every other
-      player, so we can predict the exact world position of any chosen
-      target part (HRP, Head, Handle, LeftUpperArm …) instead of
-      guessing with a stale HRP-relative offset.
+    PLAYER FLING v23.4O
+    • Universal PartTracker — predicts the exact world position of any
+      chosen target part (HRP, Head, Handle, LeftUpperArm …).
     • KILASIK rotation logic preserved (FPos + SFBasePart pattern).
-    • Target Part selector: Original | LeftUpperArm (only two).
-    • Self-fling guard — kick velocity only applied when we are
-      actually overlapping the target part this frame.
-    • Airborne-chase break — the fling stops chasing once the target
-      is already flying.
+    • Target Part selector: Original | LeftUpperArm  (only two).
+    • Self-fling guard — kick velocity only applied on real overlap.
+    • Airborne-chase break — requires off-floor AND v > 500, no distance
+      gate, never skips first attempt.
     • Narrower panel (460 px), full-height in landscape.
 ]]
 
@@ -53,7 +50,7 @@ local function getCurrentTargetLabel()
     return "Original"
 end
 
-local PREDICTION_TIME = 0.06   -- seconds; tunable from Actions tab
+local PREDICTION_TIME = 0.06
 
 do
     local ok, ping = pcall(function()
@@ -92,14 +89,9 @@ local freezeActive, freezeThreads = {}, {}
 
 -- ============================================================
 -- UNIVERSAL PART TRACKER + PREDICTION
--- Tracks EVERY BasePart in every other player's character every
--- RenderStepped frame. This lets us aim at the exact predicted
--- world position of ANY chosen part (HRP, Head, Handle,
--- LeftUpperArm, LeftLowerArm, …) — mirroring KILASIK's "read the
--- part fresh every cycle" logic, but with network-lag lead.
 -- ============================================================
-local PartTracker = {}   -- [part] = {pos, vel, time}
-local CharParts   = {}   -- [character] = {list of tracked parts}
+local PartTracker = {}
+local CharParts   = {}
 
 local function trackCharacter(char)
     if not char then return end
@@ -345,7 +337,7 @@ local Scale = make("UIScale", {Scale=1}, Main)
 local Header = make("Frame", {Size=UDim2.new(1,0,0,56), BackgroundTransparency=1, Active=true}, Main)
 make("Frame", {Position=UDim2.fromOffset(0,0), Size=UDim2.new(0,4,1,0),
     BackgroundColor3=ACCENT, BorderSizePixel=0}, Header)
-local Title = label("FLING  ·  v23.4N", 15, UDim2.fromOffset(20,10), UDim2.new(1,-180,0,20), Header)
+local Title = label("FLING  ·  v23.4O", 15, UDim2.fromOffset(20,10), UDim2.new(1,-180,0,20), Header)
 Title.Font = Enum.Font.GothamBold
 local SubTitle = label("Part-tracker ·  Original / LeftUpperArm", 10,
     UDim2.fromOffset(20,30), UDim2.new(1,-180,0,14), Header)
@@ -490,7 +482,6 @@ local SelectAll     = makeActionBtn("ALL",  14,                    s_y, s_w, s_h
 local DeselectAll   = makeActionBtn("NONE", 14 + (s_w+s_gap)*1,    s_y, s_w, s_h, ROW)
 local InspectButton = makeActionBtn("SCAN", 14 + (s_w+s_gap)*2,    s_y, s_w, s_h, ACCENTD)
 
--- TARGET PART selector
 local TargetPartHeading = label("TARGET PART", 11, UDim2.fromOffset(14,0),
     UDim2.new(1,-28,0,16), Content)
 TargetPartHeading.Font = Enum.Font.GothamBold
@@ -552,7 +543,6 @@ TargetPartButton.MouseButton1Click:Connect(function()
     TargetPartDropdown.Visible = not TargetPartDropdown.Visible
 end)
 
--- PREDICTION
 local PredHeading = label("PREDICTION (ms)", 11, UDim2.fromOffset(14,0),
     UDim2.new(1,-28,0,16), Content)
 PredHeading.Font = Enum.Font.GothamBold
@@ -1313,7 +1303,6 @@ local function getTargetHRP(player)
     return tc, tHum, tHum and tHum.RootPart
 end
 
--- Aim point: predict the exact world position of the chosen part.
 local function getAimWorldPosition(tCharacter, aimPart)
     if not aimPart or not aimPart.Parent then return nil end
     return predictPart(aimPart, PREDICTION_TIME) or aimPart.Position
@@ -1771,7 +1760,7 @@ local function sampleContact(myRoot, targetCharacter, targetRoot, params, monito
     end
 end
 
--- SKID FLING — KILASIK rotation + prediction + self-fling guard
+-- SKID FLING
 local function SkidFling(TargetPlayer, forcedPart, monitor)
     local Character = Me.Character
     local Humanoid  = Character and Character:FindFirstChildOfClass("Humanoid")
@@ -1934,7 +1923,7 @@ local function SkidFling(TargetPlayer, forcedPart, monitor)
 
     if ran then attackOK, confirmed = true, result == true
     else
-        warn("[Fling v23.4N] Movement failed:", result)
+        warn("[Fling v23.4O] Movement failed:", result)
         setStatus("Movement error", RED, tostring(result):sub(1, 110))
     end
     if touchConnection then touchConnection:Disconnect() end
@@ -1969,21 +1958,19 @@ local function burstFlingTarget(player)
         if not FlingActive then break end
         if not isTargetReady(player) then break end
 
-        -- Airborne-chase break
-        do
+        -- Airborne-chase break: only skip if target is *unambiguously* flying.
+        --   • Never skip on the first attempt.
+        --   • Never skip based on distance.
+        --   • Require off-floor AND very high velocity (>500 studs/s).
+        if attempts > 0 then
             local _, tHumNow, tRootNow = getTargetHRP(player)
-            if tHumNow and tRootNow and tRootNow.Parent and Me.Character then
-                local myRoot = Me.Character:FindFirstChild("HumanoidRootPart")
-                if myRoot then
-                    local v = tRootNow.AssemblyLinearVelocity.Magnitude
-                    local airborne = tHumNow.FloorMaterial == Enum.Material.Air
-                    local dist = (tRootNow.Position - myRoot.Position).Magnitude
-                    if v > 300 or (airborne and v > 100) or dist > 60 then
-                        setStatus(player.Name .. " already airborne — stop chase", CYAN,
-                            string.format("vel %.0f · airborne=%s · dist %.0f",
-                                v, tostring(airborne), dist))
-                        break
-                    end
+            if tHumNow and tRootNow and tRootNow.Parent then
+                local v = tRootNow.AssemblyLinearVelocity.Magnitude
+                local offFloor = tHumNow.FloorMaterial == Enum.Material.Air
+                if offFloor and v > 500 then
+                    setStatus(player.Name .. " already flung — stop chase", CYAN,
+                        string.format("airborne · vel %.0f", v))
+                    break
                 end
             end
         end
@@ -2075,21 +2062,19 @@ local function startFlingInternal(todo)
                 string.format("Predict +%.0f ms", PREDICTION_TIME * 1000))
             stopFollowThread()
 
-            -- Skip if already airborne
+            -- Skip only if the target is unambiguously mid-fling.
+            -- Never skip based on distance — that would block legitimate
+            -- long-range flings, which is the whole point of the exploit.
             local skip = false
             do
                 local _, tHumPre, tRootPre = getTargetHRP(player)
-                if tHumPre and tRootPre and tRootPre.Parent and Me.Character then
-                    local myRoot = Me.Character:FindFirstChild("HumanoidRootPart")
-                    if myRoot then
-                        local v = tRootPre.AssemblyLinearVelocity.Magnitude
-                        local airborne = tHumPre.FloorMaterial == Enum.Material.Air
-                        local dist = (tRootPre.Position - myRoot.Position).Magnitude
-                        if v > 300 or (airborne and v > 100) or dist > 60 then
-                            setStatus(string.format("@%s already airborne (%.0f)", player.Name, v),
-                                CYAN, "Skipping — already flung")
-                            skip = true
-                        end
+                if tHumPre and tRootPre and tRootPre.Parent then
+                    local v = tRootPre.AssemblyLinearVelocity.Magnitude
+                    local offFloor = tHumPre.FloorMaterial == Enum.Material.Air
+                    if offFloor and v > 500 then
+                        setStatus(string.format("@%s already flung (%.0f)", player.Name, v),
+                            CYAN, "Skipping — already airborne")
+                        skip = true
                     end
                 end
             end
@@ -2326,4 +2311,4 @@ updateWindow()
 refreshPlayers()
 setStatus("Ready · " .. getCurrentTargetLabel(), MUTED,
     string.format("Prediction: %.0f ms", PREDICTION_TIME * 1000))
-print("Fling v23.4N — universal part tracker, 2 target options, self-fling guard")
+print("Fling v23.4O — universal part tracker, 2 target options, self-fling guard, fixed airborne check")
