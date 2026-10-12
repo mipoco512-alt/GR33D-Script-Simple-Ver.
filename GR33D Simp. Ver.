@@ -1,14 +1,8 @@
 --[[
-    GR33D EXPLOIT — v13
-      • Whitelist [9321819967]
-      • Super Ring: original filter, original physics, no CFrame teleport
-      • Mass Ring: direct-to-ring (no pool), 300 part cap, throttled scanner,
-                  per-frame work budget, ownership re-claim, sim-radius boost
-      • Counter shows ONLY orbiting parts (not scanner tally)
-      • Fling All: original SkidFling, uses Player list
-      • Fly: MoveDirection (mobile + PC)
-      • Player buttons survive mass fling
-      • RESET RUNG fully re-locks super ring
+    GR33D EXPLOIT — v16
+      • Mass: original filter, rings orbit target DURING collection
+      • FLING NOW: tightens orbit radius so parts hit target
+      • No floating above you — parts go straight to target
 ]]
 
 local Players = game:GetService("Players")
@@ -18,9 +12,6 @@ local Lighting = game:GetService("Lighting")
 local Me = Players.LocalPlayer
 local PlayerGui = Me:WaitForChild("PlayerGui")
 
--- ============================================================
--- WHITELIST
--- ============================================================
 local PROTECTED_USERS = { [9321819967] = true }
 local PROTECTED_NAMES = {}
 local function isProtectedPlayer(player)
@@ -30,9 +21,6 @@ local function isProtectedPlayer(player)
     return false
 end
 
--- ============================================================
--- STATE
--- ============================================================
 local OrbitState = 0
 local LockedPosition = nil
 local targetPlayerNames = {}
@@ -49,8 +37,7 @@ local updateWindow
 local config = {
     radiusA = 5, radiusB = 5,
     heightA = 0, heightB = 2,
-    speed = 8,
-    targetRadius = 100,
+    speed = 8, targetRadius = 100,
     baseSpeedMultiplier = 8,
     scanRadius = 2000, maxItemsPerLoop = 150,
     simRadius = 6000,
@@ -59,21 +46,21 @@ local config = {
     selfImmunity = true, immunityRadius = 15,
 }
 
+-- [MASS] Collect → ring on target → FLING tightens
 local massState = {
-    enabled = false,
+    collecting = false,
     lookup = {},
-    scanRadius = 5000,
-    itemsPerScan = 60,          -- reduced to prevent burst
-    scanInterval = 0.4,
-    maxRingParts = 300,         -- hard cap total orbiting
-    thread = nil,
     rings = {},
-    ringSpeed = 80,
-    headRadiusA = 6, headRadiusB = 8,
-    headHeightA = 15, headHeightB = 20,
-    bodyRadius = 3, bodyHeight = 0,
-    lastReport = "",
-    active = false,
+    scanRadius = 3000,
+    scanInterval = 0.5,
+    maxParts = 400,
+    collectRadius = 15,
+    collectHeight = 8,
+    hitRadius = 3,
+    hitHeight = 0,
+    ringSpeed = 30,
+    thread = nil,
+    loopConn = nil,
 }
 
 local old = PlayerGui:FindFirstChild("GR33D_EXPLOIT")
@@ -82,6 +69,7 @@ if old then old:Destroy() end
 local function selectedCount() local n=0 for _ in pairs(targetPlayerNames) do n=n+1 end return n end
 local function rungCount() local n=0 for _ in pairs(rungPlayers) do n=n+1 end return n end
 local function massRingCount() local n=0 for _ in pairs(massState.rings) do n=n+1 end return n end
+local function massTotalParts() local n=0 for _,r in pairs(massState.rings) do n=n+#r.parts end return n end
 
 local BG=Color3.fromRGB(19,23,35) local PANEL=Color3.fromRGB(30,37,53)
 local ROW=Color3.fromRGB(41,49,69) local ROWHI=Color3.fromRGB(52,62,86)
@@ -94,9 +82,6 @@ local function make(c,p,parent) local o=Instance.new(c) for k,v in pairs(p) do o
 local function round(o,r) make("UICorner",{CornerRadius=UDim.new(0,r)},o) end
 local function label(t,s,pos,dim,parent) return make("TextLabel",{Text=t,TextSize=s,Font=Enum.Font.Gotham,TextColor3=WHITE,TextXAlignment=Enum.TextXAlignment.Left,TextTruncate=Enum.TextTruncate.AtEnd,BackgroundTransparency=1,Position=pos,Size=dim},parent) end
 
--- ============================================================
--- GUI ROOT
--- ============================================================
 local Gui = make("ScreenGui", {Name="GR33D_EXPLOIT", ResetOnSpawn=false,
     IgnoreGuiInset=true, ZIndexBehavior=Enum.ZIndexBehavior.Sibling}, PlayerGui)
 local PANEL_W=440 local PANEL_H=1400
@@ -145,7 +130,7 @@ local Header = make("Frame",{Size=UDim2.new(1,0,0,56),BackgroundTransparency=1,A
 make("Frame",{Position=UDim2.fromOffset(0,0),Size=UDim2.new(0,4,1,0),BackgroundColor3=ACCENT,BorderSizePixel=0},Header)
 local Title = label("GR33D EXPLOIT",15,UDim2.fromOffset(20,10),UDim2.new(1,-180,0,20),Header)
 Title.Font=Enum.Font.GothamBold
-local SubTitle = label("Whitelisted · head-ring → body-fling",10,UDim2.fromOffset(20,30),UDim2.new(1,-180,0,14),Header)
+local SubTitle = label("Collect → ring on target → FLING tightens",10,UDim2.fromOffset(20,30),UDim2.new(1,-180,0,14),Header)
 SubTitle.TextColor3=MUTED
 
 local MinButton = make("TextButton",{Text="−",Font=Enum.Font.GothamBold,TextSize=22,TextColor3=WHITE,BackgroundColor3=ROW,Position=UDim2.new(1,-160,0,12),Size=UDim2.fromOffset(44,40)},Header)
@@ -178,9 +163,7 @@ local StatusSub = label("Press Ring · Right Shift = emergency off",10,UDim2.fro
 StatusSub.TextColor3=MUTED
 local function setStatus(m,c,s) StatusLbl.Text=m StatusLbl.TextColor3=c or WHITE StatusSub.Text=s or "" end
 
--- ============================================================
 -- PLAYERS PAGE
--- ============================================================
 local sectionPlayers = label("PLAYERS",10,UDim2.fromOffset(10,4),UDim2.new(1,-20,0,14),PlayerPage)
 sectionPlayers.Font=Enum.Font.GothamBold sectionPlayers.TextColor3=MUTED
 local Search = make("TextBox",{Text="",PlaceholderText="🔍 Search players...",ClearTextOnFocus=false,TextColor3=WHITE,PlaceholderColor3=MUTED,TextSize=13,Font=Enum.Font.Gotham,BackgroundColor3=PANEL,TextXAlignment=Enum.TextXAlignment.Left},PlayerPage)
@@ -242,11 +225,9 @@ local function refreshPlayers()
                 loadAvatar(player,pic,Enum.ThumbnailSize.Size100x100)
                 Row.MouseButton1Click:Connect(function()
                     if targetPlayerNames[player.Name] then
-                        targetPlayerNames[player.Name]=nil
-                        rungPlayers[player.Name]=nil
+                        targetPlayerNames[player.Name]=nil rungPlayers[player.Name]=nil
                     else
-                        targetPlayerNames[player.Name]=true
-                        rungPlayers[player.Name]=nil
+                        targetPlayerNames[player.Name]=true rungPlayers[player.Name]=nil
                         lastTargetPos=nil orbitTargetName=nil orbitTargetStart=0 orbitBaselineVel=0
                     end
                     refreshPlayers()
@@ -276,10 +257,7 @@ ClearBtn.MouseButton1Click:Connect(function()
 end)
 ResetRungBtn.MouseButton1Click:Connect(function()
     table.clear(rungPlayers)
-    lastTargetPos = nil
-    orbitTargetName = nil
-    orbitTargetStart = 0
-    orbitBaselineVel = 0
+    lastTargetPos=nil orbitTargetName=nil orbitTargetStart=0 orbitBaselineVel=0
     refreshPlayers()
     local origColor = ResetRungBtn.BackgroundColor3
     ResetRungBtn.BackgroundColor3 = Color3.fromRGB(64,200,120)
@@ -297,9 +275,7 @@ Search:GetPropertyChangedSignal("Text"):Connect(function() List.CanvasPosition=V
 Players.PlayerAdded:Connect(function() task.defer(refreshPlayers) end)
 Players.PlayerRemoving:Connect(function(p) targetPlayerNames[p.Name]=nil rungPlayers[p.Name]=nil task.defer(refreshPlayers) end)
 
--- ============================================================
 -- RING PAGE
--- ============================================================
 local RingHeading = label("SUPER RING",12,UDim2.fromOffset(10,14),UDim2.new(1,-20,0,22),RingPage)
 RingHeading.Font=Enum.Font.GothamBold RingHeading.TextColor3=ACCENT
 local RingHint = label("Ring orbits nearest non-rung target.",11,UDim2.fromOffset(10,40),UDim2.new(1,-20,0,32),RingPage)
@@ -357,9 +333,7 @@ SelfImmunityToggle.MouseButton1Click:Connect(function()
     SelfImmunityToggle.BackgroundColor3=config.selfImmunity and GREEN or ROW
 end)
 
--- ============================================================
 -- FPS BOOST
--- ============================================================
 local fpsActive = false
 local function applyFPSBoost()
     for _,obj in ipairs(workspace:GetDescendants()) do
@@ -371,14 +345,10 @@ local function applyFPSBoost()
     Lighting.GlobalShadows=false
 end
 
--- ============================================================
--- FLING ALL (original SkidFling, uses Player list selection)
--- ============================================================
+-- FLING ALL
 local flingAllRunning = false
 local function flingMessage(title, text, time)
-    pcall(function()
-        game:GetService("StarterGui"):SetCore("SendNotification",{Title=title,Text=text,Duration=time or 5})
-    end)
+    pcall(function() game:GetService("StarterGui"):SetCore("SendNotification",{Title=title,Text=text,Duration=time or 5}) end)
 end
 
 local function skidFling(TargetPlayer)
@@ -482,9 +452,7 @@ local function flingAll()
     flingMessage("Fling All", "Done — " .. #todo .. " target(s)", 3)
 end
 
--- ============================================================
--- FLY GUI (MoveDirection — mobile + PC)
--- ============================================================
+-- FLY GUI
 local flyState = { nowe=false }
 local function loadFlyGui()
     if Me.PlayerGui:FindFirstChild("main") then Me.PlayerGui.main:Destroy() end
@@ -633,9 +601,7 @@ local function loadFlyGui()
     end)
 end
 
--- ============================================================
 -- ANTI-FLING
--- ============================================================
 local antiFlingEnabled = false
 local antiFlingConn = nil
 local antiFlingSafeCF = nil
@@ -709,14 +675,9 @@ local function stopAntiFling()
 end
 
 -- ============================================================
--- MASS RING — direct-to-ring (no pool)
+-- MASS RING — original filter, ring on target, FLING tightens
 -- ============================================================
-local massLoopConn = nil
-
 local function massGetTargets()
-    local ch = Me.Character
-    local hrp = ch and ch:FindFirstChild("HumanoidRootPart")
-    if not hrp then return {} end
     local out = {}
     if next(targetPlayerNames) ~= nil then
         for name in pairs(targetPlayerNames) do
@@ -730,22 +691,27 @@ local function massGetTargets()
             end
         end
     else
-        local closest, cDist, cName, cHrp, cPlayer = nil, math.huge, nil, nil, nil
-        for _, p in ipairs(Players:GetPlayers()) do
-            if p ~= Me and not isProtectedPlayer(p) and p.Character then
-                local tHrp = p.Character:FindFirstChild("HumanoidRootPart")
-                local tHum = p.Character:FindFirstChildOfClass("Humanoid")
-                if tHrp and tHum and tHum.Health > 0 then
-                    local d = (hrp.Position - tHrp.Position).Magnitude
-                    if d < cDist then cDist=d; cName=p.Name; cHrp=tHrp; cPlayer=p end
+        local ch = Me.Character
+        local hrp = ch and ch:FindFirstChild("HumanoidRootPart")
+        if hrp then
+            local closest, cDist = nil, math.huge
+            for _, p in ipairs(Players:GetPlayers()) do
+                if p ~= Me and not isProtectedPlayer(p) and p.Character then
+                    local tHrp = p.Character:FindFirstChild("HumanoidRootPart")
+                    local tHum = p.Character:FindFirstChildOfClass("Humanoid")
+                    if tHrp and tHum and tHum.Health > 0 then
+                        local d = (hrp.Position - tHrp.Position).Magnitude
+                        if d < cDist then cDist=d; closest={name=p.Name, hrp=tHrp, player=p} end
+                    end
                 end
             end
+            if closest then table.insert(out, closest) end
         end
-        if cPlayer then table.insert(out, {name=cName, hrp=cHrp, player=cPlayer}) end
     end
     return out
 end
 
+-- Ensure a ring exists for each target, drop stale ones
 local function massSyncRings()
     local targets = massGetTargets()
     if #targets == 0 then return end
@@ -753,8 +719,9 @@ local function massSyncRings()
         if not massState.rings[t.name] then
             massState.rings[t.name] = {
                 parts = {}, hrp = t.hrp, player = t.player,
-                phase = "head", startTime = tick(),
-                peakVel = 0, baselineVel = 0, hit = false,
+                phase = "collect",
+                baselineVel = 0, peakVel = 0, hit = false,
+                offset = 0,
             }
             pcall(function() massState.rings[t.name].baselineVel = t.hrp.AssemblyLinearVelocity.Magnitude end)
         else
@@ -775,8 +742,7 @@ local function massSyncRings()
                 if item and item.Parent then
                     local bp = item:FindFirstChild("MassBP")
                     if bp then bp:Destroy() end
-                    local orig = item:GetAttribute("GR33D_OrigTrans")
-                    item.Transparency = (orig ~= nil) and orig or 0
+                    item.CanCollide = false
                     massState.lookup[item] = nil
                 end
             end
@@ -785,77 +751,62 @@ local function massSyncRings()
     end
 end
 
-local function massTotalRingParts()
-    local n = 0
-    for _, r in pairs(massState.rings) do n = n + #r.parts end
-    return n
-end
-
+-- Scanner: original filter, adds parts directly to target rings
 local function massScannerLoop()
-    while massState.enabled do
+    while massState.collecting do
         local ch = Me.Character
         local hrp = ch and ch:FindFirstChild("HumanoidRootPart")
         if hrp then
-            pcall(function() sethiddenproperty(Me, "SimulationRadius", config.simRadius) end)
             pcall(function() Me.ReplicationFocus = workspace end)
+            pcall(function() sethiddenproperty(Me, "SimulationRadius", config.simRadius) end)
 
             massSyncRings()
 
             local targets = massGetTargets()
-            if #targets > 0 then
-                local totalRingParts = massTotalRingParts()
-                if totalRingParts < massState.maxRingParts then
-                    local remaining = massState.maxRingParts - totalRingParts
-                    local thisScan = math.min(massState.itemsPerScan, remaining)
-
-                    local parts = workspace:GetPartBoundsInRadius(hrp.Position, massState.scanRadius)
-                    local added = 0
-                    for _, item in ipairs(parts) do
-                        if added >= thisScan then break end
-                        -- [ORIGINAL FILTER] — exactly like Super Ring Old
-                        if item:IsA("BasePart") and not item.Anchored and not item:IsDescendantOf(ch) then
-                            if not massState.lookup[item] then
-                                local target = targets[(added % #targets) + 1]
-                                local ring = massState.rings[target.name]
-                                if ring then
-                                    pcall(function() item:SetNetworkOwner(Me) end)
-                                    massState.lookup[item] = true
-                                    item:SetAttribute("GR33D_OrigTrans", item.Transparency)
-                                    item.Transparency = 0
-                                    item.CanCollide = false
-
-                                    if not item:FindFirstChild("MassBP") then
-                                        local bp = Instance.new("BodyPosition", item)
-                                        bp.Name = "MassBP"
-                                        bp.MaxForce = Vector3.new(math.huge, math.huge, math.huge)
-                                        bp.P = 1e10
-                                        bp.D = 500
-                                    end
-                                    table.insert(ring.parts, item)
-                                    added = added + 1
+            if #targets > 0 and massTotalParts() < massState.maxParts then
+                local parts = workspace:GetPartBoundsInRadius(hrp.Position, massState.scanRadius)
+                local added = 0
+                for _, item in ipairs(parts) do
+                    if added >= 30 then break end
+                    -- [EXACT ORIGINAL FILTER]
+                    if item:IsA("BasePart") and not item.Anchored and not item:IsDescendantOf(ch) then
+                        if not massState.lookup[item] then
+                            local t = targets[(added % #targets) + 1]
+                            local ring = massState.rings[t.name]
+                            if ring then
+                                pcall(function() item:SetNetworkOwner(Me) end)
+                                item.CanCollide = false
+                                if not item:FindFirstChild("MassBP") then
+                                    local bp = Instance.new("BodyPosition", item)
+                                    bp.Name = "MassBP"
+                                    bp.MaxForce = Vector3.new(math.huge, math.huge, math.huge)
+                                    bp.P = 1e10
+                                    bp.D = 500
                                 end
+                                massState.lookup[item] = true
+                                table.insert(ring.parts, item)
+                                added = added + 1
                             end
                         end
                     end
                 end
             end
         end
-
-        local packedRatio = math.clamp(massTotalRingParts() / massState.maxRingParts, 0, 1)
-        task.wait(massState.scanInterval + packedRatio * 0.6)
+        task.wait(massState.scanInterval)
     end
     massState.thread = nil
 end
 local function startMassScanner()
     if massState.thread then return end
-    massState.enabled = true
+    massState.collecting = true
     massState.thread = task.spawn(massScannerLoop)
 end
-local function stopMassScanner() massState.enabled = false end
+local function stopMassScanner() massState.collecting = false end
 
+-- Ring loop: rotates parts around each target
 local function startMassLoop()
-    if massLoopConn then return end
-    massLoopConn = RunService.Heartbeat:Connect(function()
+    if massState.loopConn then return end
+    massState.loopConn = RunService.Heartbeat:Connect(function()
         local localCh = Me.Character
         local localHrp = localCh and localCh:FindFirstChild("HumanoidRootPart")
         local now = tick()
@@ -868,71 +819,55 @@ local function startMassLoop()
             end
             if hrp and hrp.Parent then
                 local targetPos = hrp.Position
-                local isEven = (math.floor(now) % 2 == 0)
-                local currentRadius, currentHeight
-                if ring.phase == "head" then
-                    currentRadius = isEven and massState.headRadiusA or massState.headRadiusB
-                    currentHeight = isEven and massState.headHeightA or massState.headHeightB
-                else
-                    currentRadius = massState.bodyRadius
-                    currentHeight = massState.bodyHeight
-                end
+                -- Radius/height depend on phase
+                local radius = (ring.phase == "hit") and massState.hitRadius or massState.collectRadius
+                local height = (ring.phase == "hit") and massState.hitHeight or massState.collectHeight
 
-                -- [PERF] Per-frame work budget: max 150 parts per frame
                 local total = #ring.parts
                 if total > 0 then
-                    local budget = math.min(total, 150)
-                    ring.frameOffset = (ring.frameOffset or 0) + budget
-                    if ring.frameOffset > total then ring.frameOffset = 1 end
-                    local startIdx = ring.frameOffset
+                    local budget = math.min(total, 100)
+                    ring.offset = ((ring.offset or 0) % total)
+                    local startIdx = ring.offset + 1
+                    ring.offset = (ring.offset + budget) % total
                     for k = 0, budget - 1 do
                         local i = ((startIdx + k - 1) % total) + 1
                         local item = ring.parts[i]
                         if item and item.Parent and not item.Anchored then
                             local bp = item:FindFirstChild("MassBP")
-                            if not bp then
-                                bp = Instance.new("BodyPosition", item)
-                                bp.Name = "MassBP"
-                                bp.MaxForce = Vector3.new(math.huge, math.huge, math.huge)
-                                bp.P = 1e10
-                                bp.D = 500
-                            end
-                            if i % 5 == 0 then
+                            if bp then
                                 pcall(function()
-                                    if item:GetNetworkOwner() ~= Me then
+                                    if item:GetNetworkOwner() ~= Me and k % 5 == 0 then
                                         item:SetNetworkOwner(Me)
                                     end
                                 end)
+                                local iSpeed = massState.ringSpeed + ((i % 10) * 0.5)
+                                local angle = (now * iSpeed) + (i * (math.pi * 2 / math.max(total, 1)))
+                                local tPos = targetPos + Vector3.new(
+                                    math.cos(angle) * radius,
+                                    height,
+                                    math.sin(angle) * radius
+                                )
+                                bp.Position = tPos
+                                -- Collide only in "hit" phase, and only when far from local player
+                                local wantCol = (ring.phase == "hit")
+                                if wantCol and localHrp then
+                                    local dL = (item.Position - localHrp.Position).Magnitude
+                                    if dL < 15 then wantCol = false end
+                                end
+                                if item.CanCollide ~= wantCol then item.CanCollide = wantCol end
                             end
-                            local itemSpeed = massState.ringSpeed + ((i % 10) * 0.5)
-                            local angle = (now * itemSpeed) + (i * (math.pi * 2 / math.max(total, 1)))
-                            local tPos = targetPos + Vector3.new(
-                                math.cos(angle) * currentRadius,
-                                currentHeight,
-                                math.sin(angle) * currentRadius
-                            )
-                            bp.Position = tPos
-
-                            local wantCol = (ring.phase == "body")
-                            if wantCol and localHrp then
-                                local dL = (item.Position - localHrp.Position).Magnitude
-                                if dL < 20 then wantCol = false end
-                            end
-                            if item.CanCollide ~= wantCol then item.CanCollide = wantCol end
                         end
                     end
                 end
 
-                if ring.phase == "body" and not ring.hit then
+                if ring.phase == "hit" and not ring.hit then
                     local vel = 0
                     pcall(function() vel = hrp.AssemblyLinearVelocity.Magnitude end)
-                    if vel > ring.peakVel then ring.peakVel = vel end
-                    local spike = vel - ring.baselineVel
+                    if vel > (ring.peakVel or 0) then ring.peakVel = vel end
+                    local spike = vel - (ring.baselineVel or 0)
                     if spike >= 200 or vel >= 350 then
                         ring.hit = true
-                        task.defer(function()
-                            setStatus("HIT "..name, GREEN, string.format("peak %.0f", ring.peakVel))
-                        end)
+                        task.defer(function() setStatus("HIT "..name, GREEN, string.format("peak %.0f", ring.peakVel)) end)
                     end
                 end
             end
@@ -940,34 +875,29 @@ local function startMassLoop()
     end)
 end
 
-local function triggerFling()
-    if next(massState.rings) == nil then return 0 end
+-- FLING NOW: switch each ring to tight (hit) phase
+local function massFlingNow()
+    stopMassScanner()
     local count = 0
     for name, ring in pairs(massState.rings) do
-        ring.phase = "body"
-        ring.startTime = tick()
-        ring.peakVel = 0
-        ring.hit = false
-        pcall(function() ring.baselineVel = ring.hrp.AssemblyLinearVelocity.Magnitude end)
-        for _, item in ipairs(ring.parts) do
-            if item and item.Parent then item.CanCollide = true end
+        if #ring.parts > 0 then
+            ring.phase = "hit"
+            ring.hit = false
+            ring.peakVel = 0
+            pcall(function() ring.baselineVel = ring.hrp.AssemblyLinearVelocity.Magnitude end)
+            count = count + 1
         end
-        count = count + 1
     end
-    massState.active = true
-    task.defer(function() pcall(refreshPlayers) end)
     return count
 end
 
 local function massClear()
-    massState.active = false
+    stopMassScanner()
     for name, ring in pairs(massState.rings) do
         for _, item in ipairs(ring.parts) do
             if item and item.Parent then
                 local bp = item:FindFirstChild("MassBP")
                 if bp then bp:Destroy() end
-                local orig = item:GetAttribute("GR33D_OrigTrans")
-                item.Transparency = (orig ~= nil) and orig or 0
                 item.CanCollide = false
                 massState.lookup[item] = nil
             end
@@ -975,41 +905,37 @@ local function massClear()
     end
     massState.rings = {}
     massState.lookup = {}
-    massState.lastReport = ""
-    task.defer(function() pcall(refreshPlayers) end)
 end
 
--- ============================================================
 -- MASS PAGE
--- ============================================================
 local MassHeading = label("MASS RING",12,UDim2.fromOffset(10,14),UDim2.new(1,-20,0,22),MassPage)
 MassHeading.Font=Enum.Font.GothamBold MassHeading.TextColor3=Color3.fromRGB(220,130,90)
-local MassHint = label("Collect → head-rings form → FLING NOW drops to body.",11,UDim2.fromOffset(10,40),UDim2.new(1,-20,0,42),MassPage)
+local MassHint = label("Collect ON → parts orbit target (wide). FLING NOW → tight orbit = hit.",11,UDim2.fromOffset(10,40),UDim2.new(1,-20,0,42),MassPage)
 MassHint.TextWrapped=true MassHint.TextColor3=MUTED
 
-local MassStatus = make("TextLabel",{Text="Rings: 0 · Orbiting: 0 parts",
+local MassStatus = make("TextLabel",{Text="Collected: 0 parts",
     Font=Enum.Font.GothamBold,TextSize=13,TextColor3=WHITE,
     BackgroundColor3=Color3.fromRGB(50,30,20),TextXAlignment=Enum.TextXAlignment.Center,
-    Size=UDim2.new(1,0,0,40)},MassPage)
+    Size=UDim2.new(1,0,0,36)},MassPage)
 round(MassStatus,8)
-local MassConfirm = make("TextLabel",{Text="No rings built",
+local MassConfirm = make("TextLabel",{Text="Ready to collect",
     Font=Enum.Font.GothamBold,TextSize=11,TextColor3=MUTED,
     BackgroundColor3=Color3.fromRGB(30,25,20),TextXAlignment=Enum.TextXAlignment.Center,
-    TextWrapped=true,Size=UDim2.new(1,0,0,46)},MassPage)
+    TextWrapped=true,Size=UDim2.new(1,0,0,42)},MassPage)
 round(MassConfirm,8)
 
 local MassToggle = make("TextButton",{Text="Collect: OFF",Font=Enum.Font.GothamBold,TextSize=14,TextColor3=WHITE,BackgroundColor3=ROW,AutoButtonColor=false},MassPage)
 round(MassToggle,10)
 MassToggle.MouseButton1Click:Connect(function()
-    if massState.enabled then
+    if massState.collecting then
         stopMassScanner()
         MassToggle.Text="Collect: OFF" MassToggle.BackgroundColor3=ROW
-        setStatus("Collect OFF",MUTED,"Rings remain — press FLING NOW")
+        setStatus("Collect OFF",MUTED,massTotalParts().." parts ready")
     else
         startMassScanner()
         startMassLoop()
         MassToggle.Text="Collect: ON" MassToggle.BackgroundColor3=GREEN
-        setStatus("Collect ON",GREEN,"Building head-rings")
+        setStatus("Collect ON",GREEN,"Rings forming on target")
     end
 end)
 
@@ -1030,53 +956,57 @@ local function createMassRow(labelText,minV,maxV,stepV,getFn,setFn)
 end
 
 createMassRow("Scan Radius",500,5000,100,function() return massState.scanRadius end,function(v) massState.scanRadius=v end)
-createMassRow("Items Per Scan",10,200,10,function() return massState.itemsPerScan end,function(v) massState.itemsPerScan=v end)
-createMassRow("Max Ring Parts",100,1000,50,function() return massState.maxRingParts end,function(v) massState.maxRingParts=v end)
-createMassRow("Head Ht A",2,60,1,function() return massState.headHeightA end,function(v) massState.headHeightA=v end)
-createMassRow("Head Ht B",2,60,1,function() return massState.headHeightB end,function(v) massState.headHeightB=v end)
-createMassRow("Head Rad A",1,30,1,function() return massState.headRadiusA end,function(v) massState.headRadiusA=v end)
-createMassRow("Head Rad B",1,30,1,function() return massState.headRadiusB end,function(v) massState.headRadiusB=v end)
-createMassRow("Body Radius",0,10,1,function() return massState.bodyRadius end,function(v) massState.bodyRadius=v end)
+createMassRow("Max Parts",50,600,50,function() return massState.maxParts end,function(v) massState.maxParts=v end)
+createMassRow("Collect Radius",3,40,1,function() return massState.collectRadius end,function(v) massState.collectRadius=v end)
+createMassRow("Collect Height",-5,40,1,function() return massState.collectHeight end,function(v) massState.collectHeight=v end)
+createMassRow("Hit Radius",1,10,1,function() return massState.hitRadius end,function(v) massState.hitRadius=v end)
+createMassRow("Hit Height",-5,10,1,function() return massState.hitHeight end,function(v) massState.hitHeight=v end)
 createMassRow("Ring Speed",5,200,5,function() return massState.ringSpeed end,function(v) massState.ringSpeed=v end)
 
 local MassFlingBtn = make("TextButton",{Text="FLING NOW",Font=Enum.Font.GothamBold,TextSize=16,TextColor3=WHITE,BackgroundColor3=Color3.fromRGB(200,60,60),AutoButtonColor=false},MassPage)
 round(MassFlingBtn,12)
 MassFlingBtn.MouseButton1Click:Connect(function()
-    local count = triggerFling()
-    if count == 0 then setStatus("Nothing to fling",AMBER,"Turn Collect ON")
-    else setStatus("FLINGING "..count.." ring(s)",GREEN,"Watch for HIT") end
+    local count = massFlingNow()
+    if count == 0 then
+        setStatus("Nothing to fling",AMBER,"Turn Collect ON and select targets")
+    else
+        setStatus("FLINGING "..count.." target(s)",GREEN,"Tight orbit — watch for HIT")
+    end
 end)
 
 local MassClearBtn = make("TextButton",{Text="CLEAR ALL",Font=Enum.Font.GothamBold,TextSize=13,TextColor3=WHITE,BackgroundColor3=ROW,AutoButtonColor=false},MassPage)
 round(MassClearBtn,8)
-MassClearBtn.MouseButton1Click:Connect(function() massClear() setStatus("Cleared",MUTED) end)
+MassClearBtn.MouseButton1Click:Connect(function()
+    massClear()
+    MassToggle.Text="Collect: OFF" MassToggle.BackgroundColor3=ROW
+    setStatus("Cleared",MUTED)
+end)
 
 task.spawn(function()
     while true do
-        local totalRingParts = massTotalRingParts()
-        MassStatus.Text = "Rings: "..massRingCount().." · Orbiting: "..totalRingParts.." parts"
-        if next(massState.rings) ~= nil then
+        local totalParts = massTotalParts()
+        if totalParts > 0 then
             local entries = {}
             for name, ring in pairs(massState.rings) do
-                if ring.phase == "head" then entries[#entries+1] = name.."["..#ring.parts.."@HEAD]"
-                elseif ring.hit then entries[#entries+1] = "HIT "..name
-                else entries[#entries+1] = name.."[BODY]" end
+                if ring.hit then entries[#entries+1] = "HIT "..name
+                elseif ring.phase == "hit" then entries[#entries+1] = name.."["..#ring.parts.."@HIT]"
+                else entries[#entries+1] = name.."["..#ring.parts.."@WIDE]" end
             end
+            MassStatus.Text = "Rings: "..massRingCount().." · Total: "..totalParts.." parts"
             MassConfirm.Text = table.concat(entries, " · ")
             if MassConfirm.Text:find("HIT") then MassConfirm.TextColor3 = GREEN
-            elseif MassConfirm.Text:find("BODY") then MassConfirm.TextColor3 = RED
+            elseif MassConfirm.Text:find("@HIT") then MassConfirm.TextColor3 = RED
             else MassConfirm.TextColor3 = AMBER end
         else
-            MassConfirm.Text = "No rings — turn Collect ON and select target"
+            MassStatus.Text = "Collected: 0 parts"
+            MassConfirm.Text = massState.collecting and "Collecting..." or "Ready — press FLING NOW"
             MassConfirm.TextColor3 = MUTED
         end
         task.wait(0.3)
     end
 end)
 
--- ============================================================
 -- TOOLS PAGE
--- ============================================================
 local ToolsHeading = label("TOOLS",12,UDim2.fromOffset(10,14),UDim2.new(1,-20,0,22),ToolsPage)
 ToolsHeading.Font=Enum.Font.GothamBold ToolsHeading.TextColor3=ACCENT
 local function makeToolButton(text,order,color,callback)
@@ -1108,9 +1038,7 @@ end)
 AntiFlingBtn.MouseLeave:Connect(function() AntiFlingBtn.BackgroundColor3=antiFlingEnabled and GREEN or Color3.fromRGB(80,110,80) end)
 make("UIListLayout",{SortOrder=Enum.SortOrder.LayoutOrder,Padding=UDim.new(0,8)},ToolsPage)
 
--- ============================================================
 -- TABS + LAYOUT
--- ============================================================
 local tabButtons = {}
 local currentTab = "Players"
 local function showTab(name)
@@ -1178,8 +1106,8 @@ local function reflow(pw,ph)
     local massY=8
     place(MassHeading,10,massY,innerW,20) massY=massY+22
     place(MassHint,10,massY,innerW,42) massY=massY+50
-    place(MassStatus,10,massY,innerW,40) massY=massY+48
-    place(MassConfirm,10,massY,innerW,46) massY=massY+52
+    place(MassStatus,10,massY,innerW,36) massY=massY+42
+    place(MassConfirm,10,massY,innerW,42) massY=massY+48
     place(MassToggle,10,massY,innerW,42) massY=massY+50
     for _,row in ipairs(massRows) do
         place(row.label,10,massY,innerW,14)
@@ -1196,9 +1124,7 @@ local function reflow(pw,ph)
     ToolsPage.CanvasSize=UDim2.fromOffset(0,400)
 end
 
--- ============================================================
 -- WINDOW
--- ============================================================
 updateWindow = function()
     if minimized then Main.Visible=false MiniCircle.Visible=true return end
     Main.Visible=true MiniCircle.Visible=false
@@ -1261,9 +1187,7 @@ local cam=workspace.CurrentCamera
 if cam then cam:GetPropertyChangedSignal("ViewportSize"):Connect(updateWindow) end
 CloseButton.MouseButton1Click:Connect(function() Gui:Destroy() end)
 
--- ============================================================
--- RING CORE (Super Ring — original filter, original physics)
--- ============================================================
+-- RING CORE
 pcall(function() Me.ReplicationFocus=workspace end)
 pcall(function() sethiddenproperty(Me,"SimulationRadius",config.simRadius) end)
 Me.CharacterAdded:Connect(function()
@@ -1294,7 +1218,7 @@ task.spawn(function()
                 local processed=0
                 for _,item in ipairs(parts) do
                     if processed>=config.maxItemsPerLoop then break end
-                    -- [ORIGINAL FILTER]
+                    -- ORIGINAL FILTER
                     if item:IsA("BasePart") and not item.Anchored and not item:IsDescendantOf(ch) then
                         if not itemsInRingLookup[item] then
                             table.insert(itemsInRing,item)
@@ -1461,4 +1385,4 @@ refreshPlayers()
 showTab("Players")
 updateWindow()
 setStatus("Ready · whitelist active",MUTED,"Creator ID protected: 9321819967")
-print("[GR33D EXPLOIT v13] Counter fix + throttled scanner + per-frame budget")
+print("[GR33D EXPLOIT v16] Collect → orbit target → FLING tightens")w
