@@ -1,25 +1,20 @@
 --[[
-    GR33D EXPLOIT — v16
-      • Mass: original filter, rings orbit target DURING collection
-      • FLING NOW: tightens orbit radius so parts hit target
-      • No floating above you — parts go straight to target
+    GR33D EXPLOIT
+      • Super Ring Old logic
+      • Multi-target + rung tracking + self-immunity
+      • Anti-Fling
+      • Fly GUI (fixed speed)
+      • Mass Fling
+      • Minimize shows round "G" button
 ]]
 
-local Players = game:GetService("Players")
+local Players    = game:GetService("Players")
 local RunService = game:GetService("RunService")
-local UIS = game:GetService("UserInputService")
-local Lighting = game:GetService("Lighting")
-local Me = Players.LocalPlayer
-local PlayerGui = Me:WaitForChild("PlayerGui")
+local UIS        = game:GetService("UserInputService")
+local Lighting   = game:GetService("Lighting")
 
-local PROTECTED_USERS = { [9321819967] = true }
-local PROTECTED_NAMES = {}
-local function isProtectedPlayer(player)
-    if not player then return false end
-    if PROTECTED_USERS[player.UserId] == true then return true end
-    if PROTECTED_NAMES[player.Name:lower()] == true then return true end
-    return false
-end
+local Me        = Players.LocalPlayer
+local PlayerGui = Me:WaitForChild("PlayerGui")
 
 local OrbitState = 0
 local LockedPosition = nil
@@ -28,48 +23,35 @@ local rungPlayers = {}
 local lastTargetPos = nil
 local orbitTargetName = nil
 local orbitTargetStart = 0
-local orbitBaselineVel = 0
 local itemsInRing = {}
 local itemsInRingLookup = {}
 local minimized = false
 local updateWindow
 
 local config = {
-    radiusA = 5, radiusB = 5,
-    heightA = 0, heightB = 2,
-    speed = 8, targetRadius = 100,
-    baseSpeedMultiplier = 8,
-    scanRadius = 2000, maxItemsPerLoop = 150,
-    simRadius = 6000,
-    ringSuccessTime = 10.0,
-    flingVelThreshold = 400,
-    selfImmunity = true, immunityRadius = 15,
-}
-
--- [MASS] Collect → ring on target → FLING tightens
-local massState = {
-    collecting = false,
-    lookup = {},
-    rings = {},
-    scanRadius = 3000,
-    scanInterval = 0.5,
-    maxParts = 400,
-    collectRadius = 15,
-    collectHeight = 8,
-    hitRadius = 3,
-    hitHeight = 0,
-    ringSpeed = 30,
-    thread = nil,
-    loopConn = nil,
+    radiusA = 10, radiusB = 10,
+    heightA = 1, heightB = 1,
+    speed = 15, targetRadius = 50,
+    baseSpeedMultiplier = 2.0,
+    scanRadius = 500, maxItemsPerLoop = 60,
+    simRadius = 2048,
+    ringSuccessTime = 3.0, flingVelThreshold = 200,
+    selfImmunity = true, immunityRadius = 12,
 }
 
 local old = PlayerGui:FindFirstChild("GR33D_EXPLOIT")
 if old then old:Destroy() end
 
-local function selectedCount() local n=0 for _ in pairs(targetPlayerNames) do n=n+1 end return n end
-local function rungCount() local n=0 for _ in pairs(rungPlayers) do n=n+1 end return n end
-local function massRingCount() local n=0 for _ in pairs(massState.rings) do n=n+1 end return n end
-local function massTotalParts() local n=0 for _,r in pairs(massState.rings) do n=n+#r.parts end return n end
+local function selectedCount()
+    local n = 0
+    for _ in pairs(targetPlayerNames) do n = n + 1 end
+    return n
+end
+local function rungCount()
+    local n = 0
+    for _ in pairs(rungPlayers) do n = n + 1 end
+    return n
+end
 
 local BG=Color3.fromRGB(19,23,35) local PANEL=Color3.fromRGB(30,37,53)
 local ROW=Color3.fromRGB(41,49,69) local ROWHI=Color3.fromRGB(52,62,86)
@@ -78,420 +60,690 @@ local WHITE=Color3.fromRGB(245,247,255) local MUTED=Color3.fromRGB(155,169,193)
 local RED=Color3.fromRGB(184,68,84) local GREEN=Color3.fromRGB(64,160,96)
 local AMBER=Color3.fromRGB(200,160,60)
 
-local function make(c,p,parent) local o=Instance.new(c) for k,v in pairs(p) do o[k]=v end o.Parent=parent return o end
-local function round(o,r) make("UICorner",{CornerRadius=UDim.new(0,r)},o) end
-local function label(t,s,pos,dim,parent) return make("TextLabel",{Text=t,TextSize=s,Font=Enum.Font.Gotham,TextColor3=WHITE,TextXAlignment=Enum.TextXAlignment.Left,TextTruncate=Enum.TextTruncate.AtEnd,BackgroundTransparency=1,Position=pos,Size=dim},parent) end
+local function make(c, p, parent)
+    local o = Instance.new(c)
+    for k, v in pairs(p) do o[k] = v end
+    o.Parent = parent
+    return o
+end
+local function round(o, r) make("UICorner", {CornerRadius = UDim.new(0, r)}, o) end
+local function label(t, s, pos, dim, parent)
+    return make("TextLabel", {Text=t, TextSize=s, Font=Enum.Font.Gotham, TextColor3=WHITE,
+        TextXAlignment=Enum.TextXAlignment.Left, TextTruncate=Enum.TextTruncate.AtEnd,
+        BackgroundTransparency=1, Position=pos, Size=dim}, parent)
+end
 
+-- ============================================================
+-- ROOT GUI
+-- ============================================================
 local Gui = make("ScreenGui", {Name="GR33D_EXPLOIT", ResetOnSpawn=false,
     IgnoreGuiInset=true, ZIndexBehavior=Enum.ZIndexBehavior.Sibling}, PlayerGui)
-local PANEL_W=440 local PANEL_H=1400
-local Main = make("Frame", {AnchorPoint=Vector2.new(0.5,0), Position=UDim2.new(0.5,0,0,0.02),
-    Size=UDim2.fromOffset(PANEL_W,PANEL_H), BackgroundColor3=BG, BorderSizePixel=0, Active=true}, Gui)
-round(Main,16)
-make("UIStroke",{Color=Color3.fromRGB(62,75,105),Thickness=1.5},Main)
-local Scale = make("UIScale",{Scale=1},Main)
 
-local MiniCircle = make("TextButton", {Name="MiniCircle",Text="G",Font=Enum.Font.GothamBold,TextSize=24,
-    TextColor3=Color3.fromRGB(20,20,22),BackgroundColor3=Color3.fromRGB(212,175,55),
-    Position=UDim2.new(0,20,0,80),Size=UDim2.fromOffset(58,58),
-    Visible=false,Active=true,AutoButtonColor=false,ZIndex=100}, Gui)
-round(MiniCircle,999)
-make("UIStroke",{Color=Color3.fromRGB(255,235,150),Thickness=2,Transparency=0.35},MiniCircle)
+local PANEL_W = 440
+local PANEL_H = 1400
+
+local Main = make("Frame", {AnchorPoint=Vector2.new(0.5,0),
+    Position=UDim2.new(0.5,0,0,0.02), Size=UDim2.fromOffset(PANEL_W, PANEL_H),
+    BackgroundColor3=BG, BorderSizePixel=0, Active=true}, Gui)
+round(Main, 16)
+make("UIStroke", {Color=Color3.fromRGB(62,75,105), Thickness=1.5}, Main)
+local Scale = make("UIScale", {Scale=1}, Main)
+
+local MiniCircle = make("TextButton", {
+    Name = "MiniCircle",
+    Text = "G",
+    Font = Enum.Font.GothamBold,
+    TextSize = 24,
+    TextColor3 = Color3.fromRGB(20, 20, 22),
+    BackgroundColor3 = Color3.fromRGB(212, 175, 55),
+    Position = UDim2.new(0, 20, 0, 80),
+    Size = UDim2.fromOffset(58, 58),
+    Visible = false,
+    Active = true,
+    AutoButtonColor = false,
+    ZIndex = 100,
+}, Gui)
+round(MiniCircle, 999)
+make("UIStroke", {Color = Color3.fromRGB(255, 235, 150), Thickness = 2, Transparency = 0.35}, MiniCircle)
 
 do
-    local mcDragging=false local mcStartX,mcStartY=0,0 local mcPosX,mcPosY=0,0 local mcMoved=false
+    local mcDragging, mcStart, mcPos, mcMoved = false, nil, nil, false
     MiniCircle.InputBegan:Connect(function(input)
-        if input.UserInputType==Enum.UserInputType.MouseButton1 or input.UserInputType==Enum.UserInputType.Touch then
-            mcDragging=true mcMoved=false mcStartX,mcStartY=input.Position.X,input.Position.Y
-            mcPosX=MiniCircle.Position.X.Offset mcPosY=MiniCircle.Position.Y.Offset
+        if input.UserInputType == Enum.UserInputType.MouseButton1
+        or input.UserInputType == Enum.UserInputType.Touch then
+            mcDragging = true; mcMoved = false
+            mcStart = input.Position
+            mcPos = MiniCircle.Position
         end
     end)
     UIS.InputChanged:Connect(function(input)
         if not mcDragging then return end
-        if input.UserInputType~=Enum.UserInputType.MouseMovement and input.UserInputType~=Enum.UserInputType.Touch then return end
-        local dx,dy=input.Position.X-mcStartX,input.Position.Y-mcStartY
-        if math.abs(dx)>4 or math.abs(dy)>4 then mcMoved=true end
-        if mcMoved then
-            local vp=workspace.CurrentCamera and workspace.CurrentCamera.ViewportSize or Vector2.new(1024,768)
-            MiniCircle.Position=UDim2.fromOffset(math.clamp(mcPosX+dx,4,vp.X-62),math.clamp(mcPosY+dy,4,vp.Y-62))
-        end
+        if input.UserInputType ~= Enum.UserInputType.MouseMovement and input ~= mcStart then return end
+        local delta = input.Position - mcStart
+        if delta.Magnitude > 4 then mcMoved = true end
+        MiniCircle.Position = UDim2.new(mcPos.X.Scale,
+            mcPos.X.Offset + delta.X, mcPos.Y.Scale, mcPos.Y.Offset + delta.Y)
     end)
     UIS.InputEnded:Connect(function(input)
-        if input.UserInputType==Enum.UserInputType.MouseButton1 or input.UserInputType==Enum.UserInputType.Touch then mcDragging=false end
+        if input == mcStart then mcDragging = false; mcStart = nil end
     end)
     MiniCircle.MouseButton1Click:Connect(function()
         if mcMoved then return end
-        minimized=false Main.Visible=true MiniCircle.Visible=false
+        minimized = false
+        Main.Visible = true
+        MiniCircle.Visible = false
         if updateWindow then updateWindow() end
     end)
 end
 
-local Header = make("Frame",{Size=UDim2.new(1,0,0,56),BackgroundTransparency=1,Active=true},Main)
-make("Frame",{Position=UDim2.fromOffset(0,0),Size=UDim2.new(0,4,1,0),BackgroundColor3=ACCENT,BorderSizePixel=0},Header)
-local Title = label("GR33D EXPLOIT",15,UDim2.fromOffset(20,10),UDim2.new(1,-180,0,20),Header)
-Title.Font=Enum.Font.GothamBold
-local SubTitle = label("Collect → ring on target → FLING tightens",10,UDim2.fromOffset(20,30),UDim2.new(1,-180,0,14),Header)
-SubTitle.TextColor3=MUTED
+local Header = make("Frame", {Size=UDim2.new(1,0,0,56), BackgroundTransparency=1, Active=true}, Main)
+make("Frame", {Position=UDim2.fromOffset(0,0), Size=UDim2.new(0,4,1,0),
+    BackgroundColor3=ACCENT, BorderSizePixel=0}, Header)
+local Title = label("GR33D EXPLOIT", 15, UDim2.fromOffset(20,10), UDim2.new(1,-180,0,20), Header)
+Title.Font = Enum.Font.GothamBold
+local SubTitle = label("Multi-target · rung · immunity · mass", 10,
+    UDim2.fromOffset(20,30), UDim2.new(1,-180,0,14), Header)
+SubTitle.TextColor3 = MUTED
 
-local MinButton = make("TextButton",{Text="−",Font=Enum.Font.GothamBold,TextSize=22,TextColor3=WHITE,BackgroundColor3=ROW,Position=UDim2.new(1,-160,0,12),Size=UDim2.fromOffset(44,40)},Header)
-round(MinButton,9)
-local MaxButton = make("TextButton",{Text="▢",Font=Enum.Font.GothamBold,TextSize=15,TextColor3=WHITE,BackgroundColor3=ROW,Position=UDim2.new(1,-110,0,12),Size=UDim2.fromOffset(44,40)},Header)
-round(MaxButton,9)
-local CloseButton = make("TextButton",{Text="✕",Font=Enum.Font.GothamBold,TextSize=14,TextColor3=WHITE,BackgroundColor3=RED,Position=UDim2.new(1,-60,0,12),Size=UDim2.fromOffset(44,40)},Header)
-round(CloseButton,9)
+local MinButton = make("TextButton", {Text="−", Font=Enum.Font.GothamBold, TextSize=22,
+    TextColor3=WHITE, BackgroundColor3=ROW, Position=UDim2.new(1,-160,0,12),
+    Size=UDim2.fromOffset(44,40)}, Header)
+round(MinButton, 9)
+local MaxButton = make("TextButton", {Text="▢", Font=Enum.Font.GothamBold, TextSize=15,
+    TextColor3=WHITE, BackgroundColor3=ROW, Position=UDim2.new(1,-110,0,12),
+    Size=UDim2.fromOffset(44,40)}, Header)
+round(MaxButton, 9)
+local CloseButton = make("TextButton", {Text="✕", Font=Enum.Font.GothamBold, TextSize=14,
+    TextColor3=WHITE, BackgroundColor3=RED, Position=UDim2.new(1,-60,0,12),
+    Size=UDim2.fromOffset(44,40)}, Header)
+round(CloseButton, 9)
 
-local Content = make("Frame",{Position=UDim2.fromOffset(0,56),Size=UDim2.new(1,0,1,-56),BackgroundTransparency=1},Main)
-local Navigation = make("Frame",{Name="Tabs",Position=UDim2.fromOffset(12,8),Size=UDim2.new(1,-24,0,48),BackgroundTransparency=1},Content)
-local PageHost = make("Frame",{Name="Pages",Position=UDim2.fromOffset(12,64),Size=UDim2.new(1,-24,1,-200),BackgroundColor3=PANEL,BorderSizePixel=0,ClipsDescendants=true},Content)
-round(PageHost,12)
+local Content = make("Frame", {Position=UDim2.fromOffset(0,56),
+    Size=UDim2.new(1,0,1,-56), BackgroundTransparency=1}, Main)
+
+local Navigation = make("Frame", {Name="Tabs", Position=UDim2.fromOffset(12,8),
+    Size=UDim2.new(1,-24,0,48), BackgroundTransparency=1}, Content)
+local PageHost = make("Frame", {Name="Pages", Position=UDim2.fromOffset(12,64),
+    Size=UDim2.new(1,-24,1,-200), BackgroundColor3=PANEL,
+    BorderSizePixel=0, ClipsDescendants=true}, Content)
+round(PageHost, 12)
 
 local function makePage(name)
-    return make("ScrollingFrame",{Name=name,Size=UDim2.fromScale(1,1),BackgroundTransparency=1,Visible=false,BorderSizePixel=0,ScrollingDirection=Enum.ScrollingDirection.Y,ScrollBarThickness=6,ScrollBarImageColor3=ACCENT,CanvasSize=UDim2.fromOffset(0,460)},PageHost)
+    return make("ScrollingFrame", {Name=name, Size=UDim2.fromScale(1,1),
+        BackgroundTransparency=1, Visible=false, BorderSizePixel=0,
+        ScrollingDirection=Enum.ScrollingDirection.Y, ScrollBarThickness=6,
+        ScrollBarImageColor3=ACCENT, CanvasSize=UDim2.fromOffset(0,460)}, PageHost)
 end
 local PlayerPage = makePage("Players")
-local RingPage = makePage("Ring")
-local MassPage = makePage("Mass")
-local ToolsPage = makePage("Tools")
+local RingPage   = makePage("Ring")
+local MassPage   = makePage("Mass")
+local ToolsPage  = makePage("Tools")
 
-local Footer = make("Frame",{Name="Footer",Position=UDim2.new(0,12,1,-128),Size=UDim2.new(1,-24,0,122),BackgroundTransparency=1},Content)
-local StatusPanel = make("Frame",{Position=UDim2.new(0,0,0,0),Size=UDim2.new(1,0,0,52),BackgroundColor3=PANEL,BorderSizePixel=0},Footer)
-round(StatusPanel,10)
-make("UIStroke",{Color=Color3.fromRGB(48,56,76),Thickness=1},StatusPanel)
-local StatusLbl = label("Ready",12,UDim2.fromOffset(12,8),UDim2.new(1,-24,0,18),StatusPanel)
-StatusLbl.Font=Enum.Font.GothamMedium
-local StatusSub = label("Press Ring · Right Shift = emergency off",10,UDim2.fromOffset(12,26),UDim2.new(1,-24,0,14),StatusPanel)
-StatusSub.TextColor3=MUTED
-local function setStatus(m,c,s) StatusLbl.Text=m StatusLbl.TextColor3=c or WHITE StatusSub.Text=s or "" end
+local Footer = make("Frame", {Name="Footer", Position=UDim2.new(0,12,1,-128),
+    Size=UDim2.new(1,-24,0,122), BackgroundTransparency=1}, Content)
+local StatusPanel = make("Frame", {Position=UDim2.new(0,0,0,0),
+    Size=UDim2.new(1,0,0,52), BackgroundColor3=PANEL, BorderSizePixel=0}, Footer)
+round(StatusPanel, 10)
+make("UIStroke", {Color=Color3.fromRGB(48,56,76), Thickness=1}, StatusPanel)
+local StatusLbl = label("Ready", 12, UDim2.fromOffset(12,8), UDim2.new(1,-24,0,18), StatusPanel)
+StatusLbl.Font = Enum.Font.GothamMedium
+local StatusSub = label("Press Ring · Right Shift = emergency off", 10,
+    UDim2.fromOffset(12,26), UDim2.new(1,-24,0,14), StatusPanel)
+StatusSub.TextColor3 = MUTED
+local function setStatus(main, color, sub)
+    StatusLbl.Text = main
+    StatusLbl.TextColor3 = color or WHITE
+    StatusSub.Text = sub or ""
+end
 
+-- ============================================================
 -- PLAYERS PAGE
-local sectionPlayers = label("PLAYERS",10,UDim2.fromOffset(10,4),UDim2.new(1,-20,0,14),PlayerPage)
-sectionPlayers.Font=Enum.Font.GothamBold sectionPlayers.TextColor3=MUTED
-local Search = make("TextBox",{Text="",PlaceholderText="🔍 Search players...",ClearTextOnFocus=false,TextColor3=WHITE,PlaceholderColor3=MUTED,TextSize=13,Font=Enum.Font.Gotham,BackgroundColor3=PANEL,TextXAlignment=Enum.TextXAlignment.Left},PlayerPage)
-round(Search,8)
-make("UIPadding",{PaddingLeft=UDim.new(0,10)},Search)
-local Count = label("Loading players...",10,UDim2.fromOffset(10,0),UDim2.new(1,-20,0,14),PlayerPage)
-Count.TextColor3=MUTED
-local SelectAllBtn = make("TextButton",{Text="SELECT ALL",Font=Enum.Font.GothamBold,TextSize=11,TextColor3=WHITE,BackgroundColor3=ROW,AutoButtonColor=false},PlayerPage)
-round(SelectAllBtn,8)
-local ClearBtn = make("TextButton",{Text="CLEAR",Font=Enum.Font.GothamBold,TextSize=11,TextColor3=WHITE,BackgroundColor3=ROW,AutoButtonColor=false},PlayerPage)
-round(ClearBtn,8)
-local ResetRungBtn = make("TextButton",{Text="RESET RUNG",Font=Enum.Font.GothamBold,TextSize=10,TextColor3=WHITE,BackgroundColor3=Color3.fromRGB(120,80,180),AutoButtonColor=false},PlayerPage)
-round(ResetRungBtn,8)
+-- ============================================================
+local sectionPlayers = label("PLAYERS", 10, UDim2.fromOffset(10,10), UDim2.new(1,-20,0,16), PlayerPage)
+sectionPlayers.Font = Enum.Font.GothamBold
+sectionPlayers.TextColor3 = MUTED
 
-local List = make("ScrollingFrame",{BackgroundColor3=PANEL,BorderSizePixel=0,ScrollBarThickness=10,ScrollBarImageColor3=ACCENT,CanvasSize=UDim2.fromOffset(0,0),ScrollingDirection=Enum.ScrollingDirection.Y,ScrollingEnabled=true,ClipsDescendants=true},PlayerPage)
-round(List,10)
-make("UIPadding",{PaddingTop=UDim.new(0,10),PaddingBottom=UDim.new(0,10),PaddingLeft=UDim.new(0,8),PaddingRight=UDim.new(0,8)},List)
-local ListLayout = make("UIListLayout",{SortOrder=Enum.SortOrder.LayoutOrder,Padding=UDim.new(0,8)},List)
+local Search = make("TextBox", {Text="", PlaceholderText="🔍  Search players...",
+    ClearTextOnFocus=false, TextColor3=WHITE, PlaceholderColor3=MUTED,
+    TextSize=13, Font=Enum.Font.Gotham, BackgroundColor3=PANEL,
+    TextXAlignment=Enum.TextXAlignment.Left}, PlayerPage)
+round(Search, 10)
+make("UIPadding", {PaddingLeft=UDim.new(0,12)}, Search)
+
+local Count = label("Loading players...", 11, UDim2.fromOffset(10,0),
+    UDim2.new(1,-20,0,16), PlayerPage)
+Count.TextColor3 = MUTED
+
+local SelectAllBtn = make("TextButton", {Text="SELECT ALL", Font=Enum.Font.GothamBold,
+    TextSize=11, TextColor3=WHITE, BackgroundColor3=ROW, AutoButtonColor=false}, PlayerPage)
+round(SelectAllBtn, 8)
+local ClearBtn = make("TextButton", {Text="CLEAR", Font=Enum.Font.GothamBold,
+    TextSize=11, TextColor3=WHITE, BackgroundColor3=ROW, AutoButtonColor=false}, PlayerPage)
+round(ClearBtn, 8)
+local ResetRungBtn = make("TextButton", {Text="RESET", Font=Enum.Font.GothamBold,
+    TextSize=11, TextColor3=WHITE, BackgroundColor3=Color3.fromRGB(120,80,180),
+    AutoButtonColor=false}, PlayerPage)
+round(ResetRungBtn, 8)
+
+for _, b in ipairs({SelectAllBtn, ClearBtn, ResetRungBtn}) do
+    b.MouseEnter:Connect(function() b.BackgroundColor3 = b.BackgroundColor3:Lerp(Color3.new(1,1,1), 0.15) end)
+    b.MouseLeave:Connect(function()
+        if b == ResetRungBtn then b.BackgroundColor3 = Color3.fromRGB(120,80,180)
+        else b.BackgroundColor3 = ROW end
+    end)
+end
+
+local List = make("ScrollingFrame", {BackgroundColor3=PANEL, BorderSizePixel=0,
+    ScrollBarThickness=6, ScrollBarImageColor3=ACCENT,
+    CanvasSize=UDim2.fromOffset(0,0),
+    ScrollingDirection=Enum.ScrollingDirection.Y, ScrollingEnabled=true,
+    ClipsDescendants=true}, PlayerPage)
+round(List, 10)
+make("UIPadding", {PaddingTop=UDim.new(0,6), PaddingBottom=UDim.new(0,6),
+    PaddingLeft=UDim.new(0,6), PaddingRight=UDim.new(0,6)}, List)
+local ListLayout = make("UIListLayout", {SortOrder=Enum.SortOrder.LayoutOrder,
+    Padding=UDim.new(0,6)}, List)
 
 local rows = {}
-local function loadAvatar(player,image,size)
-    image:SetAttribute("AvatarUserId",player.UserId)
-    image.Image=""
+local function loadAvatar(player, image, size)
+    image:SetAttribute("AvatarUserId", player.UserId)
+    image.Image = ""
     task.spawn(function()
-        local ok,url=pcall(function() return Players:GetUserThumbnailAsync(player.UserId,Enum.ThumbnailType.HeadShot,size) end)
-        if ok and url and image.Parent and image:GetAttribute("AvatarUserId")==player.UserId then image.Image=url end
+        local ok, url = pcall(function()
+            return Players:GetUserThumbnailAsync(player.UserId, Enum.ThumbnailType.HeadShot, size)
+        end)
+        if ok and image.Parent and image:GetAttribute("AvatarUserId") == player.UserId then
+            image.Image = url
+        end
     end)
 end
 
 local function refreshPlayers()
-    pcall(function()
-        for _,r in pairs(rows) do r:Destroy() end
-        table.clear(rows)
-        local all=Players:GetPlayers()
-        table.sort(all,function(a,b) return a.Name:lower()<b.Name:lower() end)
-        local q=Search.Text:lower()
-        local shown=0
-        for _,player in ipairs(all) do
-            if player~=Me and not isProtectedPlayer(player) and (player.Name:lower():find(q,1,true) or player.DisplayName:lower():find(q,1,true)) then
-                shown=shown+1
-                local selected=targetPlayerNames[player.Name]==true
-                local rung=rungPlayers[player.Name]==true
-                local rowColor=ROW
-                if rung then rowColor=Color3.fromRGB(90,60,60) elseif selected then rowColor=Color3.fromRGB(58,78,110) end
-                local Row=make("TextButton",{Size=UDim2.new(1,-16,0,58),LayoutOrder=shown,BackgroundColor3=rowColor,BorderSizePixel=0,AutoButtonColor=false,Text=""},List)
-                round(Row,10)
-                local pic=make("ImageLabel",{Position=UDim2.fromOffset(38,10),Size=UDim2.fromOffset(38,38),BackgroundColor3=PANEL,Image=""},Row)
-                round(pic,19)
-                local check=make("Frame",{Position=UDim2.fromOffset(8,18),Size=UDim2.fromOffset(22,22),BackgroundColor3=Color3.fromRGB(60,70,95),BorderSizePixel=0},Row)
-                round(check,6)
-                local checkTxt="✓" local checkCol=Color3.fromRGB(60,230,130)
-                if rung then checkTxt="✗" checkCol=Color3.fromRGB(230,110,110) end
-                make("TextLabel",{Size=UDim2.fromScale(1,1),BackgroundTransparency=1,Text=checkTxt,TextColor3=checkCol,Font=Enum.Font.GothamBold,TextSize=15,Visible=selected},check)
-                local dl=label(player.DisplayName..(rung and "  [RUNG]" or ""),13,UDim2.fromOffset(84,10),UDim2.new(1,-96,0,20),Row)
-                dl.Font=Enum.Font.GothamBold
-                if rung then dl.TextColor3=Color3.fromRGB(230,110,110) end
-                local ul=label("@"..player.Name,10,UDim2.fromOffset(84,32),UDim2.new(1,-96,0,16),Row)
-                ul.TextColor3=MUTED
-                loadAvatar(player,pic,Enum.ThumbnailSize.Size100x100)
-                Row.MouseButton1Click:Connect(function()
-                    if targetPlayerNames[player.Name] then
-                        targetPlayerNames[player.Name]=nil rungPlayers[player.Name]=nil
-                    else
-                        targetPlayerNames[player.Name]=true rungPlayers[player.Name]=nil
-                        lastTargetPos=nil orbitTargetName=nil orbitTargetStart=0 orbitBaselineVel=0
-                    end
-                    refreshPlayers()
-                    local n=selectedCount()
-                    setStatus(n==0 and "Target: self" or ("Selected: "..n),n==0 and MUTED or Color3.fromRGB(80,180,200))
-                end)
-                rows[player]=Row
-            end
+    for _, r in pairs(rows) do r:Destroy() end
+    table.clear(rows)
+    local all = Players:GetPlayers()
+    table.sort(all, function(a,b) return a.Name:lower() < b.Name:lower() end)
+    local q = Search.Text:lower()
+    local shown = 0
+    for _, player in ipairs(all) do
+        if player ~= Me
+           and (player.Name:lower():find(q,1,true)
+                or player.DisplayName:lower():find(q,1,true)) then
+            shown = shown + 1
+            local selected = targetPlayerNames[player.Name] == true
+            local rung = rungPlayers[player.Name] == true
+            local rowColor = ROW
+            if rung then rowColor = Color3.fromRGB(90,60,60)
+            elseif selected then rowColor = Color3.fromRGB(58,78,110) end
+
+            local Row = make("TextButton", {Size=UDim2.new(1,-18,0,60),
+                LayoutOrder=shown, BackgroundColor3=rowColor,
+                BorderSizePixel=0, AutoButtonColor=false, Text=""}, List)
+            round(Row, 10)
+            Row.MouseEnter:Connect(function()
+                if not selected then Row.BackgroundColor3 = ROWHI end
+            end)
+            Row.MouseLeave:Connect(function()
+                if not selected then Row.BackgroundColor3 = ROW end
+            end)
+            local pic = make("ImageLabel", {Position=UDim2.fromOffset(36,8),
+                Size=UDim2.fromOffset(44,44), BackgroundColor3=PANEL, Image=""}, Row)
+            round(pic, 22)
+            local check = make("Frame", {Position=UDim2.fromOffset(8,17),
+                Size=UDim2.fromOffset(24,24), BackgroundColor3=Color3.fromRGB(60,70,95),
+                BorderSizePixel=0}, Row)
+            round(check, 6)
+            make("UIStroke", {Color=Color3.fromRGB(80,92,118), Thickness=1}, check)
+            local checkTxt = "✓"
+            local checkCol = Color3.fromRGB(60,230,130)
+            if rung then checkTxt = "✗"; checkCol = Color3.fromRGB(230,110,110) end
+            make("TextLabel", {Size=UDim2.fromScale(1,1), BackgroundTransparency=1,
+                Text=checkTxt, TextColor3=checkCol,
+                Font=Enum.Font.GothamBold, TextSize=16, Visible=selected}, check)
+            local dl = label(player.DisplayName .. (rung and "  [RUNG]" or ""), 14,
+                UDim2.fromOffset(88,8), UDim2.new(1,-96,0,22), Row)
+            dl.Font = Enum.Font.GothamBold
+            if rung then dl.TextColor3 = Color3.fromRGB(230,110,110) end
+            local ul = label("@"..player.Name, 11, UDim2.fromOffset(88,32),
+                UDim2.new(1,-96,0,18), Row)
+            ul.TextColor3 = MUTED
+            loadAvatar(player, pic, Enum.ThumbnailSize.Size100x100)
+            Row.MouseButton1Click:Connect(function()
+                if targetPlayerNames[player.Name] then
+                    targetPlayerNames[player.Name] = nil
+                    rungPlayers[player.Name] = nil
+                else
+                    targetPlayerNames[player.Name] = true
+                    rungPlayers[player.Name] = nil
+                end
+                refreshPlayers()
+                local n = selectedCount()
+                setStatus(n == 0 and "Target: self (no selection)" or ("Selected: "..n),
+                    n == 0 and MUTED or Color3.fromRGB(80,180,200))
+            end)
+            rows[player] = Row
         end
-        Count.Text=string.format("%d online · %d shown · %d selected · %d rung",#all,shown,selectedCount(),rungCount())
-    end)
+    end
+    Count.Text = string.format("%d online · %d shown · %d selected · %d rung",
+        #all, shown, selectedCount(), rungCount())
 end
 
 SelectAllBtn.MouseButton1Click:Connect(function()
-    for _,player in ipairs(Players:GetPlayers()) do
-        if player~=Me and not isProtectedPlayer(player) then
-            targetPlayerNames[player.Name]=true rungPlayers[player.Name]=nil
+    for _, player in ipairs(Players:GetPlayers()) do
+        if player ~= Me then
+            targetPlayerNames[player.Name] = true
+            rungPlayers[player.Name] = nil
         end
     end
-    lastTargetPos=nil orbitTargetName=nil orbitBaselineVel=0
     refreshPlayers()
+    setStatus("Selected: "..selectedCount(), Color3.fromRGB(80,180,200))
 end)
 ClearBtn.MouseButton1Click:Connect(function()
-    table.clear(targetPlayerNames) table.clear(rungPlayers)
-    lastTargetPos=nil orbitTargetName=nil orbitBaselineVel=0
-    refreshPlayers() setStatus("Target: self",MUTED)
+    table.clear(targetPlayerNames)
+    table.clear(rungPlayers)
+    lastTargetPos = nil
+    orbitTargetName = nil
+    refreshPlayers()
+    setStatus("Target: self (no selection)", MUTED)
 end)
 ResetRungBtn.MouseButton1Click:Connect(function()
     table.clear(rungPlayers)
-    lastTargetPos=nil orbitTargetName=nil orbitTargetStart=0 orbitBaselineVel=0
+    lastTargetPos = nil
+    orbitTargetName = nil
     refreshPlayers()
-    local origColor = ResetRungBtn.BackgroundColor3
-    ResetRungBtn.BackgroundColor3 = Color3.fromRGB(64,200,120)
-    ResetRungBtn.Text = "✓ DONE"
-    setStatus("Rung reset — targeting again", GREEN)
-    task.delay(0.8, function()
-        if ResetRungBtn and ResetRungBtn.Parent then
-            ResetRungBtn.BackgroundColor3 = origColor
-            ResetRungBtn.Text = "RESET RUNG"
-        end
-    end)
+    setStatus("Rung list reset", Color3.fromRGB(200,160,60))
 end)
 
-Search:GetPropertyChangedSignal("Text"):Connect(function() List.CanvasPosition=Vector2.zero refreshPlayers() end)
+Search:GetPropertyChangedSignal("Text"):Connect(function()
+    List.CanvasPosition = Vector2.zero
+    refreshPlayers()
+end)
 Players.PlayerAdded:Connect(function() task.defer(refreshPlayers) end)
-Players.PlayerRemoving:Connect(function(p) targetPlayerNames[p.Name]=nil rungPlayers[p.Name]=nil task.defer(refreshPlayers) end)
+Players.PlayerRemoving:Connect(function(p)
+    targetPlayerNames[p.Name] = nil
+    rungPlayers[p.Name] = nil
+    task.defer(refreshPlayers)
+end)
 
+-- ============================================================
 -- RING PAGE
-local RingHeading = label("SUPER RING",12,UDim2.fromOffset(10,14),UDim2.new(1,-20,0,22),RingPage)
-RingHeading.Font=Enum.Font.GothamBold RingHeading.TextColor3=ACCENT
-local RingHint = label("Ring orbits nearest non-rung target.",11,UDim2.fromOffset(10,40),UDim2.new(1,-20,0,32),RingPage)
-RingHint.TextWrapped=true RingHint.TextColor3=MUTED
+-- ============================================================
+local RingHeading = label("SUPER RING OLD", 12, UDim2.fromOffset(10,14),
+    UDim2.new(1,-20,0,22), RingPage)
+RingHeading.Font = Enum.Font.GothamBold
+RingHeading.TextColor3 = ACCENT
 
-local RingToggle = make("TextButton",{Text="Ring: OFF",Font=Enum.Font.GothamBold,TextSize=14,TextColor3=WHITE,BackgroundColor3=RED,AutoButtonColor=false},RingPage)
-round(RingToggle,10)
+local RingHint = label("Ring orbits nearest non-rung selected player. Self-Immunity keeps parts out of your safe radius.",
+    11, UDim2.fromOffset(10,40), UDim2.new(1,-20,0,52), RingPage)
+RingHint.TextWrapped = true
+RingHint.TextColor3 = MUTED
+
+local RingToggle = make("TextButton", {Text="Ring: OFF", Font=Enum.Font.GothamBold,
+    TextSize=14, TextColor3=WHITE, BackgroundColor3=RED, AutoButtonColor=false}, RingPage)
+round(RingToggle, 10)
 RingToggle.MouseButton1Click:Connect(function()
-    local ch=Me.Character local hrp=ch and ch:FindFirstChild("HumanoidRootPart")
-    if not hrp and OrbitState~=0 then setStatus("No character",RED) return end
-    if OrbitState==0 then
-        OrbitState=1 RingToggle.Text="Ring: ON" RingToggle.BackgroundColor3=GREEN setStatus("Orbit active",GREEN)
-    elseif OrbitState==1 then
-        LockedPosition=hrp.Position OrbitState=2 RingToggle.Text="Ring: LOCKED" RingToggle.BackgroundColor3=AMBER setStatus("Locked",AMBER)
+    local ch = Me.Character
+    local hrp = ch and ch:FindFirstChild("HumanoidRootPart")
+    if not hrp and OrbitState ~= 0 then setStatus("No character", RED); return end
+    if OrbitState == 0 then
+        OrbitState = 1
+        RingToggle.Text = "Ring: ON"
+        RingToggle.BackgroundColor3 = GREEN
+        setStatus("Orbit active", GREEN, "Targeting selected players")
+    elseif OrbitState == 1 then
+        LockedPosition = hrp.Position
+        OrbitState = 2
+        RingToggle.Text = "Ring: LOCKED"
+        RingToggle.BackgroundColor3 = AMBER
+        setStatus("Orbit locked", AMBER, "Center frozen")
     else
-        OrbitState=0 LockedPosition=nil RingToggle.Text="Ring: OFF" RingToggle.BackgroundColor3=RED
-        for _,v in pairs(itemsInRing) do if v and v.Parent then local bp=v:FindFirstChild("OrbitBP") if bp then bp:Destroy() end end end
-        itemsInRing={} itemsInRingLookup={} table.clear(rungPlayers) lastTargetPos=nil orbitTargetName=nil
-        refreshPlayers() setStatus("Orbit off",MUTED)
+        OrbitState = 0
+        LockedPosition = nil
+        RingToggle.Text = "Ring: OFF"
+        RingToggle.BackgroundColor3 = RED
+        for _, v in pairs(itemsInRing) do
+            if v and v.Parent then
+                local bp = v:FindFirstChild("OrbitBP")
+                if bp then bp:Destroy() end
+            end
+        end
+        itemsInRing = {}
+        itemsInRingLookup = {}
+        table.clear(rungPlayers)
+        lastTargetPos = nil
+        orbitTargetName = nil
+        refreshPlayers()
+        setStatus("Orbit off", MUTED)
     end
 end)
 
 local ringRows = {}
-local function createRingRow(labelText,minV,maxV,stepV,getFn,setFn,parent)
-    parent=parent or RingPage
-    local lbl=label(labelText,11,UDim2.fromOffset(10,0),UDim2.fromOffset(200,14),parent)
-    lbl.Font=Enum.Font.GothamBold lbl.TextColor3=MUTED
-    local dec=make("TextButton",{Text="−",Font=Enum.Font.GothamBold,TextSize=18,TextColor3=WHITE,BackgroundColor3=ROW,AutoButtonColor=false},parent)
-    round(dec,8)
-    local box=make("TextBox",{Text=tostring(getFn()),ClearTextOnFocus=false,TextColor3=WHITE,TextSize=12,Font=Enum.Font.GothamBold,BackgroundColor3=PANEL,TextXAlignment=Enum.TextXAlignment.Center},parent)
-    round(box,8)
-    local inc=make("TextButton",{Text="+",Font=Enum.Font.GothamBold,TextSize=18,TextColor3=WHITE,BackgroundColor3=ROW,AutoButtonColor=false},parent)
-    round(inc,8)
-    dec.MouseButton1Click:Connect(function() setFn(math.clamp(getFn()-stepV,minV,maxV)) box.Text=tostring(getFn()) end)
-    inc.MouseButton1Click:Connect(function() setFn(math.clamp(getFn()+stepV,minV,maxV)) box.Text=tostring(getFn()) end)
-    box.FocusLost:Connect(function(e) if e then local n=tonumber(box.Text) if n then setFn(math.clamp(n,minV,maxV)) end end box.Text=tostring(getFn()) end)
-    table.insert(ringRows,{label=lbl,dec=dec,box=box,inc=inc,parent=parent})
+local function createRingRow(labelText, minV, maxV, stepV, getFn, setFn)
+    local lbl = label(labelText, 11, UDim2.fromOffset(10,0), UDim2.fromOffset(200,16), RingPage)
+    lbl.Font = Enum.Font.GothamBold
+    lbl.TextColor3 = MUTED
+    local dec = make("TextButton", {Text="−", Font=Enum.Font.GothamBold, TextSize=20,
+        TextColor3=WHITE, BackgroundColor3=ROW, AutoButtonColor=false}, RingPage)
+    round(dec, 8)
+    local box = make("TextBox", {Text=tostring(getFn()), ClearTextOnFocus=false,
+        TextColor3=WHITE, TextSize=13, Font=Enum.Font.GothamBold,
+        BackgroundColor3=PANEL, TextXAlignment=Enum.TextXAlignment.Center}, RingPage)
+    round(box, 8)
+    local inc = make("TextButton", {Text="+", Font=Enum.Font.GothamBold, TextSize=20,
+        TextColor3=WHITE, BackgroundColor3=ROW, AutoButtonColor=false}, RingPage)
+    round(inc, 8)
+    dec.MouseButton1Click:Connect(function()
+        setFn(math.clamp(getFn()-stepV,minV,maxV)); box.Text = tostring(getFn())
+    end)
+    inc.MouseButton1Click:Connect(function()
+        setFn(math.clamp(getFn()+stepV,minV,maxV)); box.Text = tostring(getFn())
+    end)
+    box.FocusLost:Connect(function(enter)
+        if enter then local n = tonumber(box.Text); if n then setFn(math.clamp(n,minV,maxV)) end end
+        box.Text = tostring(getFn())
+    end)
+    table.insert(ringRows, {label=lbl, dec=dec, box=box, inc=inc})
 end
 
-createRingRow("Radius A",1,500,1,function() return config.radiusA end,function(v) config.radiusA=v end)
-createRingRow("Radius B",1,500,1,function() return config.radiusB end,function(v) config.radiusB=v end)
-createRingRow("Height A",-200,400,1,function() return config.heightA end,function(v) config.heightA=v end)
-createRingRow("Height B",-200,400,1,function() return config.heightB end,function(v) config.heightB=v end)
-createRingRow("Spin Speed",1,200,1,function() return config.baseSpeedMultiplier end,function(v) config.baseSpeedMultiplier=v end)
-createRingRow("Target Radius",0,500,5,function() return config.targetRadius end,function(v) config.targetRadius=v end)
-createRingRow("Scan Radius",50,2000,50,function() return config.scanRadius end,function(v) config.scanRadius=v end)
-createRingRow("Success Time",1,60,1,function() return config.ringSuccessTime end,function(v) config.ringSuccessTime=v end)
-createRingRow("Immunity Radius",2,100,1,function() return config.immunityRadius end,function(v) config.immunityRadius=v end)
+createRingRow("Radius A",       1, 500, 1, function() return config.radiusA end, function(v) config.radiusA = v end)
+createRingRow("Radius B",       1, 500, 1, function() return config.radiusB end, function(v) config.radiusB = v end)
+createRingRow("Height A",    -200, 400, 1, function() return config.heightA end, function(v) config.heightA = v end)
+createRingRow("Height B",    -200, 400, 1, function() return config.heightB end, function(v) config.heightB = v end)
+createRingRow("Spin Speed",     1, 100, 1, function() return config.speed end,   function(v) config.speed = v end)
+createRingRow("Target Radius",  0, 500, 5, function() return config.targetRadius end, function(v) config.targetRadius = v end)
+createRingRow("Scan Radius",   50, 2000, 50, function() return config.scanRadius end, function(v) config.scanRadius = v end)
+createRingRow("Success Time",   1, 30, 0.5, function() return config.ringSuccessTime end, function(v) config.ringSuccessTime = v end)
+createRingRow("Immunity Radius", 2, 100, 1, function() return config.immunityRadius end, function(v) config.immunityRadius = v end)
 
-local SelfImmunityToggle = make("TextButton",{Text="Self-Immunity: "..(config.selfImmunity and "ON" or "OFF"),Font=Enum.Font.GothamBold,TextSize=13,TextColor3=WHITE,BackgroundColor3=config.selfImmunity and GREEN or ROW,AutoButtonColor=false},RingPage)
-round(SelfImmunityToggle,8)
+local SelfImmunityToggle = make("TextButton", {
+    Text = "Self-Immunity: " .. (config.selfImmunity and "ON" or "OFF"),
+    Font = Enum.Font.GothamBold, TextSize = 13, TextColor3 = WHITE,
+    BackgroundColor3 = config.selfImmunity and GREEN or ROW,
+    AutoButtonColor = false}, RingPage)
+round(SelfImmunityToggle, 8)
 SelfImmunityToggle.MouseButton1Click:Connect(function()
-    config.selfImmunity=not config.selfImmunity
-    SelfImmunityToggle.Text="Self-Immunity: "..(config.selfImmunity and "ON" or "OFF")
-    SelfImmunityToggle.BackgroundColor3=config.selfImmunity and GREEN or ROW
+    config.selfImmunity = not config.selfImmunity
+    SelfImmunityToggle.Text = "Self-Immunity: " .. (config.selfImmunity and "ON" or "OFF")
+    SelfImmunityToggle.BackgroundColor3 = config.selfImmunity and GREEN or ROW
+    setStatus("Self-Immunity " .. (config.selfImmunity and "ON" or "OFF"),
+        config.selfImmunity and GREEN or MUTED,
+        "Safe radius: " .. config.immunityRadius .. " studs")
 end)
 
+local RingNote = label("Right Shift = emergency off.",
+    10, UDim2.fromOffset(10,0), UDim2.new(1,-20,0,24), RingPage)
+RingNote.TextWrapped = true
+RingNote.TextColor3 = MUTED
+
+-- ============================================================
 -- FPS BOOST
+-- ============================================================
 local fpsActive = false
 local function applyFPSBoost()
-    for _,obj in ipairs(workspace:GetDescendants()) do
-        if obj:IsA("ParticleEmitter") or obj:IsA("Trail") or obj:IsA("Smoke") or obj:IsA("Fire") or obj:IsA("Sparkles") then obj.Enabled=false
-        elseif obj:IsA("Explosion") then obj.Visible=false
-        elseif obj:IsA("BasePart") then pcall(function() obj.CastShadow=false end) end
+    local set = _G.Settings or {}
+    local noParts  = set["No Particles"] ~= false
+    local noCam    = set["No Camera Effects"] ~= false
+    local noExp    = set["No Explosions"] ~= false
+    local noShadow = set["No Shadows"] ~= false
+    local lowQual  = set["Low Quality Parts"] ~= false
+
+    if noParts then
+        for _, obj in ipairs(workspace:GetDescendants()) do
+            if obj:IsA("ParticleEmitter") or obj:IsA("Trail") or obj:IsA("Smoke")
+               or obj:IsA("Fire") or obj:IsA("Sparkles") then
+                obj.Enabled = false
+            end
+        end
+        workspace.DescendantAdded:Connect(function(obj)
+            if obj:IsA("ParticleEmitter") or obj:IsA("Trail") or obj:IsA("Smoke")
+               or obj:IsA("Fire") or obj:IsA("Sparkles") then
+                obj.Enabled = false
+            end
+        end)
     end
-    for _,obj in ipairs(Lighting:GetChildren()) do if obj:IsA("PostEffect") then obj.Enabled=false end end
-    Lighting.GlobalShadows=false
+    if noCam then
+        for _, obj in ipairs(Lighting:GetChildren()) do
+            if obj:IsA("PostEffect") then obj.Enabled = false end
+        end
+    end
+    if noExp then
+        for _, obj in ipairs(workspace:GetDescendants()) do
+            if obj:IsA("Explosion") then obj.Visible = false end
+        end
+        workspace.DescendantAdded:Connect(function(obj)
+            if obj:IsA("Explosion") then obj.Visible = false end
+        end)
+    end
+    if noShadow then
+        Lighting.GlobalShadows = false
+        Lighting.FogEnd = 100000
+        for _, obj in ipairs(workspace:GetDescendants()) do
+            if obj:IsA("BasePart") then obj.CastShadow = false end
+        end
+        workspace.DescendantAdded:Connect(function(obj)
+            if obj:IsA("BasePart") then obj.CastShadow = false end
+        end)
+    end
+    if lowQual then
+        for _, obj in ipairs(workspace:GetDescendants()) do
+            if obj:IsA("BasePart") then
+                pcall(function() obj.Material = Enum.Material.SmoothPlastic end)
+            end
+        end
+    end
 end
 
+-- ============================================================
 -- FLING ALL
+-- ============================================================
 local flingAllRunning = false
-local function flingMessage(title, text, time)
-    pcall(function() game:GetService("StarterGui"):SetCore("SendNotification",{Title=title,Text=text,Duration=time or 5}) end)
-end
+local function flingAll()
+    if flingAllRunning then return end
+    flingAllRunning = true
+    getgenv().FPDH = workspace.FallenPartsDestroyHeight
 
-local function skidFling(TargetPlayer)
-    local Character = Me.Character
-    local Humanoid = Character and Character:FindFirstChildOfClass("Humanoid")
-    local RootPart = Humanoid and Humanoid.RootPart
-    local TCharacter = TargetPlayer.Character
-    if not TCharacter then return end
-    local THumanoid, TRootPart, THead, Accessory, Handle
-    if TCharacter:FindFirstChildOfClass("Humanoid") then THumanoid = TCharacter:FindFirstChildOfClass("Humanoid") end
-    if THumanoid and THumanoid.RootPart then TRootPart = THumanoid.RootPart end
-    if TCharacter:FindFirstChild("Head") then THead = TCharacter.Head end
-    if TCharacter:FindFirstChildOfClass("Accessory") then Accessory = TCharacter:FindFirstChildOfClass("Accessory") end
-    if Accessory and Accessory:FindFirstChild("Handle") then Handle = Accessory.Handle end
-    if Character and Humanoid and RootPart then
+    local function msg(t, x, dur)
+        pcall(function()
+            game:GetService("StarterGui"):SetCore("SendNotification",
+                {Title=t, Text=x, Duration=dur or 5})
+        end)
+    end
+
+    local function skidFling(TargetPlayer)
+        local Character = Me.Character
+        local Humanoid = Character and Character:FindFirstChildOfClass("Humanoid")
+        local RootPart = Humanoid and Humanoid.RootPart
+        if not (Character and Humanoid and RootPart) then return end
+        local TCharacter = TargetPlayer.Character
+        if not TCharacter then return end
+        local THumanoid = TCharacter:FindFirstChildOfClass("Humanoid")
+        local TRootPart = THumanoid and THumanoid.RootPart
+        local THead = TCharacter:FindFirstChild("Head")
+        local Accessory = TCharacter:FindFirstChildOfClass("Accessory")
+        local Handle = Accessory and Accessory:FindFirstChild("Handle")
+
         if RootPart.Velocity.Magnitude < 50 then getgenv().OldPos = RootPart.CFrame end
-        if THumanoid and THumanoid.Sit then return flingMessage("Error", "Target is sitting", 5) end
-        if THead then workspace.CurrentCamera.CameraSubject = THead
-        elseif Handle then workspace.CurrentCamera.CameraSubject = Handle
-        elseif THumanoid and TRootPart then workspace.CurrentCamera.CameraSubject = THumanoid end
+        if THumanoid and THumanoid.Sit then return end
         if not TCharacter:FindFirstChildWhichIsA("BasePart") then return end
-        local function FPos(BasePart, Pos, Ang)
-            RootPart.CFrame = CFrame.new(BasePart.Position) * Pos * Ang
-            Character:SetPrimaryPartCFrame(CFrame.new(BasePart.Position) * Pos * Ang)
-            RootPart.Velocity = Vector3.new(9e7, 9e7 * 10, 9e7)
+
+        local function FPos(bp, pos, ang)
+            RootPart.CFrame = CFrame.new(bp.Position) * pos * ang
+            Character:SetPrimaryPartCFrame(CFrame.new(bp.Position) * pos * ang)
+            RootPart.Velocity = Vector3.new(9e7, 9e7*10, 9e7)
             RootPart.RotVelocity = Vector3.new(9e8, 9e8, 9e8)
         end
+
         local function SFBasePart(BasePart)
-            local TimeToWait = 2
             local Time = tick()
             local Angle = 0
             repeat
-                if RootPart and THumanoid then
-                    if BasePart.Velocity.Magnitude < 50 then
-                        Angle = Angle + 100
-                        FPos(BasePart, CFrame.new(0, 1.5, 0) + THumanoid.MoveDirection * BasePart.Velocity.Magnitude / 1.25, CFrame.Angles(math.rad(Angle),0,0)) task.wait()
-                        FPos(BasePart, CFrame.new(0, -1.5, 0) + THumanoid.MoveDirection * BasePart.Velocity.Magnitude / 1.25, CFrame.Angles(math.rad(Angle), 0, 0)) task.wait()
-                        FPos(BasePart, CFrame.new(2.25, 1.5, -2.25) + THumanoid.MoveDirection * BasePart.Velocity.Magnitude / 1.25, CFrame.Angles(math.rad(Angle), 0, 0)) task.wait()
-                        FPos(BasePart, CFrame.new(-2.25, -1.5, 2.25) + THumanoid.MoveDirection * BasePart.Velocity.Magnitude / 1.25, CFrame.Angles(math.rad(Angle), 0, 0)) task.wait()
-                        FPos(BasePart, CFrame.new(0, 1.5, 0) + THumanoid.MoveDirection, CFrame.Angles(math.rad(Angle), 0, 0)) task.wait()
-                        FPos(BasePart, CFrame.new(0, -1.5, 0) + THumanoid.MoveDirection, CFrame.Angles(math.rad(Angle), 0, 0)) task.wait()
-                    else
-                        FPos(BasePart, CFrame.new(0, 1.5, THumanoid.WalkSpeed), CFrame.Angles(math.rad(90), 0, 0)) task.wait()
-                        FPos(BasePart, CFrame.new(0, -1.5, -THumanoid.WalkSpeed), CFrame.Angles(0, 0, 0)) task.wait()
-                        FPos(BasePart, CFrame.new(0, 1.5, THumanoid.WalkSpeed), CFrame.Angles(math.rad(90), 0, 0)) task.wait()
-                        FPos(BasePart, CFrame.new(0, 1.5, TRootPart.Velocity.Magnitude / 1.25), CFrame.Angles(math.rad(90), 0, 0)) task.wait()
-                        FPos(BasePart, CFrame.new(0, -1.5, -TRootPart.Velocity.Magnitude / 1.25), CFrame.Angles(0, 0, 0)) task.wait()
-                        FPos(BasePart, CFrame.new(0, 1.5, TRootPart.Velocity.Magnitude / 1.25), CFrame.Angles(math.rad(90), 0, 0)) task.wait()
-                        FPos(BasePart, CFrame.new(0, -1.5, 0), CFrame.Angles(math.rad(90), 0, 0)) task.wait()
-                        FPos(BasePart, CFrame.new(0, -1.5, 0), CFrame.Angles(0, 0, 0)) task.wait()
-                        FPos(BasePart, CFrame.new(0, -1.5, 0), CFrame.Angles(math.rad(-90), 0, 0)) task.wait()
-                        FPos(BasePart, CFrame.new(0, -1.5, 0), CFrame.Angles(0, 0, 0)) task.wait()
-                    end
-                else break end
-            until BasePart.Velocity.Magnitude > 500 or BasePart.Parent ~= TargetPlayer.Character or TargetPlayer.Parent ~= Players or THumanoid.Sit or Humanoid.Health <= 0 or tick() > Time + TimeToWait
+                if not (RootPart and THumanoid) then break end
+                if BasePart.Velocity.Magnitude < 50 then
+                    Angle = Angle + 100
+                    FPos(BasePart, CFrame.new(0,1.5,0) + THumanoid.MoveDirection * BasePart.Velocity.Magnitude/1.25, CFrame.Angles(math.rad(Angle),0,0)); task.wait()
+                    FPos(BasePart, CFrame.new(0,-1.5,0) + THumanoid.MoveDirection * BasePart.Velocity.Magnitude/1.25, CFrame.Angles(math.rad(Angle),0,0)); task.wait()
+                    FPos(BasePart, CFrame.new(2.25,1.5,-2.25) + THumanoid.MoveDirection * BasePart.Velocity.Magnitude/1.25, CFrame.Angles(math.rad(Angle),0,0)); task.wait()
+                    FPos(BasePart, CFrame.new(-2.25,-1.5,2.25) + THumanoid.MoveDirection * BasePart.Velocity.Magnitude/1.25, CFrame.Angles(math.rad(Angle),0,0)); task.wait()
+                    FPos(BasePart, CFrame.new(0,1.5,0) + THumanoid.MoveDirection, CFrame.Angles(math.rad(Angle),0,0)); task.wait()
+                    FPos(BasePart, CFrame.new(0,-1.5,0) + THumanoid.MoveDirection, CFrame.Angles(math.rad(Angle),0,0)); task.wait()
+                else
+                    FPos(BasePart, CFrame.new(0,1.5,THumanoid.WalkSpeed), CFrame.Angles(math.rad(90),0,0)); task.wait()
+                    FPos(BasePart, CFrame.new(0,-1.5,-THumanoid.WalkSpeed), CFrame.Angles(0,0,0)); task.wait()
+                    FPos(BasePart, CFrame.new(0,1.5,THumanoid.WalkSpeed), CFrame.Angles(math.rad(90),0,0)); task.wait()
+                    FPos(BasePart, CFrame.new(0,1.5,TRootPart.Velocity.Magnitude/1.25), CFrame.Angles(math.rad(90),0,0)); task.wait()
+                    FPos(BasePart, CFrame.new(0,-1.5,-TRootPart.Velocity.Magnitude/1.25), CFrame.Angles(0,0,0)); task.wait()
+                    FPos(BasePart, CFrame.new(0,1.5,TRootPart.Velocity.Magnitude/1.25), CFrame.Angles(math.rad(90),0,0)); task.wait()
+                    FPos(BasePart, CFrame.new(0,-1.5,0), CFrame.Angles(math.rad(90),0,0)); task.wait()
+                    FPos(BasePart, CFrame.new(0,-1.5,0), CFrame.Angles(0,0,0)); task.wait()
+                    FPos(BasePart, CFrame.new(0,-1.5,0), CFrame.Angles(math.rad(-90),0,0)); task.wait()
+                    FPos(BasePart, CFrame.new(0,-1.5,0), CFrame.Angles(0,0,0)); task.wait()
+                end
+            until BasePart.Velocity.Magnitude > 500
+                or BasePart.Parent ~= TargetPlayer.Character
+                or TargetPlayer.Parent ~= Players
+                or THumanoid.Sit
+                or Humanoid.Health <= 0
+                or tick() > Time + 2
         end
+
         workspace.FallenPartsDestroyHeight = 0/0
         local BV = Instance.new("BodyVelocity")
-        BV.Name="EpixVel" BV.Parent=RootPart
-        BV.Velocity=Vector3.new(9e8,9e8,9e8)
-        BV.MaxForce=Vector3.new(1/0,1/0,1/0)
-        Humanoid:SetStateEnabled(Enum.HumanoidStateType.Seated,false)
+        BV.Name = "EpixVel"
+        BV.Parent = RootPart
+        BV.Velocity = Vector3.new(9e8, 9e8, 9e8)
+        BV.MaxForce = Vector3.new(1/0, 1/0, 1/0)
+        Humanoid:SetStateEnabled(Enum.HumanoidStateType.Seated, false)
+
         if TRootPart and THead then
-            if (TRootPart.CFrame.p - THead.CFrame.p).Magnitude > 5 then SFBasePart(THead) else SFBasePart(TRootPart) end
-        elseif TRootPart and not THead then SFBasePart(TRootPart)
-        elseif not TRootPart and THead then SFBasePart(THead)
-        elseif not TRootPart and not THead and Accessory and Handle then SFBasePart(Handle)
-        else return flingMessage("Error", "Target missing", 5) end
+            if (TRootPart.CFrame.p - THead.CFrame.p).Magnitude > 5 then
+                SFBasePart(THead)
+            else
+                SFBasePart(TRootPart)
+            end
+        elseif TRootPart then SFBasePart(TRootPart)
+        elseif THead then SFBasePart(THead)
+        elseif Handle then SFBasePart(Handle)
+        else return msg("Fling All", "Target missing parts") end
+
         BV:Destroy()
-        Humanoid:SetStateEnabled(Enum.HumanoidStateType.Seated,true)
-        workspace.CurrentCamera.CameraSubject = Humanoid
+        Humanoid:SetStateEnabled(Enum.HumanoidStateType.Seated, true)
         repeat
-            RootPart.CFrame = getgenv().OldPos * CFrame.new(0, .5, 0)
-            Character:SetPrimaryPartCFrame(getgenv().OldPos * CFrame.new(0, .5, 0))
+            RootPart.CFrame = getgenv().OldPos * CFrame.new(0,.5,0)
+            Character:SetPrimaryPartCFrame(getgenv().OldPos * CFrame.new(0,.5,0))
             Humanoid:ChangeState("GettingUp")
             for _, x in ipairs(Character:GetChildren()) do
-                if x:IsA("BasePart") then x.Velocity, x.RotVelocity = Vector3.new(), Vector3.new() end
+                if x:IsA("BasePart") then x.Velocity = Vector3.zero; x.RotVelocity = Vector3.zero end
             end
             task.wait()
         until (RootPart.Position - getgenv().OldPos.p).Magnitude < 25
         workspace.FallenPartsDestroyHeight = getgenv().FPDH
     end
-end
 
-local function flingAll()
-    if flingAllRunning then return end
-    flingAllRunning = true
-    local todo = {}
-    for name in pairs(targetPlayerNames) do
-        local p = Players:FindFirstChild(name)
-        if p and p ~= Me and not isProtectedPlayer(p) then table.insert(todo, p) end
-    end
-    if #todo == 0 then
-        for _, p in ipairs(Players:GetPlayers()) do
-            if p ~= Me and not isProtectedPlayer(p) then table.insert(todo, p) end
+    for _, target in ipairs(Players:GetPlayers()) do
+        if target ~= Me then
+            pcall(skidFling, target)
         end
     end
-    if #todo == 0 then flingAllRunning = false; return flingMessage("Fling All", "No players", 3) end
-    for _, target in ipairs(todo) do pcall(skidFling, target) end
     flingAllRunning = false
-    flingMessage("Fling All", "Done — " .. #todo .. " target(s)", 3)
+    msg("Fling All", "Done", 3)
 end
 
+-- ============================================================
 -- FLY GUI
-local flyState = { nowe=false }
+-- ============================================================
 local function loadFlyGui()
     if Me.PlayerGui:FindFirstChild("main") then Me.PlayerGui.main:Destroy() end
+
     local main = Instance.new("ScreenGui")
-    main.Name = "main"; main.Parent = Me:WaitForChild("PlayerGui")
-    main.ZIndexBehavior = Enum.ZIndexBehavior.Sibling; main.ResetOnSpawn = false
-    local Frame = Instance.new("Frame", main)
+    local Frame = Instance.new("Frame")
+    local up = Instance.new("TextButton")
+    local down = Instance.new("TextButton")
+    local onof = Instance.new("TextButton")
+    local TextLabel = Instance.new("TextLabel")
+    local plus = Instance.new("TextButton")
+    local speed = Instance.new("TextLabel")
+    local mine = Instance.new("TextButton")
+    local closebutton = Instance.new("TextButton")
+    local mini = Instance.new("TextButton")
+    local mini2 = Instance.new("TextButton")
+
+    main.Name = "main"
+    main.Parent = Me:WaitForChild("PlayerGui")
+    main.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+    main.ResetOnSpawn = false
+
+    Frame.Parent = main
     Frame.BackgroundColor3 = Color3.fromRGB(163, 255, 137)
     Frame.BorderColor3 = Color3.fromRGB(103, 221, 213)
     Frame.Position = UDim2.new(0.1, 0, 0.35, 0)
     Frame.Size = UDim2.new(0, 210, 0, 60)
-    Frame.Active = true; Frame.Draggable = true
-    local function mkBtn(t, x, y, w, h, c)
-        local b = Instance.new("TextButton", Frame)
-        b.Text = t; b.Position = UDim2.new(0, x, 0, y)
-        b.Size = UDim2.new(0, w, 0, h)
-        b.BackgroundColor3 = c; b.TextColor3 = Color3.new(0,0,0)
-        b.Font = Enum.Font.SourceSans; b.TextSize = 14
-        return b
-    end
-    local up=mkBtn("UP",0,0,48,30,Color3.fromRGB(79,255,152))
-    local down=mkBtn("DOWN",0,36,48,30,Color3.fromRGB(215,255,121))
-    local plus=mkBtn("+",54,0,52,30,Color3.fromRGB(133,145,255))
-    local mine=mkBtn("-",54,36,52,30,Color3.fromRGB(123,255,247))
-    local onof=mkBtn("fly",110,36,58,30,Color3.fromRGB(255,249,74))
-    local spd=Instance.new("TextLabel", Frame)
-    spd.Position=UDim2.new(0,110,0,0); spd.Size=UDim2.new(0,58,0,30)
-    spd.BackgroundColor3=Color3.fromRGB(255,85,0); spd.TextColor3=Color3.new(0,0,0)
-    spd.Font=Enum.Font.SourceSans; spd.Text="25"; spd.TextSize=14
-    local cb=mkBtn("X",0,-32,48,30,Color3.fromRGB(225,25,0))
-    local mini=mkBtn("-",52,-32,48,30,Color3.fromRGB(192,150,230))
-    local mini2=mkBtn("+",104,-32,48,30,Color3.fromRGB(192,150,230))
-    mini2.Visible = false
-    local flySpeed = 25
-    local FLY_MIN, FLY_MAX, FLY_STEP = 5, 200, 5
+
+    up.Parent = Frame; up.BackgroundColor3 = Color3.fromRGB(79, 255, 152)
+    up.Size = UDim2.new(0, 48, 0, 30); up.Font = Enum.Font.SourceSans
+    up.Text = "UP"; up.TextColor3 = Color3.new(0, 0, 0); up.TextSize = 14
+
+    down.Parent = Frame; down.BackgroundColor3 = Color3.fromRGB(215, 255, 121)
+    down.Position = UDim2.new(0, 0, 0.5, 0); down.Size = UDim2.new(0, 48, 0, 30)
+    down.Font = Enum.Font.SourceSans; down.Text = "DOWN"
+    down.TextColor3 = Color3.new(0, 0, 0); down.TextSize = 14
+
+    onof.Parent = Frame; onof.BackgroundColor3 = Color3.fromRGB(255, 249, 74)
+    onof.Position = UDim2.new(0.72, 0, 0.5, 0); onof.Size = UDim2.new(0, 58, 0, 30)
+    onof.Font = Enum.Font.SourceSans; onof.Text = "fly"
+    onof.TextColor3 = Color3.new(0, 0, 0); onof.TextSize = 14
+
+    TextLabel.Parent = Frame; TextLabel.BackgroundColor3 = Color3.fromRGB(242, 60, 255)
+    TextLabel.Position = UDim2.new(0.48, 0, 0, 0); TextLabel.Size = UDim2.new(0, 100, 0, 30)
+    TextLabel.Font = Enum.Font.SourceSans; TextLabel.Text = "FLY GUI V3"
+    TextLabel.TextColor3 = Color3.new(0, 0, 0); TextLabel.TextScaled = true
+    TextLabel.TextWrapped = true
+
+    plus.Parent = Frame; plus.BackgroundColor3 = Color3.fromRGB(133, 145, 255)
+    plus.Position = UDim2.new(0.23, 0, 0, 0); plus.Size = UDim2.new(0, 48, 0, 30)
+    plus.Font = Enum.Font.SourceSans; plus.Text = "+"
+    plus.TextColor3 = Color3.new(0, 0, 0); plus.TextScaled = true
+
+    speed.Parent = Frame; speed.BackgroundColor3 = Color3.fromRGB(255, 85, 0)
+    speed.Position = UDim2.new(0.48, 0, 0.5, 0); speed.Size = UDim2.new(0, 46, 0, 30)
+    speed.Font = Enum.Font.SourceSans; speed.Text = "50"
+    speed.TextColor3 = Color3.new(0, 0, 0); speed.TextScaled = true
+
+    mine.Parent = Frame; mine.BackgroundColor3 = Color3.fromRGB(123, 255, 247)
+    mine.Position = UDim2.new(0.23, 0, 0.5, 0); mine.Size = UDim2.new(0, 48, 0, 30)
+    mine.Font = Enum.Font.SourceSans; mine.Text = "-"
+    mine.TextColor3 = Color3.new(0, 0, 0); mine.TextScaled = true
+
+    closebutton.Parent = Frame
+    closebutton.BackgroundColor3 = Color3.fromRGB(225, 25, 0)
+    closebutton.Font = Enum.Font.SourceSans; closebutton.Size = UDim2.new(0, 48, 0, 30)
+    closebutton.Text = "X"; closebutton.TextSize = 24
+    closebutton.Position = UDim2.new(0, 0, -1, 30)
+
+    mini.Parent = Frame
+    mini.BackgroundColor3 = Color3.fromRGB(192, 150, 230)
+    mini.Font = Enum.Font.SourceSans; mini.Size = UDim2.new(0, 48, 0, 30)
+    mini.Text = "-"; mini.TextSize = 30; mini.Position = UDim2.new(0, 48, -1, 30)
+
+    mini2.Parent = Frame
+    mini2.BackgroundColor3 = Color3.fromRGB(192, 150, 230)
+    mini2.Font = Enum.Font.SourceSans; mini2.Size = UDim2.new(0, 48, 0, 30)
+    mini2.Text = "+"; mini2.TextSize = 30
+    mini2.Position = UDim2.new(0, 48, -1, 60); mini2.Visible = false
+
+    local flySpeed = 50
+    local FLY_MIN, FLY_MAX = 10, 500
+    local FLY_STEP = 25
+    local nowe = false
     local speaker = Players.LocalPlayer
-    onof.MouseButton1Click:Connect(function()
-        if flyState.nowe then
-            flyState.nowe = false
+
+    speed.Text = tostring(flySpeed)
+
+    Frame.Active = true
+    Frame.Draggable = true
+
+    onof.MouseButton1Down:Connect(function()
+        if nowe == true then
+            nowe = false
             local hum = speaker.Character and speaker.Character:FindFirstChildOfClass("Humanoid")
             if hum then
                 for _, st in ipairs({Enum.HumanoidStateType.Climbing, Enum.HumanoidStateType.FallingDown,
@@ -501,16 +753,20 @@ local function loadFlyGui()
                     Enum.HumanoidStateType.PlatformStanding, Enum.HumanoidStateType.Ragdoll,
                     Enum.HumanoidStateType.Running, Enum.HumanoidStateType.RunningNoPhysics,
                     Enum.HumanoidStateType.Seated, Enum.HumanoidStateType.StrafingNoPhysics,
-                    Enum.HumanoidStateType.Swimming}) do pcall(function() hum:SetStateEnabled(st, true) end) end
+                    Enum.HumanoidStateType.Swimming}) do
+                    pcall(function() hum:SetStateEnabled(st, true) end)
+                end
                 pcall(function() hum:ChangeState(Enum.HumanoidStateType.RunningNoPhysics) end)
             end
         else
-            flyState.nowe = true
-            if speaker.Character and speaker.Character:FindFirstChild("Animate") then speaker.Character.Animate.Disabled = true end
-            local Ch = speaker.Character
-            local H = Ch and (Ch:FindFirstChildOfClass("Humanoid") or Ch:FindFirstChildOfClass("AnimationController"))
-            if H then for _, v in next, H:GetPlayingAnimationTracks() do v:AdjustSpeed(0) end end
-            local hum = Ch and Ch:FindFirstChildOfClass("Humanoid")
+            nowe = true
+            if speaker.Character and speaker.Character:FindFirstChild("Animate") then
+                speaker.Character.Animate.Disabled = true
+            end
+            local Char = speaker.Character
+            local Hum = Char and (Char:FindFirstChildOfClass("Humanoid") or Char:FindFirstChildOfClass("AnimationController"))
+            if Hum then for _, v in next, Hum:GetPlayingAnimationTracks() do v:AdjustSpeed(0) end end
+            local hum = Char and Char:FindFirstChildOfClass("Humanoid")
             if hum then
                 for _, st in ipairs({Enum.HumanoidStateType.Climbing, Enum.HumanoidStateType.FallingDown,
                     Enum.HumanoidStateType.Flying, Enum.HumanoidStateType.Freefall,
@@ -519,722 +775,743 @@ local function loadFlyGui()
                     Enum.HumanoidStateType.PlatformStanding, Enum.HumanoidStateType.Ragdoll,
                     Enum.HumanoidStateType.Running, Enum.HumanoidStateType.RunningNoPhysics,
                     Enum.HumanoidStateType.Seated, Enum.HumanoidStateType.StrafingNoPhysics,
-                    Enum.HumanoidStateType.Swimming}) do pcall(function() hum:SetStateEnabled(st, false) end) end
+                    Enum.HumanoidStateType.Swimming}) do
+                    pcall(function() hum:SetStateEnabled(st, false) end)
+                end
                 pcall(function() hum:ChangeState(Enum.HumanoidStateType.Swimming) end)
             end
-            local rig = Enum.HumanoidRigType.R15
-            if speaker.Character then local h = speaker.Character:FindFirstChildOfClass("Humanoid") if h then rig = h.RigType end end
-            local bp = rig == Enum.HumanoidRigType.R6 and speaker.Character.Torso or speaker.Character.UpperTorso
-            if not bp then flyState.nowe = false; return end
-            local bg = Instance.new("BodyGyro", bp)
-            bg.P = 9e4; bg.maxTorque = Vector3.new(9e9, 9e9, 9e9); bg.cframe = bp.CFrame
-            local bv = Instance.new("BodyVelocity", bp)
-            bv.velocity = Vector3.new(0, 0.1, 0); bv.maxForce = Vector3.new(9e9, 9e9, 9e9)
-            if hum then hum.PlatformStand = true end
-            local speedVal = 0
-            while flyState.nowe do
-                RunService.RenderStepped:Wait()
-                local cam = workspace.CurrentCamera
-                if not cam then break end
-                if not hum or not hum.Parent or hum.Health <= 0 then break end
-                local maxspeed = flySpeed
-                local moveDir = hum.MoveDirection
-                local moving = moveDir.Magnitude > 0.05
-                if moving then speedVal = speedVal + 0.5 + (speedVal / maxspeed); if speedVal > maxspeed then speedVal = maxspeed end
-                elseif speedVal ~= 0 then speedVal = speedVal - 1; if speedVal < 0 then speedVal = 0 end end
-                if moving then bv.velocity = moveDir.Unit * speedVal else bv.velocity = Vector3.new(0,0,0) end
-                bg.cframe = cam.CoordinateFrame
+        end
+
+        local rigType = Enum.HumanoidRigType.R15
+        if speaker.Character then
+            local h = speaker.Character:FindFirstChildOfClass("Humanoid")
+            if h then rigType = h.RigType end
+        end
+        local BodyPart
+        if rigType == Enum.HumanoidRigType.R6 then
+            BodyPart = speaker.Character and speaker.Character:FindFirstChild("Torso")
+        else
+            BodyPart = speaker.Character and speaker.Character:FindFirstChild("UpperTorso")
+        end
+        if not BodyPart then return end
+
+        local bg = Instance.new("BodyGyro", BodyPart)
+        bg.P = 9e4; bg.maxTorque = Vector3.new(9e9, 9e9, 9e9); bg.cframe = BodyPart.CFrame
+        local bv = Instance.new("BodyVelocity", BodyPart)
+        bv.velocity = Vector3.new(0, 0.1, 0); bv.maxForce = Vector3.new(9e9, 9e9, 9e9)
+        local hum = speaker.Character:FindFirstChildOfClass("Humanoid")
+        if nowe == true and hum then hum.PlatformStand = true end
+
+        local ctrl = {f=0,b=0,l=0,r=0}
+        local lastctrl = {f=0,b=0,l=0,r=0}
+        local speedVal = 0
+        local heartbeat = RunService.Heartbeat
+        while nowe == true do
+            heartbeat:Wait()
+            local cam = workspace.CurrentCamera
+            if not cam then break end
+            local maxspeed = flySpeed
+            if ctrl.l + ctrl.r ~= 0 or ctrl.f + ctrl.b ~= 0 then
+                speedVal = speedVal + 0.5 + (speedVal / maxspeed)
+                if speedVal > maxspeed then speedVal = maxspeed end
+            elseif speedVal ~= 0 then
+                speedVal = speedVal - 1
+                if speedVal < 0 then speedVal = 0 end
             end
-            bg:Destroy(); bv:Destroy()
-            if hum then hum.PlatformStand = false end
-            if speaker.Character and speaker.Character:FindFirstChild("Animate") then speaker.Character.Animate.Disabled = false end
+            if (ctrl.l + ctrl.r) ~= 0 or (ctrl.f + ctrl.b) ~= 0 then
+                bv.velocity = ((cam.CoordinateFrame.lookVector * (ctrl.f+ctrl.b)) +
+                    ((cam.CoordinateFrame * CFrame.new(ctrl.l+ctrl.r,(ctrl.f+ctrl.b)*0.2,0).p) - cam.CoordinateFrame.p)) * speedVal
+                lastctrl = {f=ctrl.f, b=ctrl.b, l=ctrl.l, r=ctrl.r}
+            elseif (ctrl.l + ctrl.r) == 0 and (ctrl.f + ctrl.b) == 0 and speedVal ~= 0 then
+                bv.velocity = ((cam.CoordinateFrame.lookVector * (lastctrl.f+lastctrl.b)) +
+                    ((cam.CoordinateFrame * CFrame.new(lastctrl.l+lastctrl.r,(lastctrl.f+lastctrl.b)*0.2,0).p) - cam.CoordinateFrame.p)) * speedVal
+            else
+                bv.velocity = Vector3.new(0,0,0)
+            end
+            bg.cframe = cam.CoordinateFrame * CFrame.Angles(-math.rad((ctrl.f+ctrl.b)*50*speedVal/maxspeed), 0, 0)
+        end
+        bg:Destroy(); bv:Destroy()
+        if hum then hum.PlatformStand = false end
+        if speaker.Character and speaker.Character:FindFirstChild("Animate") then
+            speaker.Character.Animate.Disabled = false
         end
     end)
+
+    UIS.InputBegan:Connect(function(input, gpe)
+        if gpe then return end
+        if not nowe then return end
+        if input.KeyCode == Enum.KeyCode.W then ctrl.f = 1 end
+        if input.KeyCode == Enum.KeyCode.S then ctrl.b = -1 end
+        if input.KeyCode == Enum.KeyCode.A then ctrl.l = -1 end
+        if input.KeyCode == Enum.KeyCode.D then ctrl.r = 1 end
+    end)
+
+    local tis
     up.MouseButton1Down:Connect(function()
-        up:SetAttribute("Held", true)
-        task.spawn(function()
-            while up:GetAttribute("Held") do
+        tis = up.MouseEnter:Connect(function()
+            while tis do
+                task.wait()
                 local ch = speaker.Character
                 local hrp = ch and ch:FindFirstChild("HumanoidRootPart")
-                if hrp then hrp.CFrame = hrp.CFrame * CFrame.new(0,0.7,0) end
-                task.wait()
+                if hrp then hrp.CFrame = hrp.CFrame * CFrame.new(0,1,0) end
             end
         end)
     end)
-    up.MouseButton1Up:Connect(function() up:SetAttribute("Held", false) end)
-    up.MouseLeave:Connect(function() up:SetAttribute("Held", false) end)
+    up.MouseLeave:Connect(function() if tis then tis:Disconnect(); tis = nil end end)
+
+    local dis
     down.MouseButton1Down:Connect(function()
-        down:SetAttribute("Held", true)
-        task.spawn(function()
-            while down:GetAttribute("Held") do
+        dis = down.MouseEnter:Connect(function()
+            while dis do
+                task.wait()
                 local ch = speaker.Character
                 local hrp = ch and ch:FindFirstChild("HumanoidRootPart")
-                if hrp then hrp.CFrame = hrp.CFrame * CFrame.new(0,-0.7,0) end
-                task.wait()
+                if hrp then hrp.CFrame = hrp.CFrame * CFrame.new(0,-1,0) end
             end
         end)
     end)
-    down.MouseButton1Up:Connect(function() down:SetAttribute("Held", false) end)
-    down.MouseLeave:Connect(function() down:SetAttribute("Held", false) end)
-    speaker.CharacterAdded:Connect(function(c)
+    down.MouseLeave:Connect(function() if dis then dis:Disconnect(); dis = nil end end)
+
+    speaker.CharacterAdded:Connect(function(char)
         task.wait(0.7)
-        local h = c:FindFirstChildOfClass("Humanoid")
+        local h = char:FindFirstChildOfClass("Humanoid")
         if h then h.PlatformStand = false end
-        if c:FindFirstChild("Animate") then c.Animate.Disabled = false end
+        if char:FindFirstChild("Animate") then char.Animate.Disabled = false end
     end)
-    plus.MouseButton1Down:Connect(function() flySpeed = math.min(flySpeed + FLY_STEP, FLY_MAX); spd.Text = tostring(flySpeed) end)
-    mine.MouseButton1Down:Connect(function() flySpeed = math.max(flySpeed - FLY_STEP, FLY_MIN); spd.Text = tostring(flySpeed) end)
-    cb.MouseButton1Click:Connect(function() flyState.nowe = false; main:Destroy() end)
+
+    plus.MouseButton1Down:Connect(function()
+        flySpeed = math.min(flySpeed + FLY_STEP, FLY_MAX)
+        speed.Text = tostring(flySpeed)
+    end)
+    mine.MouseButton1Down:Connect(function()
+        flySpeed = math.max(flySpeed - FLY_STEP, FLY_MIN)
+        speed.Text = tostring(flySpeed)
+    end)
+
+    closebutton.MouseButton1Click:Connect(function() main:Destroy() end)
     mini.MouseButton1Click:Connect(function()
         up.Visible=false; down.Visible=false; onof.Visible=false
-        plus.Visible=false; spd.Visible=false; mine.Visible=false
+        plus.Visible=false; speed.Visible=false; mine.Visible=false
         mini.Visible=false; mini2.Visible=true
-        Frame.BackgroundTransparency=1
-        cb.Position=UDim2.new(0,0,-1,60)
+        Frame.BackgroundTransparency = 1
+        closebutton.Position = UDim2.new(0, 0, -1, 60)
     end)
     mini2.MouseButton1Click:Connect(function()
         up.Visible=true; down.Visible=true; onof.Visible=true
-        plus.Visible=true; spd.Visible=true; mine.Visible=true
+        plus.Visible=true; speed.Visible=true; mine.Visible=true
         mini.Visible=true; mini2.Visible=false
-        Frame.BackgroundTransparency=0
-        cb.Position=UDim2.new(0,0,-1,30)
+        Frame.BackgroundTransparency = 0
+        closebutton.Position = UDim2.new(0, 0, -1, 30)
     end)
 end
 
+-- ============================================================
 -- ANTI-FLING
+-- ============================================================
 local antiFlingEnabled = false
 local antiFlingConn = nil
 local antiFlingSafeCF = nil
-local antiFlingLastPos = nil
-local antiFlingLastTime = 0
-local AFC_GROUND=130 local AFC_AIR=400 local AF_SNAP=30 local AF_TELEPORT=18
-local ALLOWED_MOVERS={OrbitBP=true,EpixVel=true,FlyGyro=true,FlyVel=true,MassBP=true}
-local function isForeign(obj)
-    if ALLOWED_MOVERS[obj.Name] then return false end
-    if obj:IsA("BodyPosition") then return false end
-    return true
-end
+local ANTI_FLING_VEL_CAP = 120
+local ANTI_FLING_SNAP_RANGE = 40
+
 local function startAntiFling()
     if antiFlingConn then return end
-    antiFlingSafeCF=nil antiFlingLastPos=nil antiFlingLastTime=0
-    antiFlingConn=RunService.Heartbeat:Connect(function()
-        local ch=Me.Character if not ch then return end
-        local hrp=ch:FindFirstChild("HumanoidRootPart")
-        local hum=ch:FindFirstChildOfClass("Humanoid")
-        if not hrp or not hum or hum.Health<=0 then return end
-        local now=tick()
-        local vel=hrp.AssemblyLinearVelocity
-        if vel.Magnitude<40 and hum.FloorMaterial~=Enum.Material.Air then
-            antiFlingSafeCF=hrp.CFrame antiFlingLastPos=hrp.Position antiFlingLastTime=now
+    antiFlingSafeCF = nil
+    antiFlingConn = RunService.Heartbeat:Connect(function()
+        local ch = Me.Character
+        if not ch then return end
+        local hrp = ch:FindFirstChild("HumanoidRootPart")
+        local hum = ch:FindFirstChildOfClass("Humanoid")
+        if not hrp or not hum or hum.Health <= 0 then return end
+
+        local vel = hrp.AssemblyLinearVelocity
+        if vel.Magnitude < 40 and hum.FloorMaterial ~= Enum.Material.Air then
+            antiFlingSafeCF = hrp.CFrame
         end
-        for _,part in ipairs(ch:GetDescendants()) do
-            if part:IsA("BasePart") then
-                for _,obj in ipairs(part:GetChildren()) do
-                    if obj:IsA("BodyVelocity") and isForeign(obj) then
-                        if obj.Velocity.Magnitude>80 then obj:Destroy() end
-                    elseif obj:IsA("BodyAngularVelocity") and isForeign(obj) then
-                        if obj.AngularVelocity.Magnitude>40 then obj:Destroy() end
-                    elseif (obj:IsA("BodyThrust") or obj:IsA("BodyForce")) and isForeign(obj) then obj:Destroy() end
-                end
+
+        for _, obj in ipairs(hrp:GetChildren()) do
+            if obj:IsA("BodyVelocity") and obj.Velocity.Magnitude > 100 then
+                obj:Destroy()
+            elseif obj:IsA("BodyAngularVelocity") then
+                if obj.AngularVelocity.Magnitude > 50 then obj:Destroy() end
+            elseif obj:IsA("BodyThrust") or obj:IsA("BodyForce") then
+                obj:Destroy()
             end
         end
-        local cap=(hum.FloorMaterial==Enum.Material.Air) and AFC_AIR or AFC_GROUND
-        if vel.Magnitude>cap then
-            local c=vel.Unit*cap
-            hrp.AssemblyLinearVelocity=c hrp.Velocity=c
-            hrp.AssemblyAngularVelocity=Vector3.zero hrp.RotVelocity=Vector3.zero
+
+        if vel.Magnitude > ANTI_FLING_VEL_CAP then
+            local capped = vel.Unit * ANTI_FLING_VEL_CAP
+            hrp.AssemblyLinearVelocity = capped
+            hrp.Velocity = capped
+            hrp.AssemblyAngularVelocity = Vector3.zero
+            hrp.RotVelocity = Vector3.zero
         end
-        if antiFlingLastPos and antiFlingLastTime>0 then
-            local dt=now-antiFlingLastTime
-            local delta=(hrp.Position-antiFlingLastPos).Magnitude
-            if dt<0.1 and delta>AF_TELEPORT and antiFlingSafeCF then
-                hrp.CFrame=antiFlingSafeCF
-                hrp.AssemblyLinearVelocity=Vector3.zero hrp.AssemblyAngularVelocity=Vector3.zero
-            end
-        end
-        antiFlingLastPos=hrp.Position antiFlingLastTime=now
+
         if antiFlingSafeCF then
-            local drift=(hrp.Position-antiFlingSafeCF.Position).Magnitude
-            if drift>AF_SNAP and vel.Magnitude>cap then
-                hrp.CFrame=antiFlingSafeCF
-                hrp.AssemblyLinearVelocity=Vector3.zero hrp.AssemblyAngularVelocity=Vector3.zero
+            local drift = (hrp.Position - antiFlingSafeCF.Position).Magnitude
+            if drift > ANTI_FLING_SNAP_RANGE and vel.Magnitude > ANTI_FLING_VEL_CAP then
+                hrp.CFrame = antiFlingSafeCF
+                hrp.AssemblyLinearVelocity = Vector3.zero
+                hrp.AssemblyAngularVelocity = Vector3.zero
             end
         end
+
         pcall(function()
-            hum.PlatformStand=false
-            local st=hum:GetState()
-            if st==Enum.HumanoidStateType.Ragdoll or st==Enum.HumanoidStateType.Physics or st==Enum.HumanoidStateType.FallingDown or st==Enum.HumanoidStateType.PlatformStanding then
+            hum.PlatformStand = false
+            local st = hum:GetState()
+            if st == Enum.HumanoidStateType.Ragdoll
+               or st == Enum.HumanoidStateType.Physics
+               or st == Enum.HumanoidStateType.FallingDown
+               or st == Enum.HumanoidStateType.PlatformStanding then
                 hum:ChangeState(Enum.HumanoidStateType.Running)
             end
         end)
     end)
 end
+
 local function stopAntiFling()
-    if antiFlingConn then antiFlingConn:Disconnect() antiFlingConn=nil end
-    antiFlingSafeCF=nil
+    if antiFlingConn then antiFlingConn:Disconnect(); antiFlingConn = nil end
+    antiFlingSafeCF = nil
 end
 
 -- ============================================================
--- MASS RING — original filter, ring on target, FLING tightens
+-- MASS FLING
 -- ============================================================
-local function massGetTargets()
-    local out = {}
-    if next(targetPlayerNames) ~= nil then
-        for name in pairs(targetPlayerNames) do
-            local p = Players:FindFirstChild(name)
-            if p and p ~= Me and not isProtectedPlayer(p) and p.Character then
-                local tHrp = p.Character:FindFirstChild("HumanoidRootPart")
-                local tHum = p.Character:FindFirstChildOfClass("Humanoid")
-                if tHrp and tHum and tHum.Health > 0 then
-                    table.insert(out, {name=name, hrp=tHrp, player=p})
-                end
-            end
-        end
-    else
-        local ch = Me.Character
-        local hrp = ch and ch:FindFirstChild("HumanoidRootPart")
-        if hrp then
-            local closest, cDist = nil, math.huge
-            for _, p in ipairs(Players:GetPlayers()) do
-                if p ~= Me and not isProtectedPlayer(p) and p.Character then
-                    local tHrp = p.Character:FindFirstChild("HumanoidRootPart")
-                    local tHum = p.Character:FindFirstChildOfClass("Humanoid")
-                    if tHrp and tHum and tHum.Health > 0 then
-                        local d = (hrp.Position - tHrp.Position).Magnitude
-                        if d < cDist then cDist=d; closest={name=p.Name, hrp=tHrp, player=p} end
-                    end
-                end
-            end
-            if closest then table.insert(out, closest) end
-        end
-    end
-    return out
-end
+local massState = {
+    enabled = false, parts = {}, lookup = {},
+    scanRadius = 3000, itemsPerScan = 200,
+    launchSpeed = 500, scanInterval = 0.5,
+    thread = nil,
+}
 
--- Ensure a ring exists for each target, drop stale ones
-local function massSyncRings()
-    local targets = massGetTargets()
-    if #targets == 0 then return end
-    for _, t in ipairs(targets) do
-        if not massState.rings[t.name] then
-            massState.rings[t.name] = {
-                parts = {}, hrp = t.hrp, player = t.player,
-                phase = "collect",
-                baselineVel = 0, peakVel = 0, hit = false,
-                offset = 0,
-            }
-            pcall(function() massState.rings[t.name].baselineVel = t.hrp.AssemblyLinearVelocity.Magnitude end)
-        else
-            local ring = massState.rings[t.name]
-            if not ring.hrp or not ring.hrp.Parent then
-                ring.hrp = t.hrp
-                ring.player = t.player
-            end
-        end
-    end
-    for name, ring in pairs(massState.rings) do
-        local still = false
-        for _, t in ipairs(targets) do
-            if t.name == name then still = true; break end
-        end
-        if not still then
-            for _, item in ipairs(ring.parts) do
-                if item and item.Parent then
-                    local bp = item:FindFirstChild("MassBP")
-                    if bp then bp:Destroy() end
-                    item.CanCollide = false
-                    massState.lookup[item] = nil
-                end
-            end
-            massState.rings[name] = nil
+local function massCleanInvalid()
+    for i = #massState.parts, 1, -1 do
+        local item = massState.parts[i]
+        if not item or not item.Parent then
+            massState.lookup[item] = nil
+            table.remove(massState.parts, i)
         end
     end
 end
 
--- Scanner: original filter, adds parts directly to target rings
 local function massScannerLoop()
-    while massState.collecting do
+    while massState.enabled do
         local ch = Me.Character
         local hrp = ch and ch:FindFirstChild("HumanoidRootPart")
         if hrp then
-            pcall(function() Me.ReplicationFocus = workspace end)
-            pcall(function() sethiddenproperty(Me, "SimulationRadius", config.simRadius) end)
-
-            massSyncRings()
-
-            local targets = massGetTargets()
-            if #targets > 0 and massTotalParts() < massState.maxParts then
-                local parts = workspace:GetPartBoundsInRadius(hrp.Position, massState.scanRadius)
-                local added = 0
-                for _, item in ipairs(parts) do
-                    if added >= 30 then break end
-                    -- [EXACT ORIGINAL FILTER]
-                    if item:IsA("BasePart") and not item.Anchored and not item:IsDescendantOf(ch) then
-                        if not massState.lookup[item] then
-                            local t = targets[(added % #targets) + 1]
-                            local ring = massState.rings[t.name]
-                            if ring then
-                                pcall(function() item:SetNetworkOwner(Me) end)
-                                item.CanCollide = false
-                                if not item:FindFirstChild("MassBP") then
-                                    local bp = Instance.new("BodyPosition", item)
-                                    bp.Name = "MassBP"
-                                    bp.MaxForce = Vector3.new(math.huge, math.huge, math.huge)
-                                    bp.P = 1e10
-                                    bp.D = 500
-                                end
-                                massState.lookup[item] = true
-                                table.insert(ring.parts, item)
-                                added = added + 1
-                            end
-                        end
-                    end
+            local parts = workspace:GetPartBoundsInRadius(hrp.Position, massState.scanRadius)
+            local added = 0
+            for _, item in ipairs(parts) do
+                if added >= massState.itemsPerScan then break end
+                if item:IsA("BasePart") and not item.Anchored
+                   and not item:IsDescendantOf(ch)
+                   and item.Name ~= "Handle"
+                   and not (item.Parent and item.Parent:IsA("Accessory"))
+                   and not massState.lookup[item] then
+                    table.insert(massState.parts, item)
+                    massState.lookup[item] = true
+                    added = added + 1
                 end
             end
+            massCleanInvalid()
         end
         task.wait(massState.scanInterval)
     end
     massState.thread = nil
 end
+
 local function startMassScanner()
     if massState.thread then return end
-    massState.collecting = true
+    massState.enabled = true
     massState.thread = task.spawn(massScannerLoop)
 end
-local function stopMassScanner() massState.collecting = false end
+local function stopMassScanner() massState.enabled = false end
 
--- Ring loop: rotates parts around each target
-local function startMassLoop()
-    if massState.loopConn then return end
-    massState.loopConn = RunService.Heartbeat:Connect(function()
-        local localCh = Me.Character
-        local localHrp = localCh and localCh:FindFirstChild("HumanoidRootPart")
-        local now = tick()
-
-        for name, ring in pairs(massState.rings) do
-            local hrp = ring.hrp
-            if (not hrp or not hrp.Parent) and ring.player and ring.player.Character then
-                local nh = ring.player.Character:FindFirstChild("HumanoidRootPart")
-                if nh then ring.hrp = nh; hrp = nh end
+local function massGetTargetPos()
+    local ch = Me.Character
+    local hrp = ch and ch:FindFirstChild("HumanoidRootPart")
+    if not hrp then return nil end
+    if OrbitState == 2 and LockedPosition then return LockedPosition, "locked pos" end
+    local best, bestDist = nil, math.huge
+    for name in pairs(targetPlayerNames) do
+        local p = Players:FindFirstChild(name)
+        if p and p.Character then
+            local tHrp = p.Character:FindFirstChild("HumanoidRootPart")
+            if tHrp then
+                local d = (hrp.Position - tHrp.Position).Magnitude
+                if d < bestDist then bestDist = d; best = tHrp end
             end
-            if hrp and hrp.Parent then
-                local targetPos = hrp.Position
-                -- Radius/height depend on phase
-                local radius = (ring.phase == "hit") and massState.hitRadius or massState.collectRadius
-                local height = (ring.phase == "hit") and massState.hitHeight or massState.collectHeight
-
-                local total = #ring.parts
-                if total > 0 then
-                    local budget = math.min(total, 100)
-                    ring.offset = ((ring.offset or 0) % total)
-                    local startIdx = ring.offset + 1
-                    ring.offset = (ring.offset + budget) % total
-                    for k = 0, budget - 1 do
-                        local i = ((startIdx + k - 1) % total) + 1
-                        local item = ring.parts[i]
-                        if item and item.Parent and not item.Anchored then
-                            local bp = item:FindFirstChild("MassBP")
-                            if bp then
-                                pcall(function()
-                                    if item:GetNetworkOwner() ~= Me and k % 5 == 0 then
-                                        item:SetNetworkOwner(Me)
-                                    end
-                                end)
-                                local iSpeed = massState.ringSpeed + ((i % 10) * 0.5)
-                                local angle = (now * iSpeed) + (i * (math.pi * 2 / math.max(total, 1)))
-                                local tPos = targetPos + Vector3.new(
-                                    math.cos(angle) * radius,
-                                    height,
-                                    math.sin(angle) * radius
-                                )
-                                bp.Position = tPos
-                                -- Collide only in "hit" phase, and only when far from local player
-                                local wantCol = (ring.phase == "hit")
-                                if wantCol and localHrp then
-                                    local dL = (item.Position - localHrp.Position).Magnitude
-                                    if dL < 15 then wantCol = false end
-                                end
-                                if item.CanCollide ~= wantCol then item.CanCollide = wantCol end
-                            end
-                        end
-                    end
-                end
-
-                if ring.phase == "hit" and not ring.hit then
-                    local vel = 0
-                    pcall(function() vel = hrp.AssemblyLinearVelocity.Magnitude end)
-                    if vel > (ring.peakVel or 0) then ring.peakVel = vel end
-                    local spike = vel - (ring.baselineVel or 0)
-                    if spike >= 200 or vel >= 350 then
-                        ring.hit = true
-                        task.defer(function() setStatus("HIT "..name, GREEN, string.format("peak %.0f", ring.peakVel)) end)
-                    end
-                end
-            end
-        end
-    end)
-end
-
--- FLING NOW: switch each ring to tight (hit) phase
-local function massFlingNow()
-    stopMassScanner()
-    local count = 0
-    for name, ring in pairs(massState.rings) do
-        if #ring.parts > 0 then
-            ring.phase = "hit"
-            ring.hit = false
-            ring.peakVel = 0
-            pcall(function() ring.baselineVel = ring.hrp.AssemblyLinearVelocity.Magnitude end)
-            count = count + 1
         end
     end
-    return count
+    if best then return best.Position, best.Parent.Name end
+    local closest, closestDist = nil, math.huge
+    for _, p in ipairs(Players:GetPlayers()) do
+        if p ~= Me and p.Character then
+            local tHrp = p.Character:FindFirstChild("HumanoidRootPart")
+            if tHrp then
+                local d = (hrp.Position - tHrp.Position).Magnitude
+                if d < closestDist then closestDist = d; closest = tHrp end
+            end
+        end
+    end
+    if closest then return closest.Position, closest.Parent.Name end
+    return nil
+end
+
+local function massFlingNow()
+    local targetPos, targetName = massGetTargetPos()
+    if not targetPos then return 0, "no target" end
+    local count = 0
+    for i = #massState.parts, 1, -1 do
+        local item = massState.parts[i]
+        if item and item.Parent and not item.Anchored then
+            local bp = item:FindFirstChild("OrbitBP")
+            if bp then bp:Destroy() end
+            pcall(function() item:SetNetworkOwner(Me) end)
+            pcall(function()
+                item.Massless = false
+                item.CustomPhysicalProperties = PhysicalProperties.new(0.7, 0.3, 0.5, 1, 1)
+                item.CanCollide = true
+            end)
+            local dir = targetPos - item.Position
+            local dist = dir.Magnitude
+            if dist > 0.5 then
+                dir = dir.Unit
+                pcall(function()
+                    item.AssemblyLinearVelocity = dir * massState.launchSpeed
+                    item.AssemblyAngularVelocity = Vector3.new(
+                        math.random(-200, 200), math.random(-200, 200), math.random(-200, 200))
+                end)
+                count = count + 1
+            end
+            massState.lookup[item] = nil
+            table.remove(massState.parts, i)
+        else
+            massState.lookup[item] = nil
+            table.remove(massState.parts, i)
+        end
+    end
+    return count, targetName or "?"
 end
 
 local function massClear()
-    stopMassScanner()
-    for name, ring in pairs(massState.rings) do
-        for _, item in ipairs(ring.parts) do
-            if item and item.Parent then
-                local bp = item:FindFirstChild("MassBP")
-                if bp then bp:Destroy() end
-                item.CanCollide = false
-                massState.lookup[item] = nil
-            end
+    for _, item in ipairs(massState.parts) do
+        if item and item.Parent then
+            local bp = item:FindFirstChild("OrbitBP")
+            if bp then bp:Destroy() end
         end
     end
-    massState.rings = {}
-    massState.lookup = {}
+    table.clear(massState.parts)
+    table.clear(massState.lookup)
 end
 
+-- ============================================================
 -- MASS PAGE
-local MassHeading = label("MASS RING",12,UDim2.fromOffset(10,14),UDim2.new(1,-20,0,22),MassPage)
-MassHeading.Font=Enum.Font.GothamBold MassHeading.TextColor3=Color3.fromRGB(220,130,90)
-local MassHint = label("Collect ON → parts orbit target (wide). FLING NOW → tight orbit = hit.",11,UDim2.fromOffset(10,40),UDim2.new(1,-20,0,42),MassPage)
-MassHint.TextWrapped=true MassHint.TextColor3=MUTED
+-- ============================================================
+local MassHeading = label("MASS FLING", 12, UDim2.fromOffset(10,14),
+    UDim2.new(1,-20,0,22), MassPage)
+MassHeading.Font = Enum.Font.GothamBold
+MassHeading.TextColor3 = Color3.fromRGB(220, 130, 90)
 
-local MassStatus = make("TextLabel",{Text="Collected: 0 parts",
-    Font=Enum.Font.GothamBold,TextSize=13,TextColor3=WHITE,
-    BackgroundColor3=Color3.fromRGB(50,30,20),TextXAlignment=Enum.TextXAlignment.Center,
-    Size=UDim2.new(1,0,0,36)},MassPage)
-round(MassStatus,8)
-local MassConfirm = make("TextLabel",{Text="Ready to collect",
-    Font=Enum.Font.GothamBold,TextSize=11,TextColor3=MUTED,
-    BackgroundColor3=Color3.fromRGB(30,25,20),TextXAlignment=Enum.TextXAlignment.Center,
-    TextWrapped=true,Size=UDim2.new(1,0,0,42)},MassPage)
-round(MassConfirm,8)
+local MassHint = label("Collect parts in a large radius. FLING NOW launches them all at the target.",
+    11, UDim2.fromOffset(10,40), UDim2.new(1,-20,0,42), MassPage)
+MassHint.TextWrapped = true
+MassHint.TextColor3 = MUTED
 
-local MassToggle = make("TextButton",{Text="Collect: OFF",Font=Enum.Font.GothamBold,TextSize=14,TextColor3=WHITE,BackgroundColor3=ROW,AutoButtonColor=false},MassPage)
-round(MassToggle,10)
+local MassStatus = make("TextLabel", {
+    Text = "Accumulated: 0 parts",
+    Font = Enum.Font.GothamBold, TextSize = 14,
+    TextColor3 = WHITE, BackgroundColor3 = Color3.fromRGB(50,30,20),
+    TextXAlignment = Enum.TextXAlignment.Center,
+    Size = UDim2.new(1,0,0,40),
+}, MassPage)
+round(MassStatus, 8)
+
+local MassToggle = make("TextButton", {
+    Text = "Collect: OFF",
+    Font = Enum.Font.GothamBold, TextSize = 14, TextColor3 = WHITE,
+    BackgroundColor3 = ROW, AutoButtonColor = false,
+}, MassPage)
+round(MassToggle, 10)
 MassToggle.MouseButton1Click:Connect(function()
-    if massState.collecting then
+    if massState.enabled then
         stopMassScanner()
-        MassToggle.Text="Collect: OFF" MassToggle.BackgroundColor3=ROW
-        setStatus("Collect OFF",MUTED,massTotalParts().." parts ready")
+        MassToggle.Text = "Collect: OFF"
+        MassToggle.BackgroundColor3 = ROW
+        setStatus("Mass collect OFF", MUTED)
     else
         startMassScanner()
-        startMassLoop()
-        MassToggle.Text="Collect: ON" MassToggle.BackgroundColor3=GREEN
-        setStatus("Collect ON",GREEN,"Rings forming on target")
+        MassToggle.Text = "Collect: ON"
+        MassToggle.BackgroundColor3 = GREEN
+        setStatus("Mass collect ON", GREEN, "Scanning "..massState.scanRadius.." studs")
     end
 end)
 
 local massRows = {}
-local function createMassRow(labelText,minV,maxV,stepV,getFn,setFn)
-    local lbl=label(labelText,11,UDim2.fromOffset(10,0),UDim2.fromOffset(200,14),MassPage)
-    lbl.Font=Enum.Font.GothamBold lbl.TextColor3=MUTED
-    local dec=make("TextButton",{Text="−",Font=Enum.Font.GothamBold,TextSize=18,TextColor3=WHITE,BackgroundColor3=ROW,AutoButtonColor=false},MassPage)
-    round(dec,8)
-    local box=make("TextBox",{Text=tostring(getFn()),ClearTextOnFocus=false,TextColor3=WHITE,TextSize=12,Font=Enum.Font.GothamBold,BackgroundColor3=PANEL,TextXAlignment=Enum.TextXAlignment.Center},MassPage)
-    round(box,8)
-    local inc=make("TextButton",{Text="+",Font=Enum.Font.GothamBold,TextSize=18,TextColor3=WHITE,BackgroundColor3=ROW,AutoButtonColor=false},MassPage)
-    round(inc,8)
-    dec.MouseButton1Click:Connect(function() setFn(math.clamp(getFn()-stepV,minV,maxV)) box.Text=tostring(getFn()) end)
-    inc.MouseButton1Click:Connect(function() setFn(math.clamp(getFn()+stepV,minV,maxV)) box.Text=tostring(getFn()) end)
-    box.FocusLost:Connect(function(e) if e then local n=tonumber(box.Text) if n then setFn(math.clamp(n,minV,maxV)) end end box.Text=tostring(getFn()) end)
-    table.insert(massRows,{label=lbl,dec=dec,box=box,inc=inc})
+local function createMassRow(labelText, minV, maxV, stepV, getFn, setFn)
+    local lbl = label(labelText, 11, UDim2.fromOffset(10,0), UDim2.fromOffset(200,16), MassPage)
+    lbl.Font = Enum.Font.GothamBold
+    lbl.TextColor3 = MUTED
+    local dec = make("TextButton", {Text="−", Font=Enum.Font.GothamBold, TextSize=20,
+        TextColor3=WHITE, BackgroundColor3=ROW, AutoButtonColor=false}, MassPage)
+    round(dec, 8)
+    local box = make("TextBox", {Text=tostring(getFn()), ClearTextOnFocus=false,
+        TextColor3=WHITE, TextSize=13, Font=Enum.Font.GothamBold,
+        BackgroundColor3=PANEL, TextXAlignment=Enum.TextXAlignment.Center}, MassPage)
+    round(box, 8)
+    local inc = make("TextButton", {Text="+", Font=Enum.Font.GothamBold, TextSize=20,
+        TextColor3=WHITE, BackgroundColor3=ROW, AutoButtonColor=false}, MassPage)
+    round(inc, 8)
+    dec.MouseButton1Click:Connect(function()
+        setFn(math.clamp(getFn()-stepV,minV,maxV)); box.Text = tostring(getFn())
+    end)
+    inc.MouseButton1Click:Connect(function()
+        setFn(math.clamp(getFn()+stepV,minV,maxV)); box.Text = tostring(getFn())
+    end)
+    box.FocusLost:Connect(function(enter)
+        if enter then local n = tonumber(box.Text); if n then setFn(math.clamp(n,minV,maxV)) end end
+        box.Text = tostring(getFn())
+    end)
+    table.insert(massRows, {label=lbl, dec=dec, box=box, inc=inc})
 end
 
-createMassRow("Scan Radius",500,5000,100,function() return massState.scanRadius end,function(v) massState.scanRadius=v end)
-createMassRow("Max Parts",50,600,50,function() return massState.maxParts end,function(v) massState.maxParts=v end)
-createMassRow("Collect Radius",3,40,1,function() return massState.collectRadius end,function(v) massState.collectRadius=v end)
-createMassRow("Collect Height",-5,40,1,function() return massState.collectHeight end,function(v) massState.collectHeight=v end)
-createMassRow("Hit Radius",1,10,1,function() return massState.hitRadius end,function(v) massState.hitRadius=v end)
-createMassRow("Hit Height",-5,10,1,function() return massState.hitHeight end,function(v) massState.hitHeight=v end)
-createMassRow("Ring Speed",5,200,5,function() return massState.ringSpeed end,function(v) massState.ringSpeed=v end)
+createMassRow("Scan Radius",    500, 5000, 100, function() return massState.scanRadius end, function(v) massState.scanRadius = v end)
+createMassRow("Items Per Scan",  50,  500,  25, function() return massState.itemsPerScan end, function(v) massState.itemsPerScan = v end)
+createMassRow("Launch Speed",   100, 2000,  50, function() return massState.launchSpeed end, function(v) massState.launchSpeed = v end)
+createMassRow("Scan Interval",  0.2,  2.0, 0.1, function() return massState.scanInterval end, function(v) massState.scanInterval = v end)
 
-local MassFlingBtn = make("TextButton",{Text="FLING NOW",Font=Enum.Font.GothamBold,TextSize=16,TextColor3=WHITE,BackgroundColor3=Color3.fromRGB(200,60,60),AutoButtonColor=false},MassPage)
-round(MassFlingBtn,12)
+local MassFlingBtn = make("TextButton", {
+    Text = "FLING NOW",
+    Font = Enum.Font.GothamBold, TextSize = 16, TextColor3 = WHITE,
+    BackgroundColor3 = Color3.fromRGB(200, 60, 60), AutoButtonColor = false,
+}, MassPage)
+round(MassFlingBtn, 12)
 MassFlingBtn.MouseButton1Click:Connect(function()
-    local count = massFlingNow()
-    if count == 0 then
-        setStatus("Nothing to fling",AMBER,"Turn Collect ON and select targets")
+    local n, tName = massFlingNow()
+    if n == 0 then
+        setStatus("Mass fling: nothing to fling", AMBER, "Accumulate first")
     else
-        setStatus("FLINGING "..count.." target(s)",GREEN,"Tight orbit — watch for HIT")
+        setStatus("Mass fling: "..n.." parts fired", GREEN, "Toward: "..tName)
     end
+    MassStatus.Text = "Accumulated: " .. #massState.parts .. " parts"
 end)
 
-local MassClearBtn = make("TextButton",{Text="CLEAR ALL",Font=Enum.Font.GothamBold,TextSize=13,TextColor3=WHITE,BackgroundColor3=ROW,AutoButtonColor=false},MassPage)
-round(MassClearBtn,8)
+local MassClearBtn = make("TextButton", {
+    Text = "CLEAR ACCUMULATED",
+    Font = Enum.Font.GothamBold, TextSize = 13, TextColor3 = WHITE,
+    BackgroundColor3 = ROW, AutoButtonColor = false,
+}, MassPage)
+round(MassClearBtn, 8)
 MassClearBtn.MouseButton1Click:Connect(function()
     massClear()
-    MassToggle.Text="Collect: OFF" MassToggle.BackgroundColor3=ROW
-    setStatus("Cleared",MUTED)
+    MassStatus.Text = "Accumulated: 0 parts"
+    setStatus("Mass list cleared", MUTED)
 end)
 
 task.spawn(function()
     while true do
-        local totalParts = massTotalParts()
-        if totalParts > 0 then
-            local entries = {}
-            for name, ring in pairs(massState.rings) do
-                if ring.hit then entries[#entries+1] = "HIT "..name
-                elseif ring.phase == "hit" then entries[#entries+1] = name.."["..#ring.parts.."@HIT]"
-                else entries[#entries+1] = name.."["..#ring.parts.."@WIDE]" end
-            end
-            MassStatus.Text = "Rings: "..massRingCount().." · Total: "..totalParts.." parts"
-            MassConfirm.Text = table.concat(entries, " · ")
-            if MassConfirm.Text:find("HIT") then MassConfirm.TextColor3 = GREEN
-            elseif MassConfirm.Text:find("@HIT") then MassConfirm.TextColor3 = RED
-            else MassConfirm.TextColor3 = AMBER end
-        else
-            MassStatus.Text = "Collected: 0 parts"
-            MassConfirm.Text = massState.collecting and "Collecting..." or "Ready — press FLING NOW"
-            MassConfirm.TextColor3 = MUTED
-        end
-        task.wait(0.3)
+        MassStatus.Text = "Accumulated: " .. #massState.parts .. " parts"
+        task.wait(0.5)
     end
 end)
 
+local MassNote = label("FLING NOW targets: selected > nearest > locked pos.",
+    10, UDim2.fromOffset(10,0), UDim2.new(1,-20,0,24), MassPage)
+MassNote.TextWrapped = true
+MassNote.TextColor3 = MUTED
+
+-- ============================================================
 -- TOOLS PAGE
-local ToolsHeading = label("TOOLS",12,UDim2.fromOffset(10,14),UDim2.new(1,-20,0,22),ToolsPage)
-ToolsHeading.Font=Enum.Font.GothamBold ToolsHeading.TextColor3=ACCENT
-local function makeToolButton(text,order,color,callback)
-    local b=make("TextButton",{Text=text,Font=Enum.Font.GothamBold,TextSize=13,TextColor3=WHITE,BackgroundColor3=color,LayoutOrder=order,AutoButtonColor=false,Size=UDim2.new(1,0,0,50)},ToolsPage)
-    round(b,8)
+-- ============================================================
+local ToolsHeading = label("EXTERNAL TOOLS", 12, UDim2.fromOffset(10,14),
+    UDim2.new(1,-20,0,22), ToolsPage)
+ToolsHeading.Font = Enum.Font.GothamBold
+ToolsHeading.TextColor3 = ACCENT
+
+local ToolsHint = label("Hardcoded — no loadstrings.",
+    11, UDim2.fromOffset(10,40), UDim2.new(1,-20,0,20), ToolsPage)
+ToolsHint.TextWrapped = true
+ToolsHint.TextColor3 = MUTED
+
+local function makeToolButton(text, order, color, callback)
+    local b = make("TextButton", {Text=text, Font=Enum.Font.GothamBold, TextSize=13,
+        TextColor3=WHITE, BackgroundColor3=color, LayoutOrder=order,
+        AutoButtonColor=false, Size=UDim2.new(1,0,0,50)}, ToolsPage)
+    round(b, 8)
+    b.MouseEnter:Connect(function() b.BackgroundColor3 = color:Lerp(Color3.new(1,1,1), 0.15) end)
+    b.MouseLeave:Connect(function() b.BackgroundColor3 = color end)
     b.MouseButton1Click:Connect(function()
-        local ok,err=pcall(callback,b,color)
-        if not ok then b.Text="Error" b.BackgroundColor3=RED setStatus("Error",RED,tostring(err):sub(1,60)) end
+        local ok, err = pcall(callback, b, color)
+        if not ok then
+            b.Text = "Error"; b.BackgroundColor3 = RED
+            setStatus("Tool error", RED, tostring(err):sub(1,80))
+        end
     end)
     return b
 end
-makeToolButton("Open Fly GUI",10,Color3.fromRGB(70,90,160),function() loadFlyGui() setStatus("Fly opened",GREEN) end)
-makeToolButton("Fling All Players",11,Color3.fromRGB(160,70,70),function()
-    local n = 0
-    for name in pairs(targetPlayerNames) do if Players:FindFirstChild(name) then n = n + 1 end end
-    if n == 0 then setStatus("Fling All: no selection", AMBER, "Using all players")
-    else setStatus("Fling All: "..n.." selected", GREEN, "Attacking only selected") end
-    task.spawn(flingAll)
-end)
-makeToolButton("Apply FPS Boost",12,Color3.fromRGB(160,120,60),function()
-    if fpsActive then setStatus("Already on",MUTED) return end
-    applyFPSBoost() fpsActive=true setStatus("FPS applied",GREEN)
-end)
-local AntiFlingBtn = makeToolButton("Anti-Fling: OFF",13,Color3.fromRGB(80,110,80),function(b,base)
-    antiFlingEnabled=not antiFlingEnabled
-    if antiFlingEnabled then startAntiFling() b.Text="Anti-Fling: ON" b.BackgroundColor3=GREEN setStatus("Anti-Fling ON",GREEN)
-    else stopAntiFling() b.Text="Anti-Fling: OFF" b.BackgroundColor3=base setStatus("Anti-Fling OFF",MUTED) end
-end)
-AntiFlingBtn.MouseLeave:Connect(function() AntiFlingBtn.BackgroundColor3=antiFlingEnabled and GREEN or Color3.fromRGB(80,110,80) end)
-make("UIListLayout",{SortOrder=Enum.SortOrder.LayoutOrder,Padding=UDim.new(0,8)},ToolsPage)
 
--- TABS + LAYOUT
+makeToolButton("Open Fly GUI", 10, Color3.fromRGB(70,90,160), function()
+    loadFlyGui()
+    setStatus("Fly GUI opened", GREEN, "Use +/- for speed (10-500)")
+end)
+makeToolButton("Fling All Players", 11, Color3.fromRGB(160,70,70), function()
+    task.spawn(flingAll)
+    setStatus("Fling All running...", AMBER)
+end)
+makeToolButton("Apply FPS Boost", 12, Color3.fromRGB(160,120,60), function()
+    if fpsActive then setStatus("FPS Boost already on", MUTED); return end
+    applyFPSBoost()
+    fpsActive = true
+    setStatus("FPS Boost applied", GREEN)
+end)
+
+local AntiFlingBtn = makeToolButton("Anti-Fling: OFF", 13, Color3.fromRGB(80,110,80), function(b, base)
+    antiFlingEnabled = not antiFlingEnabled
+    if antiFlingEnabled then
+        startAntiFling()
+        b.Text = "Anti-Fling: ON"
+        b.BackgroundColor3 = GREEN
+        setStatus("Anti-Fling ON", GREEN)
+    else
+        stopAntiFling()
+        b.Text = "Anti-Fling: OFF"
+        b.BackgroundColor3 = base
+        setStatus("Anti-Fling OFF", MUTED)
+    end
+end)
+AntiFlingBtn.MouseLeave:Connect(function()
+    AntiFlingBtn.BackgroundColor3 = antiFlingEnabled and GREEN or Color3.fromRGB(80,110,80)
+end)
+
+make("UIListLayout", {SortOrder=Enum.SortOrder.LayoutOrder, Padding=UDim.new(0,8)}, ToolsPage)
+
+-- ============================================================
+-- TAB CONTROLLER
+-- ============================================================
 local tabButtons = {}
 local currentTab = "Players"
 local function showTab(name)
     currentTab = name
     PlayerPage.Visible = name == "Players"
-    RingPage.Visible = name == "Ring"
-    MassPage.Visible = name == "Mass"
-    ToolsPage.Visible = name == "Tools"
+    RingPage.Visible   = name == "Ring"
+    MassPage.Visible   = name == "Mass"
+    ToolsPage.Visible  = name == "Tools"
     for n, btn in pairs(tabButtons) do
         btn.BackgroundColor3 = (name == n) and ACCENTD or ROW
         btn.TextColor3 = (name == n) and WHITE or MUTED
     end
 end
 for _, tab in ipairs({"Players", "Ring", "Mass", "Tools"}) do
-    local btn = make("TextButton",{Name="Tab"..tab,Text=tab,TextSize=12,Font=Enum.Font.GothamBold,TextColor3=WHITE,BackgroundColor3=ROW,AutoButtonColor=true},Navigation)
-    round(btn,8)
+    local btn = make("TextButton", {Name="Tab"..tab, Text=tab, TextSize=12,
+        Font=Enum.Font.GothamBold, TextColor3=WHITE, BackgroundColor3=ROW,
+        AutoButtonColor=true}, Navigation)
+    round(btn, 8)
     btn.MouseButton1Click:Connect(function() showTab(tab) end)
     tabButtons[tab] = btn
 end
 
-local function place(o,x,y,w,h) o.Position=UDim2.fromOffset(x,y) o.Size=UDim2.fromOffset(w,h) end
-
-local function reflow(pw,ph)
-    local innerW=pw-44
-    local innerH=math.max(1,PageHost.Size.Y.Offset)
-    local gap=6
-    local navW=pw-24
-    local tabList={"Players","Ring","Mass","Tools"}
-    local tc=#tabList
-    local tabW=math.floor((navW-(tc-1)*gap)/tc)
-    for i,name in ipairs(tabList) do
-        local x=(i-1)*(tabW+gap)
-        local ww=(i==tc) and (navW-x) or tabW
-        place(tabButtons[name],x,0,ww,40)
-        tabButtons[name].TextSize=11
-    end
-    place(sectionPlayers,10,4,innerW,14)
-    place(Search,10,20,innerW,30)
-    place(Count,10,54,innerW,14)
-    local bw=math.floor((innerW-12)/3)
-    place(SelectAllBtn,10,72,bw,24)
-    place(ClearBtn,10+bw+6,72,bw,24)
-    place(ResetRungBtn,10+2*(bw+6),72,innerW-2*(bw+6),24)
-    local listY=102
-    local listH=math.max(120,innerH-listY-4)
-    place(List,10,listY,innerW,listH)
-    List.CanvasSize=UDim2.fromOffset(0,math.ceil(ListLayout.AbsoluteContentSize.Y)+40)
-
-    local ringY=8
-    place(RingHeading,10,ringY,innerW,20) ringY=ringY+22
-    place(RingHint,10,ringY,innerW,32) ringY=ringY+38
-    place(RingToggle,10,ringY,innerW,42) ringY=ringY+48
-    for _,row in ipairs(ringRows) do
-        if row.parent == RingPage then
-            place(row.label,10,ringY,innerW,14)
-            place(row.dec,10,ringY+18,42,30)
-            place(row.box,58,ringY+18,innerW-96,30)
-            place(row.inc,10+innerW-42,ringY+18,42,30)
-            ringY=ringY+52
-        end
-    end
-    place(SelfImmunityToggle,10,ringY,innerW,38) ringY=ringY+44
-    RingPage.CanvasSize=UDim2.fromOffset(0,ringY+20)
-
-    local massY=8
-    place(MassHeading,10,massY,innerW,20) massY=massY+22
-    place(MassHint,10,massY,innerW,42) massY=massY+50
-    place(MassStatus,10,massY,innerW,36) massY=massY+42
-    place(MassConfirm,10,massY,innerW,42) massY=massY+48
-    place(MassToggle,10,massY,innerW,42) massY=massY+50
-    for _,row in ipairs(massRows) do
-        place(row.label,10,massY,innerW,14)
-        place(row.dec,10,massY+18,42,30)
-        place(row.box,58,massY+18,innerW-96,30)
-        place(row.inc,10+innerW-42,massY+18,42,30)
-        massY=massY+52
-    end
-    place(MassFlingBtn,10,massY,innerW,52) massY=massY+60
-    place(MassClearBtn,10,massY,innerW,36)
-    MassPage.CanvasSize=UDim2.fromOffset(0,massY+50)
-
-    place(ToolsHeading,10,10,innerW,22)
-    ToolsPage.CanvasSize=UDim2.fromOffset(0,400)
+local function place(obj, x, y, w, h)
+    obj.Position = UDim2.fromOffset(x, y)
+    obj.Size = UDim2.fromOffset(w, h)
 end
 
--- WINDOW
+local function reflow(panelWidth, panelHeight)
+    local innerWidth = panelWidth - 44
+    local innerHeight = math.max(1, PageHost.Size.Y.Offset)
+    local gap = 8
+    local navWidth = panelWidth - 24
+    local tabList = {"Players", "Ring", "Mass", "Tools"}
+    local tabCount = #tabList
+    local tabW = math.floor((navWidth - (tabCount-1) * gap) / tabCount)
+    for i, name in ipairs(tabList) do
+        local x = (i - 1) * (tabW + gap)
+        local ww = (i == tabCount) and (navWidth - x) or tabW
+        place(tabButtons[name], x, 0, ww, 46)
+        tabButtons[name].TextSize = 11
+    end
+
+    place(sectionPlayers, 10, 10, innerWidth, 16)
+    place(Search, 10, 32, innerWidth, 42)
+    place(Count, 10, 80, innerWidth, 16)
+
+    local bw = math.floor((innerWidth - 16) / 3)
+    place(SelectAllBtn, 10, 102, bw, 36)
+    place(ClearBtn, 10 + bw + 8, 102, bw, 36)
+    place(ResetRungBtn, 10 + 2*(bw + 8), 102, innerWidth - 2*(bw+8), 36)
+
+    local listY = 148
+    local listH = math.max(80, innerHeight - listY - 10)
+    place(List, 10, listY, innerWidth, listH)
+    List.CanvasSize = UDim2.fromOffset(0, math.ceil(ListLayout.AbsoluteContentSize.Y) + 22)
+
+    local ringY = 14
+    place(RingHeading, 10, ringY, innerWidth, 22); ringY = ringY + 26
+    place(RingHint, 10, ringY, innerWidth, 52); ringY = ringY + 60
+    place(RingToggle, 10, ringY, innerWidth, 50); ringY = ringY + 60
+    for _, row in ipairs(ringRows) do
+        place(row.label, 10, ringY, innerWidth, 16)
+        place(row.dec, 10, ringY + 22, 46, 38)
+        place(row.box, 64, ringY + 22, innerWidth - 108, 38)
+        place(row.inc, 10 + innerWidth - 46, ringY + 22, 46, 38)
+        ringY = ringY + 66
+    end
+    place(SelfImmunityToggle, 10, ringY, innerWidth, 44); ringY = ringY + 50
+    place(RingNote, 10, ringY, innerWidth, 24)
+    RingPage.CanvasSize = UDim2.fromOffset(0, ringY + 40)
+
+    local massY = 14
+    place(MassHeading, 10, massY, innerWidth, 22); massY = massY + 26
+    place(MassHint, 10, massY, innerWidth, 42); massY = massY + 50
+    place(MassStatus, 10, massY, innerWidth, 40); massY = massY + 50
+    place(MassToggle, 10, massY, innerWidth, 46); massY = massY + 56
+    for _, row in ipairs(massRows) do
+        place(row.label, 10, massY, innerWidth, 16)
+        place(row.dec, 10, massY + 22, 46, 38)
+        place(row.box, 64, massY + 22, innerWidth - 108, 38)
+        place(row.inc, 10 + innerWidth - 46, massY + 22, 46, 38)
+        massY = massY + 66
+    end
+    place(MassFlingBtn, 10, massY, innerWidth, 54); massY = massY + 64
+    place(MassClearBtn, 10, massY, innerWidth, 42); massY = massY + 50
+    place(MassNote, 10, massY, innerWidth, 24)
+    MassPage.CanvasSize = UDim2.fromOffset(0, massY + 40)
+
+    place(ToolsHeading, 10, 14, innerWidth, 22)
+    place(ToolsHint, 10, 40, innerWidth, 20)
+    ToolsPage.CanvasSize = UDim2.fromOffset(0, 400)
+end
+
 updateWindow = function()
-    if minimized then Main.Visible=false MiniCircle.Visible=true return end
-    Main.Visible=true MiniCircle.Visible=false
-    local cam=workspace.CurrentCamera
-    local vp=cam and cam.ViewportSize or Vector2.new(1024,768)
-    local insetY=0
-    pcall(function() insetY=game:GetService("GuiService"):GetGuiInset().Y end)
-    local hudTop=math.max(insetY+4,8)
-    local usableH=math.max(180,vp.Y-hudTop-12)
-    local h=math.min(PANEL_H,usableH)
-    local w=math.min(PANEL_W,math.max(280,vp.X-16))
-    local compact=h<480
-    local headerH=compact and 40 or 56
-    Main.Position=UDim2.new(0.5,0,0,hudTop)
-    Main.Size=UDim2.fromOffset(w,h)
-    Header.Size=UDim2.new(1,0,0,headerH)
-    Title.Position=UDim2.fromOffset(14,compact and 8 or 10)
-    Title.TextSize=compact and 13 or 15
-    SubTitle.Visible=not compact
-    local closeY=compact and 4 or 12
-    local controlH=compact and 32 or 40
-    for _,b in ipairs({MinButton,MaxButton,CloseButton}) do b.Size=UDim2.fromOffset(controlH+4,controlH) end
-    MinButton.Position=UDim2.new(1,-(controlH*3+40),0,closeY)
-    MaxButton.Position=UDim2.new(1,-(controlH*2+30),0,closeY)
-    CloseButton.Position=UDim2.new(1,-(controlH+14),0,closeY)
-    Content.Position=UDim2.fromOffset(0,headerH)
-    Content.Size=UDim2.new(1,0,1,-headerH)
-    MinButton.Text="−"
-    local tabsH=compact and 38 or 48
-    local footerH=compact and 76 or 118
-    Navigation.Position=UDim2.fromOffset(12,compact and 3 or 6)
-    Navigation.Size=UDim2.new(1,-24,0,tabsH)
-    PageHost.Position=UDim2.fromOffset(12,(compact and 3 or 6)+tabsH+6)
-    PageHost.Size=UDim2.new(1,-24,0,math.max(34,(h-headerH)-((compact and 3 or 6)+tabsH+6)-footerH-6))
-    Footer.Position=UDim2.new(0,12,1,-(footerH+4))
-    Footer.Size=UDim2.new(1,-24,0,footerH)
-    reflow(w,h)
+    if minimized then
+        Main.Visible = false
+        MiniCircle.Visible = true
+        return
+    end
+    Main.Visible = true
+    MiniCircle.Visible = false
+
+    local cam = workspace.CurrentCamera
+    local vp = cam and cam.ViewportSize or Vector2.new(1024, 768)
+    local insetY = 0
+    pcall(function() insetY = game:GetService("GuiService"):GetGuiInset().Y end)
+    local hudTop = math.max(insetY + 4, 8)
+    local usableH = math.max(180, vp.Y - hudTop - 12)
+    local h = math.min(PANEL_H, usableH)
+    local w = math.min(PANEL_W, math.max(280, vp.X - 16))
+    local compact = h < 480
+    local headerH = compact and 40 or 56
+    Main.Position = UDim2.new(0.5, 0, 0, hudTop)
+    Main.Size = UDim2.fromOffset(w, h)
+    Header.Size = UDim2.new(1, 0, 0, headerH)
+    Title.Position = UDim2.fromOffset(14, compact and 8 or 10)
+    Title.TextSize = compact and 13 or 15
+    SubTitle.Visible = not compact
+    local closeY = compact and 4 or 12
+    local controlH = compact and 32 or 40
+    for _, b in ipairs({MinButton, MaxButton, CloseButton}) do
+        b.Size = UDim2.fromOffset(controlH + 4, controlH)
+    end
+    MinButton.Position   = UDim2.new(1, -(controlH*3 + 40), 0, closeY)
+    MaxButton.Position   = UDim2.new(1, -(controlH*2 + 30), 0, closeY)
+    CloseButton.Position = UDim2.new(1, -(controlH + 14), 0, closeY)
+    Content.Position = UDim2.fromOffset(0, headerH)
+    Content.Size     = UDim2.new(1, 0, 1, -headerH)
+    MinButton.Text = "−"
+    local tabsH   = compact and 38 or 48
+    local footerH = compact and 76 or 118
+    Navigation.Position = UDim2.fromOffset(12, compact and 3 or 6)
+    Navigation.Size     = UDim2.new(1, -24, 0, tabsH)
+    PageHost.Position   = UDim2.fromOffset(12, (compact and 3 or 6) + tabsH + 6)
+    PageHost.Size       = UDim2.new(1, -24, 0,
+        math.max(34, (h - headerH) - ((compact and 3 or 6) + tabsH + 6) - footerH - 6))
+    Footer.Position     = UDim2.new(0, 12, 1, -(footerH + 4))
+    Footer.Size         = UDim2.new(1, -24, 0, footerH)
+    reflow(w, h)
     showTab(currentTab)
 end
 
-MinButton.MouseButton1Click:Connect(function() minimized=true Main.Visible=false MiniCircle.Visible=true end)
+MinButton.MouseButton1Click:Connect(function()
+    minimized = true
+    Main.Visible = false
+    MiniCircle.Visible = true
+end)
 MaxButton.MouseButton1Click:Connect(function() updateWindow() end)
 
-local dragging,dragInput,dragStart,startPos=false
+local dragging, dragInput, dragStart, startPos = false
 Header.InputBegan:Connect(function(input)
-    if input.UserInputType==Enum.UserInputType.MouseButton1 or input.UserInputType==Enum.UserInputType.Touch then
-        dragging=true dragInput=input dragStart=input.Position startPos=Main.Position
+    if input.UserInputType == Enum.UserInputType.MouseButton1
+    or input.UserInputType == Enum.UserInputType.Touch then
+        dragging = true; dragInput = input
+        dragStart = input.Position; startPos = Main.Position
     end
 end)
 UIS.InputChanged:Connect(function(input)
     if not dragging then return end
-    if input.UserInputType~=Enum.UserInputType.MouseMovement and input~=dragInput then return end
-    local delta=(input.Position-dragStart)/Scale.Scale
-    local vpY=workspace.CurrentCamera and workspace.CurrentCamera.ViewportSize.Y or 768
-    Main.Position=UDim2.new(startPos.X.Scale,startPos.X.Offset+delta.X,0,math.clamp(startPos.Y.Offset+delta.Y,2,math.max(2,vpY-Main.Size.Y.Offset-2)))
+    if input.UserInputType ~= Enum.UserInputType.MouseMovement and input ~= dragInput then return end
+    local delta = (input.Position - dragStart) / Scale.Scale
+    local vpY = workspace.CurrentCamera and workspace.CurrentCamera.ViewportSize.Y or 768
+    Main.Position = UDim2.new(startPos.X.Scale,
+        startPos.X.Offset + delta.X, 0,
+        math.clamp(startPos.Y.Offset + delta.Y, 2, math.max(2, vpY - Main.Size.Y.Offset - 2)))
 end)
-UIS.InputEnded:Connect(function(input) if input==dragInput then dragging=false dragInput=nil end end)
+UIS.InputEnded:Connect(function(input)
+    if input == dragInput then dragging = false; dragInput = nil end
+end)
 
-local cam=workspace.CurrentCamera
+local cam = workspace.CurrentCamera
 if cam then cam:GetPropertyChangedSignal("ViewportSize"):Connect(updateWindow) end
 CloseButton.MouseButton1Click:Connect(function() Gui:Destroy() end)
 
+-- ============================================================
 -- RING CORE
-pcall(function() Me.ReplicationFocus=workspace end)
-pcall(function() sethiddenproperty(Me,"SimulationRadius",config.simRadius) end)
+-- ============================================================
+pcall(function() Me.ReplicationFocus = workspace end)
+pcall(function() sethiddenproperty(Me, "SimulationRadius", config.simRadius) end)
 Me.CharacterAdded:Connect(function()
     task.wait(0.5)
-    pcall(function() Me.ReplicationFocus=workspace end)
-    pcall(function() sethiddenproperty(Me,"SimulationRadius",config.simRadius) end)
-    if antiFlingEnabled then stopAntiFling() startAntiFling() end
+    pcall(function() Me.ReplicationFocus = workspace end)
+    pcall(function() sethiddenproperty(Me, "SimulationRadius", config.simRadius) end)
 end)
 
 local ringFF
 local function ringProtectChar(char)
     if not char then return end
     if ringFF and ringFF.Parent then ringFF:Destroy() end
-    ringFF=Instance.new("ForceField")
-    ringFF.Visible=false ringFF.Parent=char
+    ringFF = Instance.new("ForceField")
+    ringFF.Visible = false
+    ringFF.Parent = char
 end
 if Me.Character then ringProtectChar(Me.Character) end
-Me.CharacterAdded:Connect(function(c) task.wait(0.5) ringProtectChar(c) end)
+Me.CharacterAdded:Connect(function(ch) task.wait(0.5); ringProtectChar(ch) end)
 
 task.spawn(function()
     while true do
-        if OrbitState~=0 then
-            local ch=Me.Character
-            local hrp=ch and ch:FindFirstChild("HumanoidRootPart")
-            if hrp then
-                pcall(function() sethiddenproperty(Me,"SimulationRadius",config.simRadius) end)
-                local parts=workspace:GetPartBoundsInRadius(hrp.Position,config.scanRadius)
-                local processed=0
-                for _,item in ipairs(parts) do
-                    if processed>=config.maxItemsPerLoop then break end
-                    -- ORIGINAL FILTER
-                    if item:IsA("BasePart") and not item.Anchored and not item:IsDescendantOf(ch) then
+        if OrbitState ~= 0 then
+            local char = Me.Character
+            local root = char and char:FindFirstChild("HumanoidRootPart")
+            if root then
+                pcall(function() sethiddenproperty(Me, "SimulationRadius", config.simRadius) end)
+                local parts = workspace:GetPartBoundsInRadius(root.Position, config.scanRadius)
+                local processed = 0
+                for _, item in ipairs(parts) do
+                    if processed >= config.maxItemsPerLoop then break end
+                    if item:IsA("BasePart") and not item.Anchored
+                       and not item:IsDescendantOf(char) then
                         if not itemsInRingLookup[item] then
-                            table.insert(itemsInRing,item)
-                            itemsInRingLookup[item]=true
-                            processed=processed+1
+                            table.insert(itemsInRing, item)
+                            itemsInRingLookup[item] = true
+                            processed = processed + 1
                         end
                     end
                 end
-                local cleaned=0
-                for i=#itemsInRing,1,-1 do
-                    if cleaned>15 then break end
-                    local item=itemsInRing[i]
+                local cleaned = 0
+                for i = #itemsInRing, 1, -1 do
+                    if cleaned > 15 then break end
+                    local item = itemsInRing[i]
                     if not item or not item.Parent then
-                        itemsInRingLookup[item]=nil
-                        table.remove(itemsInRing,i)
-                        cleaned=cleaned+1
+                        itemsInRingLookup[item] = nil
+                        table.remove(itemsInRing, i)
+                        cleaned = cleaned + 1
                     end
                 end
             end
@@ -1244,145 +1521,164 @@ task.spawn(function()
 end)
 
 RunService.Stepped:Connect(function()
-    if OrbitState==0 then return end
-    local ch=Me.Character
-    local root=ch and ch:FindFirstChild("HumanoidRootPart")
+    if OrbitState == 0 then return end
+    local char = Me.Character
+    local root = char and char:FindFirstChild("HumanoidRootPart")
     if not root then return end
-    for _,v in ipairs(ch:GetChildren()) do if v:IsA("BasePart") then v.CanCollide=false end end
 
-    local targetPart=nil
-    if OrbitState==2 and LockedPosition then
-        targetPart={Position=LockedPosition}
+    for _, v in ipairs(char:GetChildren()) do
+        if v:IsA("BasePart") then v.CanCollide = false end
+    end
+
+    local targetPart = nil
+
+    if OrbitState == 2 and LockedPosition then
+        targetPart = {Position = LockedPosition}
     else
-        local bestSelected,bestSelectedName,bestDist=nil,nil,math.huge
+        local bestSelected, bestSelectedName, bestSelectedDist = nil, nil, math.huge
         for name in pairs(targetPlayerNames) do
             if not rungPlayers[name] then
-                local p=Players:FindFirstChild(name)
-                if p and p.Character and not isProtectedPlayer(p) then
-                    local hrp=p.Character:FindFirstChild("HumanoidRootPart")
+                local p = Players:FindFirstChild(name)
+                if p and p.Character then
+                    local hrp = p.Character:FindFirstChild("HumanoidRootPart")
                     if hrp then
-                        local d=(root.Position-hrp.Position).Magnitude
-                        if d<bestDist then bestDist=d bestSelected=hrp bestSelectedName=name end
+                        local d = (root.Position - hrp.Position).Magnitude
+                        if d < bestSelectedDist then
+                            bestSelectedDist = d
+                            bestSelected = hrp
+                            bestSelectedName = name
+                        end
                     end
                 end
             end
         end
+
         if bestSelected then
-            targetPart=bestSelected
-            lastTargetPos=bestSelected.Position
-            if orbitTargetName~=bestSelectedName then
-                orbitTargetName=bestSelectedName
-                orbitTargetStart=tick()
-                orbitBaselineVel=0
-                pcall(function() orbitBaselineVel=bestSelected.AssemblyLinearVelocity.Magnitude end)
+            targetPart = bestSelected
+            lastTargetPos = bestSelected.Position
+
+            if orbitTargetName ~= bestSelectedName then
+                orbitTargetName = bestSelectedName
+                orbitTargetStart = tick()
             else
-                local elapsed=tick()-orbitTargetStart
-                local velMag=0
-                pcall(function() velMag=bestSelected.AssemblyLinearVelocity.Magnitude end)
-                local inAir=false local humAlive=true
-                pcall(function()
-                    local hum=bestSelected.Parent and bestSelected.Parent:FindFirstChildOfClass("Humanoid")
-                    if hum then
-                        local st=hum:GetState()
-                        if st==Enum.HumanoidStateType.Flying or st==Enum.HumanoidStateType.Freefall or st==Enum.HumanoidStateType.Swimming then inAir=true end
-                        if hum.FloorMaterial==Enum.Material.Air then inAir=true end
-                        if hum.Health<=0 then humAlive=false end
-                    end
-                end)
-                local spike=velMag-orbitBaselineVel
-                local genuineFling=spike>=config.flingVelThreshold
-                local timedOutGrounded=(not inAir) and (velMag<50) and elapsed>=config.ringSuccessTime
-                local dead=not humAlive
-                if genuineFling or timedOutGrounded or dead then
-                    rungPlayers[bestSelectedName]=true
-                    orbitTargetName=nil
-                    local reason="Timeout"
-                    if genuineFling then reason="Fling detected" elseif dead then reason="Target dead" end
+                local elapsed = tick() - orbitTargetStart
+                local velMag = 0
+                pcall(function() velMag = bestSelected.AssemblyLinearVelocity.Magnitude end)
+                if elapsed >= config.ringSuccessTime or velMag >= config.flingVelThreshold then
+                    rungPlayers[bestSelectedName] = true
+                    orbitTargetName = nil
                     task.defer(function()
-                        setStatus("Rung: "..bestSelectedName,genuineFling and GREEN or AMBER,reason)
+                        setStatus("Rung: " .. bestSelectedName, GREEN, "Skipped")
                         refreshPlayers()
                     end)
                 end
             end
         elseif lastTargetPos then
-            targetPart={Position=lastTargetPos}
-        elseif next(targetPlayerNames)==nil then
-            local cDist=config.targetRadius local closest=nil
-            for _,p in ipairs(Players:GetPlayers()) do
-                if p~=Me and p.Character and not isProtectedPlayer(p) then
-                    local hrp=p.Character:FindFirstChild("HumanoidRootPart")
+            targetPart = {Position = lastTargetPos}
+        elseif next(targetPlayerNames) == nil then
+            local closestDist = config.targetRadius
+            local closest = nil
+            for _, p in ipairs(Players:GetPlayers()) do
+                if p ~= Me and p.Character then
+                    local hrp = p.Character:FindFirstChild("HumanoidRootPart")
                     if hrp then
-                        local d=(root.Position-hrp.Position).Magnitude
-                        if d<cDist then cDist=d closest=hrp end
+                        local dist = (root.Position - hrp.Position).Magnitude
+                        if dist < closestDist then
+                            closestDist = dist
+                            closest = hrp
+                        end
                     end
                 end
             end
-            targetPart=closest or root
+            targetPart = closest or root
         else
-            targetPart=lastTargetPos and {Position=lastTargetPos} or root
+            targetPart = lastTargetPos and {Position = lastTargetPos} or root
         end
     end
-    if not targetPart then targetPart=root end
 
-    local isEven=(math.floor(tick())%2==0)
-    local curRadius=isEven and config.radiusA or config.radiusB
-    local curHeight=isEven and config.heightA or config.heightB
-    local baseSpeed=config.baseSpeedMultiplier
-    local total=math.max(#itemsInRing,1)
-    local localHrp=root
-    local immunityOn=config.selfImmunity
-    local immunitySq=config.immunityRadius*config.immunityRadius
+    if not targetPart then targetPart = root end
 
-    for i=#itemsInRing,1,-1 do
-        local item=itemsInRing[i]
+    local isEven = (math.floor(tick()) % 2 == 0)
+    local curRadius = isEven and config.radiusA or config.radiusB
+    local curHeight = isEven and config.heightA or config.heightB
+    local baseSpeed = config.baseSpeedMultiplier
+    local totalItems = math.max(#itemsInRing, 1)
+
+    local localHrp = root
+    local immunityOn = config.selfImmunity
+    local immunitySq = config.immunityRadius * config.immunityRadius
+
+    for i = #itemsInRing, 1, -1 do
+        local item = itemsInRing[i]
         if item and item.Parent and not item.Anchored then
-            local bp=item:FindFirstChild("OrbitBP")
+            local bp = item:FindFirstChild("OrbitBP")
             if not bp then
-                bp=Instance.new("BodyPosition",item)
-                bp.Name="OrbitBP"
-                bp.MaxForce=Vector3.new(math.huge,math.huge,math.huge)
-                bp.P=1e10 bp.D=500
+                bp = Instance.new("BodyPosition", item)
+                bp.Name = "OrbitBP"
+                bp.MaxForce = Vector3.new(math.huge, math.huge, math.huge)
+                bp.P = 1e10
+                bp.D = 500
             end
-            item.Velocity=Vector3.zero item.RotVelocity=Vector3.zero
-            local iSpeed=baseSpeed+((i%10)*0.5)
-            local angle=(tick()*iSpeed)+(i*(math.pi*2/total))
-            local tPos=targetPart.Position+Vector3.new(math.cos(angle)*curRadius,curHeight,math.sin(angle)*curRadius)
+            item.CanCollide = false
+            item.Velocity = Vector3.zero
+            item.RotVelocity = Vector3.zero
+            local itemSpeed = baseSpeed + ((i % 10) * 0.5)
+            local angle = (tick() * itemSpeed) + (i * (math.pi * 2 / totalItems))
+            local targetPos = targetPart.Position + Vector3.new(
+                math.cos(angle) * curRadius,
+                curHeight,
+                math.sin(angle) * curRadius
+            )
+
             if immunityOn and localHrp then
-                local off=tPos-localHrp.Position
-                local dSq=off.X*off.X+off.Y*off.Y+off.Z*off.Z
-                if dSq<immunitySq then
-                    if dSq<0.01 then tPos=localHrp.Position+Vector3.new(config.immunityRadius+2,0,0)
-                    else tPos=localHrp.Position+off.Unit*(config.immunityRadius+2) end
+                local offset = targetPos - localHrp.Position
+                local distSq = offset.X*offset.X + offset.Y*offset.Y + offset.Z*offset.Z
+                if distSq < immunitySq then
+                    if distSq < 0.01 then
+                        targetPos = localHrp.Position + Vector3.new(config.immunityRadius + 2, 0, 0)
+                    else
+                        targetPos = localHrp.Position + offset.Unit * (config.immunityRadius + 2)
+                    end
                 end
             end
-            bp.Position=tPos
-            local wantCol=true
-            if localHrp then
-                local dL=(item.Position-localHrp.Position).Magnitude
-                if dL<20 then wantCol=false end
-            end
-            if item.CanCollide~=wantCol then item.CanCollide=wantCol end
+
+            bp.Position = targetPos
         else
-            if itemsInRingLookup[item] then itemsInRingLookup[item]=nil end
-            table.remove(itemsInRing,i)
+            if itemsInRingLookup[item] then itemsInRingLookup[item] = nil end
+            table.remove(itemsInRing, i)
         end
     end
 end)
 
-UIS.InputBegan:Connect(function(input,gpe)
+UIS.InputBegan:Connect(function(input, gpe)
     if gpe then return end
-    if input.KeyCode==Enum.KeyCode.RightShift then
-        OrbitState=0 LockedPosition=nil
-        RingToggle.Text="Ring: OFF" RingToggle.BackgroundColor3=RED
-        for _,v in pairs(itemsInRing) do if v and v.Parent then local bp=v:FindFirstChild("OrbitBP") if bp then bp:Destroy() end end end
-        itemsInRing={} itemsInRingLookup={}
-        table.clear(rungPlayers) lastTargetPos=nil orbitTargetName=nil
-        refreshPlayers() setStatus("Emergency off",AMBER)
+    if input.KeyCode == Enum.KeyCode.RightShift then
+        OrbitState = 0
+        LockedPosition = nil
+        RingToggle.Text = "Ring: OFF"
+        RingToggle.BackgroundColor3 = RED
+        for _, v in pairs(itemsInRing) do
+            if v and v.Parent then
+                local bp = v:FindFirstChild("OrbitBP")
+                if bp then bp:Destroy() end
+            end
+        end
+        itemsInRing = {}
+        itemsInRingLookup = {}
+        table.clear(rungPlayers)
+        lastTargetPos = nil
+        orbitTargetName = nil
+        refreshPlayers()
+        setStatus("Emergency ring off", AMBER)
     end
 end)
 
+-- ============================================================
+-- BOOT
+-- ============================================================
 refreshPlayers()
 showTab("Players")
 updateWindow()
-setStatus("Ready · whitelist active",MUTED,"Creator ID protected: 9321819967")
-print("[GR33D EXPLOIT v16] Collect → orbit target → FLING tightens")w
+setStatus("Ready · press Ring or Mass to start", MUTED,
+    "Self-immunity: " .. (config.selfImmunity and "ON" or "OFF"))
+print("[GR33D EXPLOIT] loaded")
